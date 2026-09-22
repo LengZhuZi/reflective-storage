@@ -75,7 +75,31 @@ node tests/inject.ts      # 注入块：声明、转义、预算截断、状态�
 node tests/extension.ts   # pi 绑定：hook/工具/命令、每会话一次、压缩后解锁、降级可见
 ```
 
-自检不联网（JEV 用假的 fetch），断言风格，不用测试框架。
+自检不联网（判断引擎用假的 fetch），断言风格，不用测试框架。
+
+## 真 pi 验收（无感闭环）
+
+自检用的是假 pi —— 真正挂进 pi 是另一回事。用临时记忆库跑一遍，不动你本地的库：
+
+```bash
+D=/tmp/reflect-test; rm -rf $D; mkdir -p $D
+cp ~/.pi/agent/reflective-storage/config.json $D/config.json && chmod 600 $D/config.json
+
+# 会话 1：顺口说一条约定（不说「记住」，也不调任何工具）
+env REFLECTIVE_HOME=$D pi -ne -e ./index.ts -p "以后这个仓库的提交都必须一个模块一个提交" --session-dir /tmp/reflect-s1
+
+# 会话 2：新会话直接问
+env REFLECTIVE_HOME=$D pi -ne -e ./index.ts -p "提交要怎么拆？" --session-dir /tmp/reflect-s2
+
+# 看库里到底发生了什么
+sqlite3 $D/projects/*.db "select content,type,scope from memories; select gate,action,user_visible from reflection_traces;"
+```
+
+`-ne` 关掉其他扩展的自动发现（只跑这个，同时避开 cognee 等扩展的副作用），`REFLECTIVE_HOME` 指向临时目录。
+验收标准（DESIGN.md §16）：能回答「记了什么、为什么记住、怎么删掉」，且全程零命令。
+
+**为什么必须跑这一步**：假 pi 查不出真的三类问题 —— 模型会主动调 `memory_add`（导致重复入库）、
+`getBranch()` 给的是会话条目而不是裸消息、问句会被当成记忆。这三个都是真跑时才暴露的。
 
 ## 环境变量
 
@@ -132,3 +156,5 @@ J15 只记事实（query / 召回集 / 注入集），`cited_ids` 和 `user_feed
 J5 目前不调用：§10.4 的本地规则已经覆盖了「要不要花这次钱」，而本会话只注入一次，所以 J5 在首轮永远是一次白花的调用。`adapter.judgeRecallNeed` 留着给压缩后重注入和将来的主动召回。
 
 待做：J9–J13 生命周期（衰减 / 合并 / 遗忘 / 复活，挂在 `session_start` 的懒执行上 —— §14 把它划在 Phase 2）、J14c 的复核 UI、J15 的 `cited` 事后核对与用户反馈入口。路线图见 DESIGN.md §14。
+
+真 pi 无感闭环已验证：会话 1 顺口说一条约定（零命令、没说「记住」）→ 自动入库一条；会话 2 新会话直接问 → 自动召回 + 注入，回答直接用上。跑法见上面「真 pi 验收」。

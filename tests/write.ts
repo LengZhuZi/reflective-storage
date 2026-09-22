@@ -15,7 +15,7 @@ process.env.REFLECTIVE_HOME = tmp;
 
 const { openDb, countMemories, listInScope, insertMemory, putEmbedding } = await import("../src/storage/db.ts");
 const { embed } = await import("../src/embed/encoder.ts");
-const { writeFlow, worthEvaluating, buildCandidate, redact, KEEP_THRESHOLD } = await import("../src/pipeline/write.ts");
+const { writeFlow, worthEvaluating, buildCandidate, splitForWrite, MAX_WRITES_PER_TURN, redact, KEEP_THRESHOLD } = await import("../src/pipeline/write.ts");
 
 const project = openDb(path.join(tmp, "proj.db"));
 const global = openDb(path.join(tmp, "global.db"));
@@ -71,6 +71,18 @@ assert.equal(
   "带明确要求的问题句照样留",
 );
 console.log("✓ 本地预筛挡掉短输入和纯确认（这一步免费，JEV 才是花钱的）");
+
+// 一轮里几句话就分几条记忆：整段写会把项目约定和用户偏好挤进同一条，
+// 类型/作用域只能选一个 —— 用户偏好被锁进单个项目就再也跟不走了（真跑 pi 撞到）
+assert.deepEqual(
+  splitForWrite(["以后提交都必须一个模块一个提交。另外我一般喜欢先给结论再给理由。"]),
+  ["以后提交都必须一个模块一个提交。", "另外我一般喜欢先给结论再给理由。"],
+);
+assert.deepEqual(splitForWrite(["只有一句"]), ["只有一句"]);
+assert.deepEqual(splitForWrite(["这个怎么拆？另外以后都用 Flyway。"]), ["另外以后都用 Flyway。"], "纯提问的句子仍然剔掉");
+const many = splitForWrite([Array.from({ length: 6 }, (_, i) => `第 ${i} 句都要记住的话。`).join("")]);
+assert.equal(many.length, MAX_WRITES_PER_TURN, "最多 3 条，多的并进最后一条，别爆炸");
+console.log("✓ 一轮多句 → 拆成多条记忆（类型/作用域各自算），上限 3 条");
 
 // ------------------------------------------------------------ 脱敏
 const dirty = "配置写到 sk-abcdefghijklmnop 里，apikey_TESTFIXTURE0000001 也是，password: hunter2";

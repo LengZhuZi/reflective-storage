@@ -117,6 +117,28 @@ export function worthEvaluating(text: string): { ok: boolean; reason?: string } 
   return { ok: true };
 }
 
+/**
+ * 一轮里有几句话，就分几条记忆写（最多 3 条，多的并进最后一条）。
+ *
+ * 实测（真 pi）：用户一口气说「提交必须一个模块一个提交。另外我一般喜欢先给结论」
+ * 时，整段被当成**一条**记忆 —— 于是一个项目约定和一个用户偏好挤在同一条里，
+ * 类型只能选一个（判成了 fact），作用域也只能选一个（跟着进了项目库）。
+ * 用户偏好本该是 global，被锁进单个项目就再也跟不着他走了。
+ *
+ * 拆开之后每条各自过 J1+J2+J3：类型、作用域、主题、去重、合并提议都按句粒度算。
+ * 代价是每条一次判断调用（写入本来就在后台队列里跑，不挡用户）。
+ */
+export const MAX_WRITES_PER_TURN = 3;
+
+export function splitForWrite(userTexts: readonly string[]): string[] {
+  const parts = userTexts
+    .flatMap((t) => sentences(t))
+    .map((s) => s.replace(/\s+/g, " ").trim())
+    .filter((s) => s.length > 0 && !isPureQuestion(s));
+  if (parts.length <= MAX_WRITES_PER_TURN) return parts;
+  return [...parts.slice(0, MAX_WRITES_PER_TURN - 1), parts.slice(MAX_WRITES_PER_TURN - 1).join(" ")];
+}
+
 /** 把本轮的候选内容拼成一段交给 J1。多条用户消息合在一起判断，省调用。
  *  纯提问的句子（哪怕夹在陈述中间）先剔掉：它们不是记忆，还会把噪声带进注入块。 */
 export function buildCandidate(input: TurnInput): string {

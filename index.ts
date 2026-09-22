@@ -24,7 +24,7 @@ import {
   openGlobalDb, openProjectDb, projectIdFor, recentRecalls, resolveReview, setTopic, tracesFor,
   type OpenedDb,
 } from "./src/storage/db.ts";
-import { writeFlow } from "./src/pipeline/write.ts";
+import { splitForWrite, writeFlow } from "./src/pipeline/write.ts";
 import { recallFlow, worthRecalling } from "./src/pipeline/recall.ts";
 import { resurrectFor, runLifecycle } from "./src/pipeline/lifecycle.ts";
 import { closeFeedbackLoop } from "./src/pipeline/feedback.ts";
@@ -398,18 +398,23 @@ export default function reflectiveStorage(pi: ExtensionAPI): void {
     }
     if (texts.length === 0) return;
     // 写入 fail-open 且不该拖住用户：排队后台跑，session_shutdown 冲刷。
-    const policy = r.inject;
     r.pending = r.pending
       .then(async () => {
-        const res = await writeFlow(r.projectDb, r.globalDb, r.adapter, r.session, { userTexts: texts, context });
-        r.lastWrite = { action: res.action, reason: res.reason, at: Date.now() };
-        if (res.status === "unavailable") warnProxy(r, ctx);
+        // 一句一条记忆（见 splitForWrite 的说明）：整段写会把项目约定和用户偏好挤进
+        // 同一条，类型和作用域只能选一个 —— 用户偏好被锁进单个项目就再也跟不走了。
+        const pieces = splitForWrite(texts);
+        let firstReviewId: string | null = null;
+        for (const piece of pieces) {
+          const res = await writeFlow(r.projectDb, r.globalDb, r.adapter, r.session, { userTexts: [piece], context });
+          r.lastWrite = { action: res.action, reason: res.reason, at: Date.now() };
+          if (res.status === "unavailable") warnProxy(r, ctx);
+          firstReviewId ??= res.review?.[0]?.id ?? null;
+        }
         // 写入排队问用户的事项：一轮最多问一条，别刷屏（剩下的 /memory review 随时能过）。
         // hasUI 为假（print 模式）就只排队，不问。
-        if (res.review?.length && ctx.hasUI) await askReview(r.projectDb, ctx, res.review[0].id);
+        if (firstReviewId && ctx.hasUI) await askReview(r.projectDb, ctx, firstReviewId);
       })
       .catch((e) => { r.error = errText(e); });
-    void policy;
   });
 
   pi.on("session_compact", async () => {

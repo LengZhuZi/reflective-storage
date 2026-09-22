@@ -86,6 +86,8 @@ export interface WriteResult {
   reason?: string;
   /** 落库后排队等用户确认的事项（合并提议 / 低置信冲突），由调用方决定什么时候问。 */
   review?: ReviewItem[];
+  /** 判断引擎的三态。调用方靠它决定要不要提示（例如引擎连不上时提示代理）。 */
+  status?: "ok" | "degraded" | "unavailable";
 }
 
 /** 有疑问句形状且没有持久化信号 —— 就是提问，不是记忆。 */
@@ -173,7 +175,7 @@ export async function writeFlow(
       confidence: j.worthKeeping.noul, status: j.meta.status,
       fallbackUsed: j.meta.fallbackUsed, latencyMs: j.meta.latencyMs,
     });
-    return { action: "skipped", reason: `worth_keeping ${j.worthKeeping.noul.toFixed(2)}` };
+    return { action: "skipped", reason: `worth_keeping ${j.worthKeeping.noul.toFixed(2)}`, status: j.meta.status };
   }
 
   // J14b：作用域分了置信度就分别对待。低置信度只许收窄（§11 原则 6），
@@ -220,5 +222,5 @@ export async function writeFlow(
     route: resolved.route,
   });
 
-  return { action: "stored", memory, review };
+  return { action: "stored", memory, review, status: j.meta.status };
 }

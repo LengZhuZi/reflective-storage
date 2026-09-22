@@ -48,6 +48,9 @@ interface Runtime {
   configProblems: string[];
   /** 本会话用哪个判断引擎（rules / jev / openai），/memory 要能看见。 */
   engine: string;
+  /** 代理没生效时的提示文本（配了代理但启动时没开 NODE_USE_ENV_PROXY）。只在真失败时提示一次。 */
+  proxyHint: string | null;
+  proxyWarned?: boolean;
   /** query 存着给 J5 用：下次它要判断「这个提问还是上次那件事吗」。 */
   lastRecall?: { status: JudgeMeta["status"] | "skipped"; candidates: number; injected: number; detail?: string; query?: string; at: number };
   lastWrite?: { action: string; reason?: string; at: number };
@@ -203,6 +206,18 @@ function foundLine(r: { memory: MemoryNode; relevance: number }): string {
 }
 
 /**
+ * 引擎真连不上时，才提示代理这件事（每会话最多一次）。
+ *
+ * 原来是在 session_start 无条件提示「配了代理但没开 NODE_USE_ENV_PROXY」—— 但直连好好的时候
+ * 那是误报，天天弹等于噪声。改成看证据：有一次判断拿到 unavailable 才说。
+ */
+function warnProxy(r: Runtime, ctx: ExtensionContext): void {
+  if (!r.proxyHint || r.proxyWarned || !ctx.hasUI) return;
+  r.proxyWarned = true;
+  ctx.ui.notify(r.proxyHint, "warning");
+}
+
+/**
  * 问用户一条待确认项（pi 的 1/2/3 选择框）。
  * 返回处置结果的人话，用户按 Esc 取消就当「保留两条」—— 默认永远选最安全的那个。
  */
@@ -244,9 +259,10 @@ export default function reflectiveStorage(pi: ExtensionAPI): void {
 
     // 代理只影响判断引擎能不能连上，连不上就是召回 fail-degraded、注入 fail-closed。
     // 但必须提示：不提示的话表现是「一直超时」，看不出是代理没生效。
+    // 代理提示**不在这里**发：配了代理不等于代理没生效（直连可能好好的），
+    // 一上来就警告会在网络正常时天天误报。改成「引擎真的连不上时才提示一次」（见 warnProxy）。
     const hint = loaded.config.proxy ? proxyHint(loaded.config) : null;
-    if (hint && ctx.hasUI) ctx.ui.notify(hint, "warning");
-    // 引擎配错了（openai 缺 baseUrl 之类）也要当场说，否则表现只是「judge 一直降级」。
+    // 引擎配错了（openai 缺 baseUrl 之类）要当场说 —— 那个是配置错误，不是网络问题。
     if (judge.problems.length && ctx.hasUI) {
       ctx.ui.notify(`reflective-storage 判断引擎配置：\n${judge.problems.join("\n")}`, "warning");
     }
@@ -256,6 +272,7 @@ export default function reflectiveStorage(pi: ExtensionAPI): void {
       globalDb,
       adapter: createJudgeAdapter(judge),
       engine: judge.provider,
+      proxyHint: hint,
       inject: loaded.inject,
       session: {
         sessionId: ctx.sessionManager.getSessionId() ?? "ephemeral",
@@ -287,7 +304,7 @@ export default function reflectiveStorage(pi: ExtensionAPI): void {
       .catch((e) => { lifecycle.error = `生命周期：${errText(e)}`; });
   });
 
-  pi.on("before_agent_start", async (event, _ctx) => {
+  pi.on("before_agent_start", async (event, ctx) => {
     const r = rt;
     if (!r) return;
     r.state.tick();
@@ -349,6 +366,7 @@ export default function reflectiveStorage(pi: ExtensionAPI): void {
         status: res.status, candidates: res.candidates.length,
         injected: res.injected.length, detail: res.detail, query: event.prompt, at: Date.now(),
       };
+      if (res.status === "unavailable") warnProxy(r, ctx);
       if (res.injected.length === 0) return;   // fail-closed：沉默优于噪声
       r.state.markInjected(res.injected.map((x) => x.memory.id));
       return { message: { customType: "reflective-memory", content: res.block, display: true } };
@@ -385,6 +403,7 @@ export default function reflectiveStorage(pi: ExtensionAPI): void {
       .then(async () => {
         const res = await writeFlow(r.projectDb, r.globalDb, r.adapter, r.session, { userTexts: texts, context });
         r.lastWrite = { action: res.action, reason: res.reason, at: Date.now() };
+        if (res.status === "unavailable") warnProxy(r, ctx);
         // 写入排队问用户的事项：一轮最多问一条，别刷屏（剩下的 /memory review 随时能过）。
         // hasUI 为假（print 模式）就只排队，不问。
         if (res.review?.length && ctx.hasUI) await askReview(r.projectDb, ctx, res.review[0].id);

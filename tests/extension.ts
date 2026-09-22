@@ -296,20 +296,30 @@ await call("session_shutdown");
 console.log("✓ 没配 key：默认走 rules 档，/memory 说清为什么");
 
 // ------------------------------------------------------------ 引擎真失败：fail-closed
+// 引擎连不上 + 配了代理但没开 NODE_USE_ENV_PROXY → 提示一次（网络正常时不许误报，见下）
+const { writeFileSync: writeCfg, chmodSync: chmodCfg } = await import("node:fs");
+writeCfg(path.join(tmp, "config.json"), JSON.stringify({ proxy: { http: "http://127.0.0.1:7897" } }), { mode: 0o600 });
+chmodCfg(path.join(tmp, "config.json"), 0o600);
+delete process.env.NODE_USE_ENV_PROXY;
 const deadFetch: typeof fetch = async () => { throw new Error("模拟引擎连不上"); };
 globalThis.fetch = deadFetch;
 process.env.REFLECTIVE_JUDGE_PROVIDER = "jev";
 process.env.TYPESAFE_API_KEY = "test-key";
 await call("session_start");
+notes.length = 0;   // 清在这里：引擎不可用的提示一次就够，清太晚会把已经发过的那条抹掉
 assert.equal(await call("before_agent_start", { prompt: PROMPT }), undefined, "引擎连不上时 fail-closed：不注入");
-notes.length = 0;
 await runCommand("");
 assert.match(notes.at(-1)!, /判断引擎：jev/);
 assert.match(notes.at(-1)!, /降级/, "引擎连不上必须显示成「降级」，不能报告成「没有记忆」（§6.2）");
 assert.match(notes.at(-1)!, /JEV/, "降级原因要说清是引擎不可用");
+// 写入那条路也连不上 → 这时候才提示代理（每会话一次；网络正常时配着代理也不许天天弹）
+await call("agent_end", { messages: [{ role: "user", content: "以后提交前都要先跑一遍完整测试" }] });
 await call("session_shutdown");
+const proxyNotes = notes.filter((n) => /NODE_USE_ENV_PROXY/.test(n));
+assert.equal(proxyNotes.length, 1, "引擎连不上 + 代理没生效 → 提示一次");
+assert.match(proxyNotes[0], /HTTP_PROXY|NODE_USE_ENV_PROXY/);
 delete process.env.REFLECTIVE_JUDGE_PROVIDER;
-console.log("✓ 引擎连不上时 fail-closed，且 /memory 说的是「降级」不是「没有记忆」");
+console.log("✓ 引擎连不上时 fail-closed，「降级」可见，代理提示只报一次");
 
 fs.rmSync(tmp, { recursive: true, force: true });
 console.log("\n全部通过");

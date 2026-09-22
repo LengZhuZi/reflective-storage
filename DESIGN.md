@@ -342,7 +342,8 @@ const res = await fetch("https://api.typesafe.ai/v1/systemone", {
   - 环境变量（覆盖同名配置项）：`TYPESAFE_API_KEY` / `TYPESAFE_BASE_URL` / `TYPESAFE_MODEL` / `REFLECTIVE_PROXY`。
   - 两者都没有时，报错写明这两个来源和权限要求，报错只写「哪个位置没拿到」，不写值。
 - **代理**：本机 `api.typesafe.ai` 直连被掐，必须走代理。Node 内置 `fetch`（undici）**只跑 HTTP/1.1**，恰好绕过了本机 Clash 的 HTTP/2 故障（实测：h2 带 body 的 POST 稳定 19.6s 超时，h1.1 正常 1.16s）。因此**不需要为它写重试逻辑**，也不需要 ProxyAgent，只要启动 pi 时带上 `HTTP_PROXY` / `HTTPS_PROXY` 且开启 `NODE_USE_ENV_PROXY=1`。
-  - 代理地址也可以只写在 `config.json` 的 `proxy.http` 里（或环境变量 `REFLECTIVE_PROXY`），但 **`NODE_USE_ENV_PROXY=1` 必须在进程启动前设好**，进程内改无效。所以 `session_start` 会检查这件事：配了代理而开关没开时提示一次，并给出可直接照抄的启动命令 —— 不提示的话表现只是「JEV 一直超时」，看不出是代理没生效。
+  - 代理地址也可以只写在 `config.json` 的 `proxy.http` 里（或环境变量 `REFLECTIVE_PROXY`），但 **`NODE_USE_ENV_PROXY=1` 必须在进程启动前设好**，进程内改无效。
+  - 提示的时机是**看证据，不是看配置**：配了代理 ≠ 代理没生效（直连可能好好的），所以不在 `session_start` 无条件警告 —— 那会天天误报。改成「真的有一次判断拿到 `unavailable` 时」提示一次（每会话最多一次），并给出可直接照抄的启动命令。不提示的话表现只是「一直超时」，看不出是代理没生效。
 - **超时**：分两条路径（实测定的，见下）。
 
   | 路径 | 超时 | 重试 | 理由 |

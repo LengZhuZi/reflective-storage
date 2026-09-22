@@ -71,7 +71,9 @@ const QUERY = "帮我把崖壁的影子调亮一点，太黑了";
 assert.equal(worthRecalling("继续").ok, false);
 assert.equal(worthRecalling("好的，谢谢").ok, false);
 assert.equal(worthRecalling("   ").ok, false);
-assert.equal(worthRecalling("影子太黑").ok, false, "短输入先不花这次钱（跳过不打标记，下一轮还会查）");
+assert.equal(worthRecalling("影子太黑").ok, false, "太短的输入先不花这次钱（跳过不打标记，下一轮还会查）");
+// 实测：8 个字的问句是很常见的开场，挡掉它等于整段会话一条记忆都搭不上
+assert.equal(worthRecalling("提交要按什么拆？").ok, true, "短但有内容的问句要查（§10.4 首轮直接走完整召回）");
 assert.equal(worthRecalling("帮我把崖壁的影子强度调低一点，夜里看起来太黑了").ok, true);
 console.log("✓ §10.4 轻量预判挡掉短输入（跳过不打标记，所以不是「本会话永不注入」）");
 

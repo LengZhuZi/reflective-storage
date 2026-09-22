@@ -135,8 +135,12 @@ export interface ResurrectionSummary {
 /**
  * J13 复活：新会话的提问命中归档记忆的主题就放回 active。
  *
- * 阈值故意松（命中 query 三成以上的二字组，且至少 2 个）—— 复活的代价只是多一条
- * 候选，J7 会把它筛掉；反过来，把一条用户其实还需要的老记忆永久埋掉，代价大得多。
+ * 阈值故意松（命中 query 一小撮二字组就够）—— 复活的代价只是多一条候选，J7 会把它
+ * 筛掉；反过来，把一条用户其实还需要的老记忆永久埋掉，代价大得多。
+ *
+ * 实测修正：原来一律要求命中 ≥2 个二字组，结果一句 8 个字的问句（「提交要按什么拆？」）
+ * 只跟记忆共享「提交」一个二字组，复活完全不发生。短问句本来就没几个二字组，
+ * 所以短问句只要求命中 1 个。
  */
 export function resurrectFor(o: OpenedDb, query: string, opts: LifecycleOptions & { limit?: number } = {}): ResurrectionSummary {
   const now = opts.now ?? Date.now();
@@ -144,6 +148,9 @@ export function resurrectFor(o: OpenedDb, query: string, opts: LifecycleOptions 
   const out: ResurrectionSummary = { resurrected: 0, ids: [] };
   const q = bigrams(query);
   if (q.size < 2) return out;
+  const short = q.size <= 10;
+  const minShared = short ? 1 : 2;
+  const minCoverage = short ? 0.15 : 0.3;
 
   let rows: MemoryNode[];
   try {
@@ -160,7 +167,7 @@ export function resurrectFor(o: OpenedDb, query: string, opts: LifecycleOptions 
       for (const g of q) if (hit.has(g)) shared++;
       return { m, shared, coverage: shared / q.size };
     })
-    .filter((s) => s.shared >= 2 && s.coverage >= 0.3)
+    .filter((s) => s.shared >= minShared && s.coverage >= minCoverage)
     .sort((a, b) => b.coverage - a.coverage)
     .slice(0, limit);
 

@@ -88,6 +88,11 @@ assert.ok((getMemory(o, stale.id)!.lastAccessed ?? 0) >= now, "复活要顺手�
 const irrelevant = resurrectFor(o, "今天天气不错适合出去走走", { now });
 assert.equal(irrelevant.resurrected, 0, "不相关的话题不该乱复活");
 assert.equal(resurrectFor(o, "短", { now }).resurrected, 0, "太短的问题没有主题可言");
+// 实测：8 个字的短问句只跟记忆共享 1 个二字组（「提交」），一律要求 ≥2 个就永远复活不了。
+const shortOne = insertMemory(o, { content: "日志统一用 logback，不要用 log4j2", type: "fact", scope: "project", scopeId: "P", importance: 0.4 });
+setState(o, shortOne.id, "archived");
+assert.equal(resurrectFor(o, "日志怎么配？", { now }).resurrected, 1, "短问句命中一个关键词就该放回来（误复活便宜，误埋贵）");
+assert.equal(getMemory(o, shortOne.id)!.state, "active");
 console.log("✓ J13 复活：话题命中才放回 active，无关不动");
 
 // ------------------------------------------------------------ fail-silent（§6.1）

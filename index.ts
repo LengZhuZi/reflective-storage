@@ -203,6 +203,15 @@ export default function reflectiveStorage(pi: ExtensionAPI): void {
     const r = rt;
     if (!r || r.state.doneThisSession) return;
 
+    // J13 复活要先跑，而且必须在预判之前：它是纯本地二字组比对（不吃 token、不调引擎），
+    // 而预判可能因为「输入太短」直接返回 —— 实测就是这样漏掉一次本该发生的复活。
+    try {
+      resurrectFor(r.projectDb, event.prompt ?? "");
+      resurrectFor(r.globalDb, event.prompt ?? "");
+    } catch (e) {
+      r.error = errText(e);   // 纯后台的一层，不该影响召回
+    }
+
     const pre = worthRecalling(event.prompt ?? "");
     if (!pre.ok) {
       // 跳过不打「已注入」标记：这一轮不花那个钱，下一轮话够长还会查。
@@ -211,9 +220,6 @@ export default function reflectiveStorage(pi: ExtensionAPI): void {
     }
 
     try {
-      // J13 复活：先把归档的放回来，再召回 —— 否则刚复活的那条赶不上这次注入。
-      resurrectFor(r.projectDb, event.prompt);
-      resurrectFor(r.globalDb, event.prompt);
       const res = await recallFlow(event.prompt, {
         projectDb: r.projectDb,
         globalDb: r.globalDb,

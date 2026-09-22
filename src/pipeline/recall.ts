@@ -33,8 +33,14 @@ export const RELEVANCE_THRESHOLD = DEFAULT_RELEVANCE_THRESHOLD;
 /** 每一路各取多少条再合并，合并后再压到 MAX_CANDIDATES。 */
 const PER_SOURCE_LIMIT = 50;
 
-/** 短于这个长度的输入不值得花一次召回（"继续"、"好"）。 */
-const MIN_PROMPT = 15;
+/**
+ * 短于这个长度就不值得花一次召回（"继续"、"好"）。
+ *
+ * 为什么不是 §10.4 写的 15：真跑 pi 时一条 8 个字的问句（「提交要按什么拆？」）
+ * 被挡住，整段会话一条记忆都没搭上 —— 而 §10.4 的第一条规则是「首轮直接走完整召回」，
+ * 长度只能用来挡「没有内容」的输入（那些还有 NOISE 正则告着），不能把短问句也一起挡掉。
+ */
+const MIN_PROMPT = 6;
 
 export type Source = "vector" | "keyword" | "scope";
 

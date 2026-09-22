@@ -183,6 +183,7 @@ notes.length = 0;
 await runCommand("");
 assert.match(notes.at(-1)!, /降级/, "JEV 不可用必须显示成「降级」，不能报告成「没有记忆」（§6.2）");
 assert.match(notes.at(-1)!, /JEV/, "降级原因要说清是 JEV 不可用");
+assert.match(notes.at(-1)!, /配置：.*配置文件不存在/, "配置来源的问题要能在 /memory 直接看到，不用去翻代码（600 权限也是这么被发现在的）");
 await call("session_shutdown");
 console.log("✓ JEV 不可用时 fail-closed，且 /memory 说的是「降级」不是「没有记忆」");
 

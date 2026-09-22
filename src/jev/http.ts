@@ -10,7 +10,12 @@
  *   - 单次 68 问题：输入 4946 tokens ≈ $0.0002，1.16s。
  *   - 本机直连 api.typesafe.ai 被掐，必须走代理。Node 内置 fetch（undici）只跑
  *     HTTP/1.1，恰好绕过本机 Clash 的 HTTP/2 故障，所以不需要 ProxyAgent。
+ *
+ * 凭据解析在 src/config.ts（环境变量 > 配置文件 > 报错）。配置文件路径和权限要求
+ * 写在那里的 CONFIG_PATH。
  */
+
+import { loadConfig, missingKeyReason, type JevConfig } from "../config.ts";
 
 export interface NoulQuestion {
   type: "noul";
@@ -59,7 +64,6 @@ export interface JevClientConfig {
   /** 注入点，测试时替换掉 fetch。 */
   fetchImpl?: typeof fetch;
 }
-
 export class JevUnavailableError extends Error {
   readonly cause?: unknown;
   constructor(message: string, cause?: unknown) {
@@ -81,14 +85,31 @@ export class JevHttpClient {
   private readonly model: string;
   private readonly timeoutMs: number;
   private readonly fetchImpl: typeof fetch;
-  private apiKey: string | undefined;
+  private readonly apiKey: string | undefined;
+  /** 实际生效的配置（含配置文件里的代理地址），给 session_start 的提示用。 */
+  readonly config: JevConfig;
+  /** 配置读取时发现的问题，降级时必须能说出来（§6.2）。 */
+  readonly problems: string[];
+  /** 没拿到 key 时的可执行报错，不再让人自己去翻代码找路径。 */
+  private readonly noKeyReason: string;
 
   constructor(config: JevClientConfig = {}) {
-    this.apiKey = config.apiKey ?? process.env.TYPESAFE_API_KEY;
-    this.baseUrl = config.baseUrl ?? "https://api.typesafe.ai";
-    this.model = config.model ?? "jev-latest";
-    this.timeoutMs = config.timeoutMs ?? 3000;
+    // 优先级：显式传参（测试用）> 环境变量 > 配置文件。解析在 src/config.ts。
+    const loaded = loadConfig();
+    this.config = {
+      apiKey: config.apiKey ?? loaded.config.apiKey,
+      baseUrl: config.baseUrl ?? loaded.config.baseUrl ?? "https://api.typesafe.ai",
+      model: config.model ?? loaded.config.model ?? "jev-latest",
+      timeoutMs: config.timeoutMs ?? loaded.config.timeoutMs ?? 3000,
+      proxy: loaded.config.proxy,
+    };
+    this.apiKey = this.config.apiKey;
+    this.baseUrl = this.config.baseUrl!;
+    this.model = this.config.model!;
+    this.timeoutMs = this.config.timeoutMs!;
     this.fetchImpl = config.fetchImpl ?? fetch;
+    this.problems = loaded.problems;
+    this.noKeyReason = missingKeyReason(loaded.problems);
   }
 
   get available(): boolean {
@@ -106,7 +127,7 @@ export class JevHttpClient {
    * 那里宁可不注入，也不能拖住用户。
    */
   async ask(state: string, questions: Questions, opts: AskOptions = {}): Promise<JevResponse> {
-    if (!this.apiKey) throw new JevUnavailableError("TYPESAFE_API_KEY 未设置");
+    if (!this.apiKey) throw new JevUnavailableError(this.noKeyReason);
 
     const timeoutMs = opts.timeoutMs ?? this.timeoutMs;
     const attempts = 1 + Math.max(0, opts.retries ?? 0);

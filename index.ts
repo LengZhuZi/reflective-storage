@@ -19,6 +19,7 @@ import type { JudgeMeta } from "./src/jev/types.ts";
 import type { MemoryNode, SessionInfo } from "./src/core/types.ts";
 import { createJevAdapter, type JevAdapter } from "./src/jev/adapter.ts";
 import { JevHttpClient } from "./src/jev/http.ts";
+import { proxyHint } from "./src/config.ts";
 import {
   addTrace, countMemories, getMemory, hardDelete, listInScope, openGlobalDb, openProjectDb,
   projectIdFor, tracesFor, type OpenedDb,
@@ -38,6 +39,8 @@ interface Runtime {
   pending: Promise<unknown>;
   /** 本会话已经消化过的用户原话，防同一句被评估两次。 */
   digested: Set<string>;
+  /** 配置读取时发现的问题（文件缺失 / 权限不对 / 解析失败），/memory 要能看见。 */
+  configProblems: string[];
   lastRecall?: { status: JudgeMeta["status"] | "skipped"; candidates: number; injected: number; detail?: string; at: number };
   lastWrite?: { action: string; reason?: string; at: number };
   error?: string;
@@ -108,6 +111,7 @@ function statusText(r: Runtime): string {
   const lr = r.lastRecall;
   if (lr) lines.push(`上次召回：${label(lr.status)}，候选 ${lr.candidates} → 注入 ${lr.injected}${lr.detail ? `（${lr.detail}）` : ""}`);
   if (r.lastWrite) lines.push(`上次写入：${r.lastWrite.action}${r.lastWrite.reason ? `（${r.lastWrite.reason}）` : ""}`);
+  for (const p of r.configProblems) lines.push(`配置：${p}`);
   if (r.error) lines.push(`最近错误：${r.error}`);
   return lines.join("\n");
 }
@@ -122,10 +126,17 @@ export default function reflectiveStorage(pi: ExtensionAPI): void {
   pi.on("session_start", async (_event, ctx) => {
     const projectDb = openProjectDb(ctx.cwd);
     const globalDb = openGlobalDb();
+    const client = new JevHttpClient();
+
+    // 代理只影响 JEV 能不能连上，连不上就是召回 fail-degraded、注入 fail-closed。
+    // 但必须提示：不提示的话表现是「JEV 一直超时」，看不出是代理没生效。
+    const hint = proxyHint(client.config);
+    if (hint && ctx.hasUI) ctx.ui.notify(hint, "warning");
+
     rt = {
       projectDb,
       globalDb,
-      adapter: createJevAdapter(new JevHttpClient()),
+      adapter: createJevAdapter(client),
       session: {
         sessionId: ctx.sessionManager.getSessionId() ?? "ephemeral",
         cwd: ctx.cwd,
@@ -135,6 +146,7 @@ export default function reflectiveStorage(pi: ExtensionAPI): void {
       state: new InjectionState(),
       pending: Promise.resolve(),
       digested: new Set<string>(),
+      configProblems: client.problems,
     };
   });
 

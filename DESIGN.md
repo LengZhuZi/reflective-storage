@@ -294,7 +294,7 @@ export interface JevAdapter {
 const res = await fetch("https://api.typesafe.ai/v1/systemone", {
   method: "POST",
   headers: {
-    Authorization: `Bearer ${process.env.TYPESAFE_API_KEY}`,
+    Authorization: `Bearer ${apiKey}`,                 // 解析见 src/config.ts：环境变量 > config.json > 报错
     "Content-Type": "application/json",
   },
   body: JSON.stringify({
@@ -307,8 +307,12 @@ const res = await fetch("https://api.typesafe.ai/v1/systemone", {
 // → { model, answers: {...}, usage: { input_tokens, output_tokens } }
 ```
 
-- **认证**：`TYPESAFE_API_KEY` 只走环境变量，禁止入库、入日志、入记忆。
+- **认证**：凭据走配置文件或环境变量，**环境变量优先**，两者都只在本机，绝不进仓库/日志/记忆。
+  - 配置文件：`~/.pi/agent/reflective-storage/config.json`，权限**必须 600**。权限不对就**不读它**，并把原因写进降级说明（不静默）—— 一个 644 的文件不该被当成可用的凭据源。
+  - 环境变量（覆盖同名配置项）：`TYPESAFE_API_KEY` / `TYPESAFE_BASE_URL` / `TYPESAFE_MODEL` / `REFLECTIVE_PROXY`。
+  - 两者都没有时，报错写明这两个来源和权限要求，报错只写「哪个位置没拿到」，不写值。
 - **代理**：本机 `api.typesafe.ai` 直连被掐，必须走代理。Node 内置 `fetch`（undici）**只跑 HTTP/1.1**，恰好绕过了本机 Clash 的 HTTP/2 故障（实测：h2 带 body 的 POST 稳定 19.6s 超时，h1.1 正常 1.16s）。因此**不需要为它写重试逻辑**，也不需要 ProxyAgent，只要启动 pi 时带上 `HTTP_PROXY` / `HTTPS_PROXY` 且开启 `NODE_USE_ENV_PROXY=1`。
+  - 代理地址也可以只写在 `config.json` 的 `proxy.http` 里（或环境变量 `REFLECTIVE_PROXY`），但 **`NODE_USE_ENV_PROXY=1` 必须在进程启动前设好**，进程内改无效。所以 `session_start` 会检查这件事：配了代理而开关没开时提示一次，并给出可直接照抄的启动命令 —— 不提示的话表现只是「JEV 一直超时」，看不出是代理没生效。
 - **超时**：分两条路径（实测定的，见下）。
 
   | 路径 | 超时 | 重试 | 理由 |
@@ -562,7 +566,7 @@ pi 扩展是**运行在 pi 进程内的 TypeScript 模块**，通过 jiti 加载
 ~/.pi/agent/reflective-storage/
 ├── global.db                 # scope='global'
 ├── projects/<project-id>.db  # scope='project'，一个项目一个库
-└── config.json                # 阈值、开关、budget
+└── config.json                # 阈值、开关、budget、凭据（权限必须 600；见 §5.2）
 ```
 
 `project-id` 解析：最近 `.git` 祖先目录名（与既有实践一致——用 cwd 的 basename 会在深层目录下解析出 `java` 这种垃圾库名）。

@@ -21,6 +21,7 @@ JEV 驱动的长期记忆运行时，作为 [pi](https://pi.dev) 的原生扩展
 
 ```
 index.ts                pi 扩展入口：六个 hook + 三个工具 + /memory 命令
+src/config.ts           配置与凭据解析（环境变量 > config.json > 报错）
 src/core/types.ts       记忆节点与作用域模型
 src/jev/types.ts        判断结果类型（三态 status）
 src/jev/http.ts         JEV 传输层：超时、重试、usage
@@ -36,7 +37,7 @@ src/pipeline/inject.ts  注入块组装与「每会话只注入一次」的状�
 ## 依赖
 
 - **Node.js 24+** —— 用到内置的 `node:sqlite`，无需第三方数据库驱动
-- **JEV API key** —— 从 https://console.typesafe.ai/keys 获取，只放环境变量
+- **JEV API key** —— 从 https://console.typesafe.ai/keys 获取，放 `~/.pi/agent/reflective-storage/config.json`（权限 600）或环境变量
 - 本地 embedding 模型 —— 用 `scripts/fetch-model.sh` 拉一次，之后完全离线
 
 ```bash
@@ -50,6 +51,7 @@ bash scripts/fetch-model.sh
 
 ```bash
 node tests/smoke.ts       # storage + embedding + 四个 gate 的成功路径与三条失败路径
+node tests/config.ts      # 配置与凭据：环境变量覆盖、600 权限把关、报错可读、代理提示
 node tests/write.ts       # 写入流程：预筛、脱敏、作用域分流、fail-open
 node tests/recall.ts      # 召回流程：门禁、阈值、fail-degraded、fail-closed、预算
 node tests/inject.ts      # 注入块：声明、转义、预算截断、状态机
@@ -62,10 +64,23 @@ node tests/extension.ts   # pi 绑定：hook/工具/命令、每会话一次、�
 
 | 变量 | 说明 |
 | --- | --- |
-| `TYPESAFE_API_KEY` | JEV API key。只从环境变量读，不落盘、不入库、不进日志 |
-| `HTTP_PROXY` / `HTTPS_PROXY` | JEV 端点在部分网络下需要代理 |
-| `NODE_USE_ENV_PROXY=1` | **必需**。Node 的内置 fetch 默认不读代理变量，必须在启动进程前设置 |
+| `TYPESAFE_API_KEY` | JEV API key。配置文件或环境变量，两者都只在本机，不落盘到仓库、不入库、不进日志 |
+| `TYPESAFE_BASE_URL` / `TYPESAFE_MODEL` | JEV 端点和模型，缺省 `https://api.typesafe.ai` / `jev-latest` |
+| `REFLECTIVE_PROXY` | 代理地址，等价于配置文件里的 `proxy.http` |
+| `HTTP_PROXY` / `HTTPS_PROXY` | JEV 端点需要代理时用，配合下面的开关 |
+| `NODE_USE_ENV_PROXY=1` | **必需**（要用代理时）。Node 的内置 fetch 默认不读代理变量，且必须在启动进程前设置 —— 进程内改无效 |
 | `REFLECTIVE_HOME` | 记忆库位置，默认 `~/.pi/agent/reflective-storage` |
+
+环境变量优先级高于配置文件。凭据放在 `~/.pi/agent/reflective-storage/config.json`（**权限必须 600**）：
+
+```json
+{
+  "typesafe": { "apiKey": "...", "baseUrl": "https://api.typesafe.ai", "model": "jev-latest" },
+  "proxy": { "http": "http://127.0.0.1:7897" }
+}
+```
+
+权限不是 600 就不读这个文件（并把原因显示在 `/memory` 里），权限不对时用环境变量可以照常工作。
 
 ## 数据存放
 

@@ -39,6 +39,7 @@ src/pipeline/recall.ts  召回流程：多路召回、作用域门禁、J7、J8�
 src/pipeline/inject.ts  注入块组装与「每会话只注入一次」的状态
 src/pipeline/lifecycle.ts 生命周期：J10 衰减 / J9 巩固 / J12 归档 / J13 复活（纯后台）
 src/pipeline/feedback.ts  J15 事后核对：注入的记忆有没有真被用上（纯本地字符串比对）
+src/pipeline/review.ts    待确认队列：低置信冲突 + 合并提议，问用户来拍（pi 的 1/2/3 选择）
 ```
 
 ## 判断引擎（三档，都是正式档位）
@@ -73,6 +74,7 @@ node tests/judge.ts       # 三档引擎、阈值跟着引擎走、OpenAI 兼容
 node tests/governance.ts  # J14b 置信度分级（作用域只许收窄）+ J14c 一句人话
 node tests/lifecycle.ts   # J10 衰减公式、J9 巩固、J12 归档（高 importance 不动）、J13 复活、fail-silent
 node tests/feedback.ts    # J15 事后核对：确凿用上的判定、换了说法的盲区、空回复不覆盖
+node tests/review.ts      # 待确认队列：只提议不动数据、三种处置、被取代的不再召回
 node tests/write.ts       # 写入流程：预筛、脱敏、作用域分流、fail-open
 node tests/recall.ts      # 召回流程：门禁、阈值、fail-degraded、fail-closed、预算
 node tests/inject.ts      # 注入块：声明、转义、预算截断、状态机
@@ -151,6 +153,18 @@ sqlite3 $D/projects/*.db "select content,type,scope from memories; select gate,a
 - **FTS5 对中文是字符三元组**：`影子太黑` 匹配不到 `影子强度`（没有共同三字组），只能当粗筛。
 - 向量层缺失时系统照常运行，只是召回少一路语义候选。关系层是事实源，向量层随时可重建。
 - 写入口的 J3 候选（跟新内容最相关的 20 条）也靠向量那一路排序。向量层不可用时它会退化成「最近的作用域内记忆」，冲突检测随之变弱 —— 但写入本身不受影响。
+
+## 会问你的两种情况
+
+引擎判不了的事不替用户拍，也不装没看见 —— 排队问，用 pi 的 1/2/3 选择框：
+
+| 什么时候 | 问什么 | 选项（默认第一个，按 Esc 也是它） |
+| --- | --- | --- |
+| 新记忆和已有某条**看着是同一件事** | 要合并吗 | 保留两条（并存） / 用新的取代旧的 / 保留旧的 |
+| 引擎给的冲突/取代关系**置信度 < 0.5** | 怎么处理 | 同上 |
+
+只改状态、记关系，**不硬删**。一轮最多问一条；`/memory review` 可以把攒下的一次过；
+`print` 模式不弹窗，只排队。
 
 ## 状态
 

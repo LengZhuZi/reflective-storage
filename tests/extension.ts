@@ -35,12 +35,18 @@ factory({
 } as never);
 
 const notes: string[] = [];
+/** 记下问过用户什么（pi 里是 ctx.ui.select 的 1/2/3 选择框）。 */
+const selects: Array<[string, string[]]> = [];
 /** 假的当前分支：memory_add 要从中取「用户自己的话」（真 pi 里是 sessionManager.getBranch()）。 */
 const branch: unknown[] = [];
 const ctx = {
   cwd: tmp,
   sessionManager: { getSessionId: () => "s1", getBranch: () => branch },
-  ui: { notify: (text: string) => { notes.push(text); } },
+  hasUI: true,
+  ui: {
+    notify: (text: string) => { notes.push(text); },
+    select: async (title: string, options: string[]) => { selects.push([title, options]); return options[0]; },
+  },
 } as never;
 
 const call = (name: string, event?: unknown) => handlers.get(name)!(event, ctx);
@@ -174,6 +180,14 @@ assert.ok(writtenId, "agent_end 写的记忆该落地（后台队列不拖用户
 assert.match(lastState, /USER SAID EARLIER IN THIS SESSION:\n我们在讨论提交要按什么拆/, "真链路上也要把前面几轮用户的话送给判断引擎");
 console.log("✓ agent_end 只取用户自己的话，重复的那句不会被评估两次；上下文带上前几轮");
 
+// 落库后排队的合并提议（看着是同一件事）会在 agent_end 之后问用户一次 ——
+// pi 的 1/2/3 选择框，不弹第二个（一轮最多问一条，剩下的 /memory review 过）。
+for (let i = 0; i < 100 && selects.length === 0; i++) await new Promise((r) => setTimeout(r, 50));
+assert.ok(selects.length >= 1, "有合并提议时要问用户一次");
+assert.match(selects[0][0], /记忆待确认/);
+assert.match(selects[0][0], /同一件事/);
+assert.equal(selects[0][1][0], "保留两条（并存）", "默认选项必须是最安全的那个（按 Esc 就是这个）");
+
 // ------------------------------------------------------------ 工具 + 命令
 const search = await tools.get("memory_search")!.execute(undefined, { query: "影子" }, undefined, undefined, ctx) as { content: Array<{ text: string }> };
 assert.ok(search.content[0].text.includes(evil.id), "memory_search 要返回 id，用户才能照它删");
@@ -223,6 +237,27 @@ assert.match(notes.at(-1)!, /已删除/);
 assert.ok(!(await tools.get("memory_search")!.execute(undefined, { query: "Flyway" }, undefined, undefined, ctx) as { content: Array<{ text: string }> }).content[0].text.includes(evil.id));
 console.log("✓ 三个工具 + /memory 命令（query 只列不删，id 才真删）");
 
+// ------------------------------------------------------------ 待确认队列：问用户
+const { enqueueReview, countPendingReviews } = await import("../src/storage/db.ts");
+const anyMemory = (seed.db.prepare(`SELECT id FROM memories LIMIT 1`).get() as { id: string }).id;
+enqueueReview(seed, {
+  kind: "merge", memoryId: anyMemory, otherId: anyMemory, question: "测试用提议：这两条要合并吗？",
+  options: ["保留两条（并存）", "用新的取代旧的", "保留旧的，把新的标为已取代"],
+});
+assert.equal(countPendingReviews(seed), 1);
+selects.length = 0;
+await runCommand("review");
+assert.equal(selects.length, 1, "/memory review 要逐条问用户（pi 的 1/2/3 选择）");
+assert.match(selects[0][0], /测试用提议/);
+assert.equal(selects[0][1].length, 3, "三个选项：并存 / 用新的取代旧的 / 保留旧的");
+assert.equal(countPendingReviews(seed), 0, "问过的就出队列");
+// 没有待确认时不该弹窗
+selects.length = 0;
+await runCommand("review");
+assert.equal(selects.length, 0);
+assert.match(notes.at(-1)!, /没有待确认/);
+console.log("✓ 待确认队列：/memory review 逐条问用户，问完出队列");
+
 // ------------------------------------------------------------ 收尾冲刷待写队列
 await call("session_shutdown");
 globalThis.fetch = realFetch;
@@ -231,6 +266,11 @@ assert.equal(countMemories(after), before + 1, "session_shutdown 必须把后台
 const contents = (after.db.prepare(`SELECT content FROM memories`).all() as Array<{ content: string }>).map((r) => r.content);
 assert.ok(!contents.some((c) => c.includes("retrieved-memories")), "注入块不能被当成用户的话写回库");
 assert.ok(contents.some((c) => c.includes("Flyway")), "用户那句该被写进去");
+// 队列不许无限攒：问过的不留，没问的也只留极少数（memory_add 那条路不问，留着给 /memory review）
+assert.ok(
+  (after.db.prepare(`SELECT count(*) c FROM review_queue WHERE status = 'pending'`).get() as { c: number }).c <= 1,
+  "待确认队列不能越攒越多",
+);
 after.close();
 seed.close();
 console.log("✓ session_shutdown 冲刷待写队列，注入块没被写回库");

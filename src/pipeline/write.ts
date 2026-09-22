@@ -23,6 +23,7 @@ import {
   type InsertMemory, type OpenedDb,
 } from "../storage/db.ts";
 import { recallCandidates } from "./recall.ts";
+import { queueAfterWrite, type ReviewItem } from "./review.ts";
 
 /** 低于这个概率就不写。实测 §4.1：明确要求记住的给出 0.86–0.89，无关内容 0.2。 */
 export const KEEP_THRESHOLD = 0.5;
@@ -80,6 +81,8 @@ export interface WriteResult {
   memory?: MemoryNode;
   /** 为什么跳过，用于 /memory 展示。 */
   reason?: string;
+  /** 落库后排队等用户确认的事项（合并提议 / 低置信冲突），由调用方决定什么时候问。 */
+  review?: ReviewItem[];
 }
 
 /** 有疑问句形状且没有持久化信号 —— 就是提问，不是记忆。 */
@@ -188,6 +191,10 @@ export async function writeFlow(
     addRelation(target, memory.id, j.targetId, j.relation.choice, j.relation.confidence);
   }
 
+  // 引擎不确定的事（§6 的 <0.5 档）和「看着是同一件事」（§9.3 合并）排进待确认队列。
+  // 这里只提议、不动数据 —— 判不了就交给用户，别让污染记忆自己沉淀下去。
+  const review = queueAfterWrite(target, memory, candidates, j.relation);
+
   addTrace(target, {
     memoryId: memory.id, stage: "write", gate: j.meta.gate, action: "keep",
     targetId: j.targetId, reason: `${j.type.choice}/${j.scope.choice} → ${resolved.scope}（${j.type.confidence.toFixed(2)}/${j.scope.confidence.toFixed(2)}，候选 ${candidates.length}）`,
@@ -196,5 +203,5 @@ export async function writeFlow(
     route: resolved.route,
   });
 
-  return { action: "stored", memory };
+  return { action: "stored", memory, review };
 }

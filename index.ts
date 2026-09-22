@@ -20,13 +20,14 @@ import type { MemoryNode, SessionInfo } from "./src/core/types.ts";
 import { createJudgeAdapter, type JevAdapter } from "./src/jev/adapter.ts";
 import { loadConfig, proxyHint, type InjectConfig } from "./src/config.ts";
 import {
-  addTrace, countMemories, getMemory, hardDelete, listInScope, openGlobalDb, openProjectDb,
-  projectIdFor, recentRecalls, tracesFor, type OpenedDb,
+  addTrace, countMemories, countPendingReviews, getMemory, hardDelete, listInScope,
+  openGlobalDb, openProjectDb, projectIdFor, recentRecalls, tracesFor, type OpenedDb,
 } from "./src/storage/db.ts";
 import { writeFlow } from "./src/pipeline/write.ts";
 import { recallFlow, worthRecalling } from "./src/pipeline/recall.ts";
 import { resurrectFor, runLifecycle } from "./src/pipeline/lifecycle.ts";
 import { closeFeedbackLoop } from "./src/pipeline/feedback.ts";
+import { RESOLUTION_LABELS, applyResolution, labelToResolution, pendingItems } from "./src/pipeline/review.ts";
 import { DEFAULT_MAX_TOKENS, InjectionState, MEMORY_OPEN } from "./src/pipeline/inject.ts";
 
 /** 本会话的运行时状态。每次 session_start 重建，session_shutdown 拆掉。 */
@@ -178,6 +179,8 @@ function statusText(r: Runtime): string {
   const lr = r.lastRecall;
   if (lr) lines.push(`上次召回：${label(lr.status)}，候选 ${lr.candidates} → 注入 ${lr.injected}${lr.detail ? `（${lr.detail}）` : ""}`);
   if (r.lastWrite) lines.push(`上次写入：${r.lastWrite.action}${r.lastWrite.reason ? `（${r.lastWrite.reason}）` : ""}`);
+  const pending = countPendingReviews(r.projectDb);
+  if (pending > 0) lines.push(`待确认：${pending} 条（/memory review 过一遍）`);
   if (r.lastFeedback) {
     lines.push(`上次注入效果：注入 ${r.lastFeedback.injected} 条，确凿用上 ${r.lastFeedback.cited} 条${r.lastFeedback.score === null ? "" : `（命中率 ${(r.lastFeedback.score * 100).toFixed(0)}%）`}`);
   }
@@ -196,6 +199,20 @@ function statusText(r: Runtime): string {
 
 function foundLine(r: { memory: MemoryNode; relevance: number }): string {
   return `[${r.memory.id}] (${r.memory.type}/${r.memory.scope}) ${r.relevance.toFixed(2)} ${r.memory.content}`;
+}
+
+/**
+ * 问用户一条待确认项（pi 的 1/2/3 选择框）。
+ * 返回处置结果的人话，用户按 Esc 取消就当「保留两条」—— 默认永远选最安全的那个。
+ */
+async function askReview(o: OpenedDb, ctx: ExtensionContext, reviewId: string): Promise<string | null> {
+  const item = pendingItems(o, 50).find((it) => String(it.id) === reviewId);
+  if (!item) return null;
+  const options = JSON.parse(String(item.options)) as string[];
+  const labels = options.length ? options : Object.values(RESOLUTION_LABELS);
+  const picked = await ctx.ui.select(`记忆待确认：${String(item.question)}`, labels);
+  const resolution = labelToResolution(picked ?? RESOLUTION_LABELS.keep_both);
+  return applyResolution(o, item, resolution);
 }
 
 export default function reflectiveStorage(pi: ExtensionAPI): void {
@@ -233,6 +250,12 @@ export default function reflectiveStorage(pi: ExtensionAPI): void {
       digested: new Set<string>(),
       configProblems: [...loaded.problems, ...judge.problems],
     };
+
+    // 有待确认的事项就在启动时说一声（不弹窗：一次弹五个对话框比不问更糟）。
+    const pending = countPendingReviews(projectDb);
+    if (pending > 0 && ctx.hasUI) {
+      ctx.ui.notify(`reflective-storage：有 ${pending} 条记忆等你确认（合并 / 冲突），/memory review`, "info");
+    }
 
     // 懒生命周期（§9.3）：没有定时任务，就挂在 session_start 上跑一次，且有上限。
     // 纯后台（fail-silent）：不 await、出错也不影响会话。
@@ -339,12 +362,17 @@ export default function reflectiveStorage(pi: ExtensionAPI): void {
     }
     if (texts.length === 0) return;
     // 写入 fail-open 且不该拖住用户：排队后台跑，session_shutdown 冲刷。
+    const policy = r.inject;
     r.pending = r.pending
       .then(async () => {
         const res = await writeFlow(r.projectDb, r.globalDb, r.adapter, r.session, { userTexts: texts, context });
         r.lastWrite = { action: res.action, reason: res.reason, at: Date.now() };
+        // 写入排队问用户的事项：一轮最多问一条，别刷屏（剩下的 /memory review 随时能过）。
+        // hasUI 为假（print 模式）就只排队，不问。
+        if (res.review?.length && ctx.hasUI) await askReview(r.projectDb, ctx, res.review[0].id);
       })
       .catch((e) => { r.error = errText(e); });
+    void policy;
   });
 
   pi.on("session_compact", async () => {
@@ -515,6 +543,23 @@ export default function reflectiveStorage(pi: ExtensionAPI): void {
             ? traces.map((t) => `${t.user_visible ?? ""}\n    ${t.gate} ${t.action} ${t.reason ?? ""} [${t.status ?? "?"}/${t.fallback_used ?? "?"}]${t.judgment ? ` 路由=${t.judgment}` : ""}`)
             : ["没有判断轨迹"]),
         ].join("\n"), "info");
+        return;
+      }
+
+      if (sub === "review" || sub === "review-") {
+        const items = pendingItems(r.projectDb, tail ? Number(tail) || 5 : 5);
+        if (items.length === 0) {
+          ctx.ui.notify("没有待确认的记忆", "info");
+          return;
+        }
+        if (!ctx.hasUI) {
+          ctx.ui.notify(
+            items.map((it) => `[${String(it.id).slice(0, 8)}] ${String(it.question).replace(/\n/g, " ")}`).join("\n"),
+            "info",
+          );
+          return;
+        }
+        for (const item of items) await askReview(r.projectDb, ctx, String(item.id));
         return;
       }
 

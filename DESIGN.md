@@ -374,6 +374,23 @@ const res = await fetch("https://api.typesafe.ai/v1/systemone", {
 `judgment='user'`，等 Phase 2 的复核入口。路由结果写进 `reflection_traces.judgment`，
 一句人话写进 `user_visible`（J14c，模板拼接，不调引擎），`/memory why <id>` 直接显示。
 
+**`<0.5` 那一档怎么落地（待确认队列）**：引擎判不了就**问用户**，不替用户拍，也不装没看见。
+写入落库后如果有这两种情况，就排队（`review_queue` 表）：
+
+| 来源 | 条件 | 问什么 |
+| --- | --- | --- |
+| J3 低置信 | 关系是 `supersedes` / `contradicts` 但置信度 < 0.5 | 这两条是不是冲突，怎么处理 |
+| J11 合并 | 新记忆与某条候选有连续 ≥6 个二字组的相同片段（≈7 字以上原样片段） | 这两条是不是同一件事，要合并吗 |
+
+三个选项，默认（按 Esc 也是）永远是最安全的「保留两条（并存）」：`keep_both` / `keep_new`
+（旧 → `superseded`）/ `keep_old`（新 → `superseded`）。**只改状态 + 记关系，不硬删**。
+
+两条纪律：
+- **提议阶段不动任何数据**（只写队列）。近似查重的判据当自动执行是错的（会误合并丢真记忆，
+  §8.5 实测过），但当**建议**是对的 —— 提议错了用户一票否决，代价为零。
+- **一轮最多问一条**：一次弹五个「要不要合并」比不问更烦。剩下的 `/memory review` 随时过一遍；
+  `session_start` 只在有待确认时提示一句（不弹窗），print 模式只排队。
+
 **J15 记录什么**：每次召回写一条 `feedback_logs` —— query、召回集、注入集，然后在 `agent_end`
 做一次**事后核对**，把「回复里真的出现了这条记忆」的 id 写进 `cited_ids`，`effect_score` = cited/injected。
 

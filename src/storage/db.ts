@@ -71,6 +71,21 @@ CREATE TABLE IF NOT EXISTS reflection_traces (
 );
 CREATE INDEX IF NOT EXISTS idx_traces_created ON reflection_traces(created_at DESC);
 
+-- 待确认队列（§6 的「<0.5 交用户确认」+ §9.3 的合并）。
+-- 引擎不确定的事不替用户拍，也不装没看见：排队，等用户过一遍。
+CREATE TABLE IF NOT EXISTS review_queue (
+  id              TEXT PRIMARY KEY,
+  kind            TEXT NOT NULL,          -- merge / conflict
+  memory_id       TEXT NOT NULL,          -- 新记的那条
+  other_id        TEXT,                   -- 已有的那条
+  question        TEXT NOT NULL,
+  options         TEXT NOT NULL,          -- JSON 数组
+  status          TEXT NOT NULL,          -- pending / resolved
+  resolution      TEXT,
+  created_at      INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_review_status ON review_queue(status, created_at DESC);
+
 -- J15 轻量反馈（§7.1）。Phase 1 只记录 recalled / injected；cited 与 user_feedback
 -- 留空 —— 「模型有没有真用上」要等 Phase 2 的事后核对，现在编不出来。
 CREATE TABLE IF NOT EXISTS feedback_logs (
@@ -406,6 +421,59 @@ export function updateRecallOutcome(o: OpenedDb, id: string, citedIds: string[],
   o.db
     .prepare(`UPDATE feedback_logs SET cited_ids = ?, effect_score = ? WHERE id = ?`)
     .run(JSON.stringify(citedIds), effectScore, id);
+}
+
+// ---------------------------------------------------------------- 待确认队列（§6 / §9.3）
+
+export interface ReviewRow extends Row {
+  id: string;
+  kind: string;
+  memory_id: string;
+  other_id: string | null;
+  question: string;
+  options: string;
+  status: string;
+}
+
+export interface EnqueueReview {
+  kind: string;
+  memoryId: string;
+  otherId: string | null;
+  question: string;
+  options: string[];
+}
+
+/**
+ * 排队问用户。同一个（kind, memory, other）已经有 pending 的就不同重复排 ——
+ * 同一件事被问第二遍比不问更惹人烦。返回新行 id，重复时返回 null。
+ */
+export function enqueueReview(o: OpenedDb, r: EnqueueReview): string | null {
+  const dupe = o.db
+    .prepare(`SELECT id FROM review_queue WHERE status = 'pending' AND kind = ? AND memory_id = ? AND other_id IS ?`)
+    .get(r.kind, r.memoryId, r.otherId) as Row | undefined;
+  if (dupe) return null;
+  const id = randomUUID();
+  o.db
+    .prepare(
+      `INSERT INTO review_queue (id, kind, memory_id, other_id, question, options, status, resolution, created_at)
+       VALUES (?,?,?,?,?,?, 'pending', NULL, ?)`,
+    )
+    .run(id, r.kind, r.memoryId, r.otherId, r.question, JSON.stringify(r.options), Date.now());
+  return id;
+}
+
+export function pendingReviews(o: OpenedDb, limit = 20): ReviewRow[] {
+  return o.db
+    .prepare(`SELECT * FROM review_queue WHERE status = 'pending' ORDER BY created_at ASC, rowid ASC LIMIT ?`)
+    .all(limit) as ReviewRow[];
+}
+
+export function countPendingReviews(o: OpenedDb): number {
+  return Number((o.db.prepare(`SELECT count(*) c FROM review_queue WHERE status = 'pending'`).get() as Row).c);
+}
+
+export function resolveReview(o: OpenedDb, id: string, resolution: string): void {
+  o.db.prepare(`UPDATE review_queue SET status = 'resolved', resolution = ? WHERE id = ?`).run(resolution, id);
 }
 
 export function countMemories(o: OpenedDb): number {

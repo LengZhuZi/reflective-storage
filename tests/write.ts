@@ -13,7 +13,8 @@ import * as path from "node:path";
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "reflect-write-"));
 process.env.REFLECTIVE_HOME = tmp;
 
-const { openDb, countMemories, listInScope } = await import("../src/storage/db.ts");
+const { openDb, countMemories, listInScope, insertMemory, putEmbedding } = await import("../src/storage/db.ts");
+const { embed } = await import("../src/embed/encoder.ts");
 const { writeFlow, worthEvaluating, buildCandidate, redact, KEEP_THRESHOLD } = await import("../src/pipeline/write.ts");
 
 const project = openDb(path.join(tmp, "proj.db"));
@@ -21,9 +22,10 @@ const global = openDb(path.join(tmp, "global.db"));
 const session = { sessionId: "s1", cwd: tmp, projectId: "P", injectedIds: new Set<string>() };
 
 /** 假 adapter：只实现 writeFlow 用到的那一个方法。 */
-function fakeAdapter(worth: number, opts: { scope?: "global" | "project" | "session"; relation?: string; fail?: boolean; confidence?: number; type?: string } = {}) {
+function fakeAdapter(worth: number, opts: { scope?: "global" | "project" | "session"; relation?: string; fail?: boolean; confidence?: number; type?: string; seen?: string[] } = {}) {
   return {
-    async judgeWrite() {
+    async judgeWrite(_content: string, _context: string, candidates: Array<{ content: string }>) {
+      opts.seen?.push(...candidates.map((c) => c.content));
       return {
         worthKeeping: { noul: worth },
         type: { choice: opts.type ?? "event", confidence: opts.confidence ?? 0.9, probabilities: {} },
@@ -178,6 +180,34 @@ assert.equal(logged[0].query, "迁移工具");
 assert.deepEqual(JSON.parse(String(logged[0].injected_ids)), ["a"]);
 assert.equal(logged[0].cited_ids, null, "刚登记时 cited 还是空的（要等 agent_end 事后核对）");
 console.log("✓ J15 召回日志：只记事实，cited / user_feedback 留空");
+
+// ------------------------------------------- J3 候选要「最相关」而不是「最近入库的 20 条」
+const oldShadow = insertMemory(project, { content: "影子强度按立面高度算，不要按海拔调", type: "fact", scope: "project", scopeId: "P" });
+// 真实写入路径会给每条记忆算 embedding（write.ts 里的 putEmbedding），这里要照着做：
+// 没有向量的记忆只能靠「最近」排序，那不是这条断言要测的东西。
+putEmbedding(project, oldShadow.id, await embed(oldShadow.content));
+for (let i = 0; i < 25; i++) {
+  insertMemory(project, { content: `第 ${i} 条构建日志：esbuild 打包参数与缓存命中情况 -${i}`, type: "event", scope: "project", scopeId: "P" });
+}
+const seen: string[] = [];
+await writeFlow(project, global, fakeAdapter(0.9, { seen }), session, {
+  userTexts: ["影子强度以后都按立面高度算"], context: "",
+});
+assert.ok(
+  seen.some((c) => c.includes("影子强度按立面高度算")),
+  "很久以前的那条相关记忆必须进候选 —— 按「最近 20 条」取的话它早被 25 条日志挤出去了（实测过）",
+);
+assert.ok(seen.length <= 20, "候选还是压在 20 条以内（§4.1 实测的高区分度区间）");
+
+// global 记忆也要参与冲突判断（原来候选只查项目库，global 从来没进过 J3 的视野）
+const gPref = insertMemory(global, { content: "用户偏好：回答先给结论，再给理由", type: "preference", scope: "global", scopeId: null });
+putEmbedding(global, gPref.id, await embed(gPref.content));
+const seenGlobal: string[] = [];
+await writeFlow(project, global, fakeAdapter(0.9, { seen: seenGlobal }), session, {
+  userTexts: ["回答都先给结论再解释，别绕"], context: "",
+});
+assert.ok(seenGlobal.some((c) => c.includes("先给结论")), "global 库里的记忆也要进候选");
+console.log("✓ J3 候选按相关性取（很旧的相关记忆也进得来），且 global 库参与冲突判断");
 
 // ------------------------------------------------------------ 断言常量
 assert.ok(KEEP_THRESHOLD > 0.2 && KEEP_THRESHOLD < 0.86, "阈值必须落在实测的无关(0.2)和明确要求(0.86)之间");

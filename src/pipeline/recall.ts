@@ -116,7 +116,15 @@ function remember(pool: Map<string, Candidate>, m: MemoryNode, source: Source, v
   pool.set(m.id, { memory: m, sources: new Set([source]), vectorSim });
 }
 
-async function gather(query: string, deps: RecallDeps): Promise<Map<string, Candidate>> {
+/** 候选生成只需要这两个库和当前会话。 */
+export interface CandidateDeps {
+  projectDb: OpenedDb;
+  globalDb: OpenedDb;
+  session: SessionInfo;
+  limit?: number;
+}
+
+async function gather(query: string, deps: CandidateDeps): Promise<Map<string, Candidate>> {
   const pool = new Map<string, Candidate>();
 
   // 向量那一路只生成候选。实测命中与无关的余弦间隔只有 0.046（§13.2），
@@ -204,6 +212,27 @@ export async function recallFlow(query: string, deps: RecallDeps): Promise<Recal
   return result;
 }
 
+/** 合并后的排序 + 门禁 + 压到 limit 条。召回和写入两条路共用同一套口径。 */
+function rank(pool: Map<string, Candidate>, session: SessionInfo, limit: number, now: number): Candidate[] {
+  return [...pool.values()]
+    .filter((c) => inScope(c.memory, session))
+    .sort((a, b) => preScore(b, now) - preScore(a, now))
+    .slice(0, limit);
+}
+
+/**
+ * 候选生成：多路召回 → 合并去重 → 作用域门禁 → 压到 limit 条。
+ *
+ * 写入路径也用它 —— J3 要的是「跟这条内容最相关的旧记忆」，而不是「最近入库的 20 条」。
+ * 用「最近 20 条」有两个后果：一条 200 条之前的矛盾记忆永远进不了候选（冲突检测失灵），
+ * 而且每次写入都无脑把那 20 条塞进 state 白花 token。另外这里会把 global 库也拉进来 ——
+ * 原来候选只查项目库，global 记忆从来没参与过冲突判断。
+ */
+export async function recallCandidates(query: string, deps: CandidateDeps): Promise<MemoryNode[]> {
+  const pool = await gather(query, deps);
+  return rank(pool, deps.session, deps.limit ?? MAX_CANDIDATES, Date.now()).map((c) => c.memory);
+}
+
 async function runRecall(query: string, deps: RecallDeps): Promise<RecallResult> {
   const now = Date.now();
   const limit = deps.limit ?? MAX_CANDIDATES;
@@ -212,10 +241,7 @@ async function runRecall(query: string, deps: RecallDeps): Promise<RecallResult>
   // 已注入过的先删：这些 id 不重复判断也不重复付费（§8.3）
   for (const id of deps.session.injectedIds) pool.delete(id);
 
-  const candidates = [...pool.values()]
-    .filter((c) => inScope(c.memory, deps.session))
-    .sort((a, b) => preScore(b, now) - preScore(a, now))
-    .slice(0, limit);
+  const candidates = rank(pool, deps.session, limit, now);
 
   if (candidates.length === 0) {
     return { candidates: [], injected: [], status: "ok", detail: "库里没有命中" };

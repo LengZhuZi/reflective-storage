@@ -19,9 +19,10 @@ import { MAX_CANDIDATES } from "../jev/adapter.ts";
 import { ruleScope } from "../jev/rule.ts";
 import { embed } from "../embed/encoder.ts";
 import {
-  addRelation, addTrace, insertMemory, listInScope, putEmbedding,
+  addRelation, addTrace, insertMemory, putEmbedding,
   type InsertMemory, type OpenedDb,
 } from "../storage/db.ts";
+import { recallCandidates } from "./recall.ts";
 
 /** 低于这个概率就不写。实测 §4.1：明确要求记住的给出 0.86–0.89，无关内容 0.2。 */
 export const KEEP_THRESHOLD = 0.5;
@@ -131,9 +132,10 @@ export async function writeFlow(
     return { action: "noise", reason: pre.reason };
   }
 
-  // J3 需要候选：拿同作用域里最近的若干条。作用域硬过滤在 SQL 层（§11.2），
-  // 这里拿到的候选天然不含跨项目记忆，所以 JEV 只需要判断语义关系。
-  const candidates = listInScope(projectDb, "project", session.projectId, MAX_CANDIDATES);
+  // J3 需要候选：**跟这条内容最相关的**旧记忆，不是「最近入库的 20 条」。
+  // 走召回那套多路召回（向量 + FTS5 + 作用域），并且带上 global 库 —— 用「最近 20 条」的话，
+  // 一条很久以前的矛盾记忆永远进不了候选，冲突检测就是失灵的。
+  const candidates = await recallCandidates(content, { projectDb, globalDb, session, limit: MAX_CANDIDATES });
 
   // 先查重再调 JEV：完全重复的一句话不该再花一次判断，也不该再占一条预算。
   // 已经在候选里的记忆比对，不额外查库。
@@ -188,7 +190,7 @@ export async function writeFlow(
 
   addTrace(target, {
     memoryId: memory.id, stage: "write", gate: j.meta.gate, action: "keep",
-    targetId: j.targetId, reason: `${j.type.choice}/${j.scope.choice} → ${resolved.scope}（${j.type.confidence.toFixed(2)}/${j.scope.confidence.toFixed(2)}）`,
+    targetId: j.targetId, reason: `${j.type.choice}/${j.scope.choice} → ${resolved.scope}（${j.type.confidence.toFixed(2)}/${j.scope.confidence.toFixed(2)}，候选 ${candidates.length}）`,
     confidence: j.worthKeeping.noul, status: j.meta.status,
     fallbackUsed: j.meta.fallbackUsed, latencyMs: j.meta.latencyMs,
     route: resolved.route,

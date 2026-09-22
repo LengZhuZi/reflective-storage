@@ -140,7 +140,14 @@ assert.ok(!listInScope(o, "project", "tobacco").some((m) => m.id === c.id), "归
 console.log("✓ 硬删 + 归档");
 
 // ------------------------------------------------------------ 其他
-assert.equal(projectIdFor(process.cwd()), "MyProject-ReflectiveStorage", "项目 id = git 根名 + 一层子目录，避免同仓库多项目混库");
+// ReflectiveStorage 现在自带 .git，所以最近的祖先就是它自己 → 直接用仓库名。
+// 这正是想要的结果：每个仓库一个库。
+assert.equal(projectIdFor(process.cwd()), "ReflectiveStorage");
+// 一个仓库里放多个项目时（没有自己的 .git 的子目录）不能混库：
+// 父仓库名 + 第一层子目录名。只用 git 根名会让下面的子项目全挤进同一个库。
+assert.equal(projectIdFor("../../MyProject/GameProject/World"), "MyProject-GameProject");
+// 深层目录不能变成 "src"/"java" 这种垃圾库名，要回退到第一层
+assert.equal(projectIdFor("../../MyProject/GameProject/World/src/main/java"), "MyProject-GameProject");
 assert.ok(MAX_CANDIDATES <= 20, "候选上限必须保持在实测的高区分度区间内");
 console.log("✓ 项目 id 解析 + 候选上限");
 

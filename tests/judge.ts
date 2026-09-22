@@ -138,6 +138,8 @@ console.log("✓ 失败姿态沿用同一套：写入 fail-open、注入 fail-cl
 const base = loadConfig();
 assert.equal(base.judge.provider, "rules", "没有 key 也没有配置时默认 rules（装了就能用）");
 assert.match(base.judge.problems.join(" "), /按 rules/);
+assert.equal(base.judge.relevanceThreshold, 0.5, "rules 档的默认阈值是 0.5，不是 JEV 的 0.7（显示不能骗人）");
+assert.equal(createJudgeAdapter(base.judge).relevanceThreshold, 0.5, "工厂要把配置的阈值传下去");
 
 process.env.REFLECTIVE_JUDGE_PROVIDER = "openai";
 process.env.REFLECTIVE_JUDGE_BASE_URL = "http://localhost:11434/v1";

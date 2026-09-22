@@ -160,9 +160,10 @@ function resolveJudge(file: Record<string, unknown>, base: JevConfig): JudgeConf
     model,
     timeoutMs: num("REFLECTIVE_JUDGE_TIMEOUT_MS", fileNumber(file.timeoutMs, 2500)),
     writeTimeoutMs: num("REFLECTIVE_JUDGE_WRITE_TIMEOUT_MS", fileNumber(file.writeTimeoutMs, 8000)),
+    // 规则引擎的默认阈值是 0.5（它自己的分数尺度，见 §5.2），不是 JEV 的 0.7。
     relevanceThreshold: threshold !== undefined && Number.isFinite(Number(threshold))
       ? Number(threshold)
-      : fileNumber(file.relevanceThreshold, 0.7),
+      : fileNumber(file.relevanceThreshold, provider === "rules" ? 0.5 : 0.7),
     problems,
   };
 }

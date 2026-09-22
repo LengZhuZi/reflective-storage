@@ -23,9 +23,9 @@ const meta = (gate: string) => ({
   gate, fallbackUsed: "rule" as const, status: "ok" as const, latencyMs: 0, model: "rules",
 });
 
-export function createRuleAdapter(): JevAdapter {
+export function createRuleAdapter(relevanceThreshold: number = RULE_RELEVANCE_THRESHOLD): JevAdapter {
   return {
-    relevanceThreshold: RULE_RELEVANCE_THRESHOLD,
+    relevanceThreshold,
 
     async judgeWrite(content) {
       const type = ruleType(content);
@@ -56,7 +56,7 @@ export function createRuleAdapter(): JevAdapter {
       let used = 0;
       for (const m of [...candidates].sort((a, b) => ruleRelevance(query, b) - ruleRelevance(query, a))) {
         const cost = estimateTokens(m.content);
-        if (ruleRelevance(query, m) < RULE_RELEVANCE_THRESHOLD || used + cost > budget.maxTokens) {
+        if (ruleRelevance(query, m) < relevanceThreshold || used + cost > budget.maxTokens) {
           decisions.set(m.id, "skip");
           continue;
         }

@@ -16,7 +16,7 @@ import { MEMORY_TYPES, type MemoryNode, type MemoryScope, type MemoryType, type 
 import type { JudgeConfig } from "../config.ts";
 import { JevHttpClient, JevUnavailableError, type AskOptions, type Answer, type JevResponse, type Questions } from "./http.ts";
 import { LlmClient } from "./llm.ts";
-import { createRuleAdapter } from "./rule-adapter.ts";
+import { createRuleAdapter, RULE_RELEVANCE_THRESHOLD } from "./rule-adapter.ts";
 import { ruleRelation, ruleRelevance, ruleScope, ruleType, ruleWorthKeeping } from "./rule.ts";
 import type { InjectionJudgment, Judged, NoulResult, RecallJudgment, WriteJudgment } from "./types.ts";
 
@@ -334,8 +334,7 @@ export function createJudgeAdapter(config: JudgeConfig, deps: { fetchImpl?: type
   };
   switch (config.provider) {
     case "rules":
-      // 规则引擎不用外面给的阈值：它的 0.7 是自己分数尺度上的，外面调它没意义。
-      return createRuleAdapter();
+      return createRuleAdapter(config.relevanceThreshold);
     case "openai":
       return createJevAdapter(
         new LlmClient({

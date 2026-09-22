@@ -271,7 +271,8 @@ export default function reflectiveStorage(pi: ExtensionAPI): void {
     description: "主动往长期记忆里写入一条。仍然会走类型/作用域判断和写入闸，JEV 认为不值得存就不会落库。",
     promptSnippet: "Remember a durable decision, correction or preference in the user's long-term memory",
     promptGuidelines: [
-      "Use memory_add only when the user explicitly asks you to remember something, or states a durable decision, correction or preference. Do not use it for transient status or for anything you merely inferred.",
+      "Use memory_add ONLY when the user explicitly asks you to remember something (for example \"记住…\", \"别忘了…\", \"remember this\").",
+      "Do NOT use memory_add for decisions, corrections or preferences the user merely states in passing — those are captured automatically at the end of the turn, and calling memory_add as well stores the same thing twice.",
       "Write memory_add content in your own words as one clear sentence. Never paste logs, file contents or tool output into it.",
     ],
     parameters: Type.Object({

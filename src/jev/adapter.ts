@@ -132,7 +132,7 @@ export function createJevAdapter(client: JudgeClient, opts: JudgeTimeouts = {}):
       const questions: Questions = {
         worth_keeping: {
           type: "noul",
-          instructions: "The NEW CONTENT contains something durable worth remembering across sessions (a decision, a correction, a preference, a project fact), not small talk or transient status",
+          instructions: "The NEW CONTENT contains something durable worth remembering across sessions (a decision, a correction, a preference, a project fact), not small talk or transient status. A question or a request addressed to the assistant is NOT a memory, even when it mentions the project — only durable statements about the user, the project or how work should be done count",
         },
         memory_type: {
           type: "choice",

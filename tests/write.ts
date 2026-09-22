@@ -48,6 +48,12 @@ assert.equal(worthEvaluating("OK").ok, false);
 assert.equal(worthEvaluating("嗯嗯").ok, false);
 assert.equal(worthEvaluating("短").ok, false);
 assert.equal(worthEvaluating("这个项目的记忆系统要完全独立，不要复用 cognee").ok, true);
+// 真跑 pi 发现：用户的一句问句被 J1 判成值得存（1.00），问题本身变成了记忆。
+assert.equal(worthEvaluating("这个仓库提交的时候要怎么拆？只按你已知的信息答").ok, false, "问句不是记忆");
+assert.equal(worthEvaluating("这个仓库提交的时候要怎么拆？").ok, false);
+assert.equal(worthEvaluating("Why is the build failing?").ok, false);
+assert.equal(worthEvaluating("记住：上线前为什么要先跑一遍 index 重建？").ok, true, "带明确要求的问题句必须留");
+assert.equal(worthEvaluating("以后这个仓库的提交都必须一个模块一个提交").ok, true, "陈述句照常");
 console.log("✓ 本地预筛挡掉短输入和纯确认（这一步免费，JEV 才是花钱的）");
 
 // ------------------------------------------------------------ 脱敏
@@ -163,6 +169,26 @@ console.log("✓ J15 召回日志：只记事实，cited / user_feedback 留空"
 
 // ------------------------------------------------------------ 断言常量
 assert.ok(KEEP_THRESHOLD > 0.2 && KEEP_THRESHOLD < 0.86, "阈值必须落在实测的无关(0.2)和明确要求(0.86)之间");
+
+// ------------------------------------------------------------ 精确查重（真跑 pi 发现的）
+// 实测：模型在对话里调了 memory_add，agent_end 又把用户原话存一次 —— 同一条约定两行。
+// 重复会白占注入预算，所以归一化后完全相同的就不再存，也不花钱调 JEV。
+const beforeDup = countMemories(project);
+const dup1 = await writeFlow(project, global, fakeAdapter(0.9), session, {
+  userTexts: ["部署前必须先跑一遍 index 重建"],
+  context: "",
+});
+const dup2 = await writeFlow(project, global, fakeAdapter(0.9), session, {
+  userTexts: ["部署前必须先跑一遍  index 重建！"],
+  context: "",
+});
+assert.equal(dup1.action, "stored");
+assert.equal(dup2.action, "duplicate", "只有空白和标点不同的一句话不该再存一遍");
+assert.equal(countMemories(project), beforeDup + 1);
+const dupTrace = project.db.prepare(`SELECT action, reason FROM reflection_traces WHERE gate = 'dedup'`).get() as Record<string, unknown>;
+assert.equal(dupTrace.action, "duplicate");
+assert.ok(String(dupTrace.reason).includes(dup1.memory!.id.slice(0, 8)), "留痕要指向被撞上的那条");
+console.log("✓ 精确查重：归一化后相同就不第二遍存，也不花 JEV 调用");
 
 project.close();
 global.close();

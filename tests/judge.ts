@@ -121,6 +121,7 @@ const llmFetch: typeof fetch = async (url, init) => {
       memory_scope: { choice: "project", confidence: 0.8, probabilities: { project: 0.8, global: 0.2 } },
       relation: { choice: "none", confidence: 0.9, probabilities: { none: 1 } },
       target: { choice: "none", confidence: 0.9, probabilities: { none: 1 } },
+      topic: { choice: "none", confidence: 0.8, probabilities: { none: 1 } },
     },
   };
   return new Response(JSON.stringify({ model: "local-model", choices: [{ message: { content: "```json\n" + JSON.stringify(answer) + "\n```" } }], usage: { prompt_tokens: 321, completion_tokens: 45 } }), { status: 200 });

@@ -2,6 +2,9 @@
   "name": "reflective-storage",
   "private": true,
   "type": "module",
+  "scripts": {
+    "test": "for f in tests/*.ts; do node \"$f\" || exit 1; done"
+  },
   "pi": {
     "extensions": [
       "./index.ts"

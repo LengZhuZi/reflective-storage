@@ -423,6 +423,23 @@ export function updateRecallOutcome(o: OpenedDb, id: string, citedIds: string[],
     .run(JSON.stringify(citedIds), effectScore, id);
 }
 
+/** 主题（J4）：只用来分组和遍历，不是判断依据。起名由用户或引擎选，系统不造词。 */
+export function setTopic(o: OpenedDb, id: string, topic: string | null): void {
+  o.db.prepare(`UPDATE memories SET topic = ? WHERE id = ?`).run(topic, id);
+}
+
+/** 现有主题，按用得多的排前面。给 J2 的选项列表和 /memory 用。 */
+export function distinctTopics(o: OpenedDb, limit = 30): string[] {
+  const rows = o.db
+    .prepare(
+      `SELECT topic, count(*) n FROM memories
+        WHERE topic IS NOT NULL AND topic != '' AND state IN ('active','cold')
+        GROUP BY topic ORDER BY n DESC, topic ASC LIMIT ?`,
+    )
+    .all(limit) as Row[];
+  return rows.map((r) => String(r.topic));
+}
+
 // ---------------------------------------------------------------- 待确认队列（§6 / §9.3）
 
 export interface ReviewRow extends Row {

@@ -51,8 +51,8 @@ export interface JevAdapter {
    * 规则引擎和本地小模型的分数尺度完全不同，拿 0.7 去卡它们会把候选全卡光。
    */
   readonly relevanceThreshold: number;
-  /** J1 + J2 + J3，一次调用。 */
-  judgeWrite(content: string, context: string, candidates: MemoryNode[]): Promise<Judged<WriteJudgment>>;
+  /** J1 + J2 + J3 + J4，一次调用。`topics` 是现有主题，引擎只能在里面选。 */
+  judgeWrite(content: string, context: string, candidates: MemoryNode[], topics?: readonly string[]): Promise<Judged<WriteJudgment>>;
   /** J5。 */
   judgeRecallNeed(utterance: string, session: SessionInfo): Promise<Judged<NoulResult>>;
   /** J7。 */
@@ -122,7 +122,7 @@ export function createJevAdapter(client: JudgeClient, opts: JudgeTimeouts = {}):
   return {
     relevanceThreshold: opts.relevanceThreshold ?? 0.7,
 
-    async judgeWrite(content, context, candidates): Promise<Judged<WriteJudgment>> {
+    async judgeWrite(content, context, candidates, topics = []): Promise<Judged<WriteJudgment>> {
       const t0 = Date.now();
       const state =
         `NEW CONTENT:\n${content}\n\n` +
@@ -173,6 +173,16 @@ export function createJevAdapter(client: JudgeClient, opts: JudgeTimeouts = {}):
           instructions: "If the NEW CONTENT extends, supersedes or contradicts an existing memory, which one",
           criteria: Object.fromEntries([["none", "No existing memory, or relation is none"], ...candidates.map((m) => [m.id, m.content.slice(0, 120)])]),
         },
+        // J4：只让引擎在**已有主题**里挑，不给它生成新词的权力（原则 1）。
+        // 一个都不合适就选 none —— 之后由用户来起名（走待确认队列），系统不自己造。
+        topic: {
+          type: "choice",
+          instructions: "Which existing topic does the NEW CONTENT belong to. Pick none if none of them fit",
+          criteria: Object.fromEntries([
+            ["none", "None of the existing topics fit"],
+            ...topics.map((t) => [t, t]),
+          ]),
+        },
       };
 
       try {
@@ -183,6 +193,7 @@ export function createJevAdapter(client: JudgeClient, opts: JudgeTimeouts = {}):
         const scope = choiceOf(res.answers.memory_scope, ["global", "project", "session"]) as MemoryScope | null;
         const relation = choiceOf(res.answers.relation, ["none", "extends", "supersedes", "contradicts"]) as Relation | null;
         const target = choiceOf(res.answers.target, ["none", ...candidates.map((m) => m.id)]);
+        const topic = choiceOf(res.answers.topic, ["none", ...topics]);
 
         return {
           worthKeeping: { noul: num(res.answers.worth_keeping, "noul") },
@@ -190,6 +201,7 @@ export function createJevAdapter(client: JudgeClient, opts: JudgeTimeouts = {}):
           scope: { choice: scope ?? "project", confidence: confidenceOf(res.answers.memory_scope), probabilities: probabilitiesOf(res.answers.memory_scope) },
           relation: { choice: relation ?? "none", confidence: confidenceOf(res.answers.relation), probabilities: probabilitiesOf(res.answers.relation) },
           targetId: relation && relation !== "none" && target && target !== "none" ? target : null,
+          topic: topic && topic !== "none" ? topic : null,
           meta: okMeta("J1+J2+J3", res, questions, t0),
         };
       } catch (e) {
@@ -198,7 +210,8 @@ export function createJevAdapter(client: JudgeClient, opts: JudgeTimeouts = {}):
         const scope = ruleScope(type.choice);
         return {
           worthKeeping: ruleWorthKeeping(content),
-          type, scope, relation: ruleRelation(), targetId: null,
+          // 规则档不猜主题（它没有判断力）：留空，等用户起名。
+          type, scope, relation: ruleRelation(), targetId: null, topic: null,
           meta: degradation("J1+J2+J3", e, t0, "JEV 不可用，已按规则写入"),
         };
       }

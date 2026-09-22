@@ -37,6 +37,8 @@ factory({
 const notes: string[] = [];
 /** 记下问过用户什么（pi 里是 ctx.ui.select 的 1/2/3 选择框）。 */
 const selects: Array<[string, string[]]> = [];
+/** J4 的起名走文本框（select 只能选不能输入）。 */
+const inputs: string[] = [];
 /** 假的当前分支：memory_add 要从中取「用户自己的话」（真 pi 里是 sessionManager.getBranch()）。 */
 const branch: unknown[] = [];
 const ctx = {
@@ -46,6 +48,7 @@ const ctx = {
   ui: {
     notify: (text: string) => { notes.push(text); },
     select: async (title: string, options: string[]) => { selects.push([title, options]); return options[0]; },
+    input: async (title: string) => { inputs.push(title); return "提交流程"; },
   },
 } as never;
 
@@ -244,13 +247,18 @@ enqueueReview(seed, {
   kind: "merge", memoryId: anyMemory, otherId: anyMemory, question: "测试用提议：这两条要合并吗？",
   options: ["保留两条（并存）", "用新的取代旧的", "保留旧的，把新的标为已取代"],
 });
-assert.equal(countPendingReviews(seed), 1);
+assert.ok(countPendingReviews(seed) >= 1);
+const pendingBefore = countPendingReviews(seed);
 selects.length = 0;
+inputs.length = 0;
 await runCommand("review");
-assert.equal(selects.length, 1, "/memory review 要逐条问用户（pi 的 1/2/3 选择）");
-assert.match(selects[0][0], /测试用提议/);
-assert.equal(selects[0][1].length, 3, "三个选项：并存 / 用新的取代旧的 / 保留旧的");
-assert.equal(countPendingReviews(seed), 0, "问过的就出队列");
+assert.equal(countPendingReviews(seed), 0, `/memory review 要把队列过完（原本 ${pendingBefore} 条）`);
+assert.ok(selects.length >= 1, "合并/冲突用 pi 的 1/2/3 选择框");
+assert.equal(selects.find(([t]) => /测试用提议/.test(t))![1].length, 3, "三个选项：并存 / 用新的取代旧的 / 保留旧的");
+assert.ok(inputs.length >= 1, "J4 的起名用文本框（select 只能选不能输入）");
+assert.match(inputs[0], /起个主题/);
+const { distinctTopics } = await import("../src/storage/db.ts");
+assert.deepEqual(distinctTopics(seed), ["提交流程"], "用户起的名字要真的写进记忆的 topic");
 // 没有待确认时不该弹窗
 selects.length = 0;
 await runCommand("review");

@@ -67,17 +67,39 @@ queueAfterWrite(o, dupB, [dupA], { choice: "none", confidence: 0.9 });
 assert.equal(countPendingReviews(o), before, "同一个 (kind, 新, 旧) 不重复排队");
 console.log("✓ 合并提议：只提议、去重、一次只提一个");
 
+// ------------------------------------------------------------ J4：主题起名
+const {
+  queueTopicNaming, TOPIC_ASK_IMPORTANCE,
+} = await import("../src/pipeline/review.ts");
+const { setTopic, distinctTopics, getMemory: get2 } = await import("../src/storage/db.ts");
+const important = insertMemory(o, { content: "上线灰度按 5% → 20% → 100% 走", type: "procedure", scope: "project", scopeId: "P", importance: 0.9 });
+assert.equal(queueTopicNaming(o, important, []).length, 1, "够重要的记忆该问一句要不要起主题");
+const trivial = insertMemory(o, { content: "随手记一句", type: "event", scope: "project", scopeId: "P", importance: 0.3 });
+assert.equal(queueTopicNaming(o, trivial, []).length, 0, "一次性小事不值得占用户一次输入");
+const already = insertMemory(o, { content: "已有主题的记忆", type: "fact", scope: "project", scopeId: "P", importance: 0.9, topic: "提交流程" });
+assert.equal(queueTopicNaming(o, already, ["提交流程"]).length, 0, "已经有主题就不问");
+assert.ok(TOPIC_ASK_IMPORTANCE > 0.5 && TOPIC_ASK_IMPORTANCE < 0.95);
+
+// 用户起名之后：主题能查到，也能按主题捞回来
+setTopic(o, important.id, "发布流程");
+assert.ok(distinctTopics(o).includes("发布流程"), "起过名的主题要出现在主题表里");
+assert.equal(get2(o, important.id)!.topic, "发布流程");
+const inTopic = o.db.prepare(`SELECT id FROM memories WHERE topic = ?`).all("发布流程") as Array<{ id: string }>;
+assert.deepEqual(inTopic.map((r) => r.id), [important.id]);
+
 // ------------------------------------------------------------ 处置
 const items = pendingItems(o, 20);
-assert.equal(items.length, 2);
-for (const it of items) assert.ok(Object.values(RESOLUTION_LABELS).includes(JSON.parse(String(it.options))[0]));
+const kinds = items.map((it) => String(it.kind));
+assert.ok(kinds.includes("conflict") && kinds.includes("merge") && kinds.includes("topic"), `三种提议都要能排队，实际 ${kinds.join(",")}`);
+for (const it of items) assert.ok(JSON.parse(String(it.options)).length >= 1);
+const pendingBeforeResolve = countPendingReviews(o);
 
 // 1) 并存：什么都不改
 const conflictItem = items.find((it) => String(it.kind) === "conflict")!;
 assert.match(applyResolution(o, conflictItem, "keep_both"), /并存/);
 assert.equal(getMemory(o, oldPref.id)!.state, "active");
 assert.equal(getMemory(o, fresh.id)!.state, "active");
-assert.equal(countPendingReviews(o), 1, "处置完就从队列里出去");
+assert.equal(countPendingReviews(o), pendingBeforeResolve - 1, "处置完就从队列里出去");
 
 // 2) 用新的取代旧的
 const mergeItem = items.find((it) => String(it.kind) === "merge")!;
@@ -86,13 +108,13 @@ assert.equal(getMemory(o, dupA.id)!.state, "superseded", "旧的标成已取代"
 assert.equal(getMemory(o, dupB.id)!.state, "active", "新的留着");
 const rel = o.db.prepare(`SELECT relation FROM memory_relations WHERE from_id = ? AND to_id = ?`).get(dupB.id, dupA.id) as Record<string, unknown>;
 assert.equal(rel.relation, "supersedes");
-assert.equal(countPendingReviews(o), 0);
+assert.equal(countPendingReviews(o), pendingBeforeResolve - 2, "两条处置完就少两条（主题那条还留着）");
 
 // 3) 保留旧的（只在内存里试，不入库新队列）
 const c2 = insertMemory(o, { content: "部署前先跑一遍 index 重建", type: "procedure", scope: "project", scopeId: "P" });
 const c3 = insertMemory(o, { content: "部署前先跑一遍 index 重建再发版", type: "procedure", scope: "project", scopeId: "P" });
 queueAfterWrite(o, c3, [c2], { choice: "none", confidence: 0.9 });
-const item3 = pendingItems(o, 5)[0];
+const item3 = pendingItems(o, 20).find((it) => String(it.kind) === "merge" && String(it.other_id) === c2.id)!;
 assert.match(applyResolution(o, item3, "keep_old"), /保留了旧的/);
 assert.equal(getMemory(o, c3.id)!.state, "superseded");
 assert.equal(getMemory(o, c2.id)!.state, "active");

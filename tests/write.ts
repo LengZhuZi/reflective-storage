@@ -22,16 +22,18 @@ const global = openDb(path.join(tmp, "global.db"));
 const session = { sessionId: "s1", cwd: tmp, projectId: "P", injectedIds: new Set<string>() };
 
 /** 假 adapter：只实现 writeFlow 用到的那一个方法。 */
-function fakeAdapter(worth: number, opts: { scope?: "global" | "project" | "session"; relation?: string; fail?: boolean; confidence?: number; type?: string; seen?: string[] } = {}) {
+function fakeAdapter(worth: number, opts: { scope?: "global" | "project" | "session"; relation?: string; fail?: boolean; confidence?: number; type?: string; seen?: string[]; seenTopics?: string[]; topic?: string | null; importance?: number } = {}) {
   return {
-    async judgeWrite(_content: string, _context: string, candidates: Array<{ content: string }>) {
+    async judgeWrite(_content: string, _context: string, candidates: Array<{ content: string }>, topics: string[] = []) {
       opts.seen?.push(...candidates.map((c) => c.content));
+      opts.seenTopics?.push(...topics);
       return {
         worthKeeping: { noul: worth },
         type: { choice: opts.type ?? "event", confidence: opts.confidence ?? 0.9, probabilities: {} },
         scope: { choice: opts.scope ?? "project", confidence: opts.confidence ?? 0.9, probabilities: {} },
         relation: { choice: opts.relation ?? "none", confidence: 0.8, probabilities: {} },
         targetId: null,
+        topic: opts.topic ?? null,
         meta: {
           gate: "J1+J2+J3",
           fallbackUsed: opts.fail ? "rule" : "none",
@@ -133,6 +135,14 @@ assert.equal(failTrace.fallback_used, "rule");
 assert.ok(failTrace !== undefined, "降级也必须留痕");
 console.log("✓ 写入闸 fail-open 且留痕（status=unavailable, fallback=rule）");
 
+// 真跑 pi 时发现的：引擎挂了、规则兜底给 0.2，记忆就被静默丢了 —— 那是 fail-closed。
+const r6 = await writeFlow(project, global, fakeAdapter(0.2, { fail: true }), session, {
+  userTexts: ["以后提交之前都先跑一遍测试再提"], context: "",
+});
+assert.equal(r6.action, "stored", "引擎不可用时不许卡写入闸（§6.1 fail-open：丢记忆 > 存噪声）");
+assert.ok(r6.memory!.importance <= 0.35, "照存但要压低重要性，否则噪声会盖过正常记住的东西");
+console.log("✓ 引擎不可用时照存（fail-open 不被阈值吃掉），重要性压到 0.3");
+
 // ------------------------------------------------------------ 只吃用户的话
 const before = countMemories(project);
 await writeFlow(project, global, fakeAdapter(0.9), session, {
@@ -208,6 +218,27 @@ await writeFlow(project, global, fakeAdapter(0.9, { seen: seenGlobal }), session
 });
 assert.ok(seenGlobal.some((c) => c.includes("先给结论")), "global 库里的记忆也要进候选");
 console.log("✓ J3 候选按相关性取（很旧的相关记忆也进得来），且 global 库参与冲突判断");
+
+// ------------------------------------------------------------ J4：主题
+// 引擎只能在**已有主题**里挑（不许生成新词），所以现有主题要送进 state
+const firstTopics: string[] = [];
+const withTopic = await writeFlow(project, global, fakeAdapter(0.9, { topic: "提交与发布", seenTopics: firstTopics }), session, {
+  userTexts: ["发布先灰度 5% 再全量，别一次推完"], context: "",
+});
+assert.equal(withTopic.memory?.topic, "提交与发布", "引擎选的主题要落库");
+assert.ok(!firstTopics.includes("提交与发布"), "第一次写的时候这个主题还不存在（主题表是写入前读的）");
+const secondTopics: string[] = [];
+await writeFlow(project, global, fakeAdapter(0.9, { topic: "提交与发布", seenTopics: secondTopics }), session, {
+  userTexts: ["发布前的检查清单必须先跑一遍"], context: "",
+});
+assert.ok(secondTopics.includes("提交与发布"), "之后写的时候，已有主题要出现在给引擎的选项里");
+// 引擎挑不出主题（none）且足够重要 → 排一条「要不要起个主题」给用户
+const naming = await writeFlow(project, global, fakeAdapter(0.95, { importance: 0.95, topic: null }), session, {
+  userTexts: ["灰度发布的比例以后都按 5% 起步"], context: "",
+});
+assert.ok(JSON.stringify(naming.review ?? []).includes("起个主题"), "没主题又重要的记忆，要问用户起名（引擎不许造词）");
+console.log("✓ J4 主题：引擎在已有主题里挑、落库、不重复问用户");
+
 
 // ------------------------------------------------------------ 断言常量
 assert.ok(KEEP_THRESHOLD > 0.2 && KEEP_THRESHOLD < 0.86, "阈值必须落在实测的无关(0.2)和明确要求(0.86)之间");

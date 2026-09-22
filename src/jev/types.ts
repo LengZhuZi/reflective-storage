@@ -49,6 +49,11 @@ export interface WriteJudgment {
   scope: ChoiceResult;
   /** J3：与前一条候选旧记忆的关系。 */
   relation: ChoiceResult;
+  /**
+   * J4：主题。只在**已有主题**里选（或 none），引擎不生成新词 ——
+   * 给记忆起名是生成，§15 原则 1 不让引擎干这件事。
+   */
+  topic: string | null;
   /** J3 选中的旧记忆 id（relation === "none" 时为空）。 */
   targetId: string | null;
 }

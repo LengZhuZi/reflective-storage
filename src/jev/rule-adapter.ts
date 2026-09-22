@@ -36,6 +36,7 @@ export function createRuleAdapter(relevanceThreshold: number = RULE_RELEVANCE_TH
         // 没有模型就没法判断语义冲突，一律新建 —— 并存比误删安全（§6.1）。
         relation: ruleRelation(),
         targetId: null,
+        topic: null,   // 规则档不猜主题（没有判断力），留空等用户起名
         meta: meta("J1+J2+J3(rules)"),
       };
     },

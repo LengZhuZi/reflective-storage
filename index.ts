@@ -20,8 +20,9 @@ import type { MemoryNode, SessionInfo } from "./src/core/types.ts";
 import { createJudgeAdapter, type JevAdapter } from "./src/jev/adapter.ts";
 import { loadConfig, proxyHint, type InjectConfig } from "./src/config.ts";
 import {
-  addTrace, countMemories, countPendingReviews, getMemory, hardDelete, listInScope,
-  openGlobalDb, openProjectDb, projectIdFor, recentRecalls, tracesFor, type OpenedDb,
+  addTrace, countMemories, countPendingReviews, distinctTopics, getMemory, hardDelete, listInScope,
+  openGlobalDb, openProjectDb, projectIdFor, recentRecalls, resolveReview, setTopic, tracesFor,
+  type OpenedDb,
 } from "./src/storage/db.ts";
 import { writeFlow } from "./src/pipeline/write.ts";
 import { recallFlow, worthRecalling } from "./src/pipeline/recall.ts";
@@ -208,6 +209,23 @@ function foundLine(r: { memory: MemoryNode; relevance: number }): string {
 async function askReview(o: OpenedDb, ctx: ExtensionContext, reviewId: string): Promise<string | null> {
   const item = pendingItems(o, 50).find((it) => String(it.id) === reviewId);
   if (!item) return null;
+
+  // J4 的起名用文本框（要让用户输入新词），其余两个用 1/2/3 选择框。
+  if (String(item.kind) === "topic") {
+    const existing = (JSON.parse(String(item.options)) as string[]).filter((o) => o !== "先不起主题");
+    const name = (await ctx.ui.input(
+      `${String(item.question)}${existing.length ? `\n（已有主题：${existing.join(" / ")}）` : ""}`,
+      "主题名，留空跳过",
+    ))?.trim();
+    if (!name) {
+      resolveReview(o, String(item.id), "topic:skipped");
+      return "先不起主题";
+    }
+    setTopic(o, String(item.memory_id), name);
+    resolveReview(o, String(item.id), `topic:${name}`);
+    return `主题设为「${name}」`;
+  }
+
   const options = JSON.parse(String(item.options)) as string[];
   const labels = options.length ? options : Object.values(RESOLUTION_LABELS);
   const picked = await ctx.ui.select(`记忆待确认：${String(item.question)}`, labels);
@@ -505,7 +523,7 @@ export default function reflectiveStorage(pi: ExtensionAPI): void {
   });
 
   pi.registerCommand("memory", {
-    description: "长期记忆状态 / 搜索 / 查为什么 / 删除（/memory、search <词>、why <id>、forget <id>）",
+    description: "长期记忆 /memory：状态、search <词>、why <id>、review（待确认）、topic <名>、topics、forget <id>",
     handler: async (args: string, ctx: ExtensionContext) => {
       const r = rt;
       if (!r) {
@@ -560,6 +578,25 @@ export default function reflectiveStorage(pi: ExtensionAPI): void {
           return;
         }
         for (const item of items) await askReview(r.projectDb, ctx, String(item.id));
+        return;
+      }
+
+      if (sub === "topics") {
+        const topics = distinctTopics(r.projectDb);
+        ctx.ui.notify(topics.length ? `主题（${topics.length}）：\n${topics.join("\n")}` : "还没有主题", "info");
+        return;
+      }
+
+      if (sub === "topic" && tail) {
+        const rows = r.projectDb.db
+          .prepare(`SELECT id, type, state, content FROM memories WHERE topic = ? ORDER BY created_at DESC LIMIT 20`)
+          .all(tail) as Array<Record<string, unknown>>;
+        ctx.ui.notify(
+          rows.length
+            ? `主题「${tail}」下 ${rows.length} 条：\n${rows.map((m) => `[${String(m.id).slice(0, 8)}] (${m.type}/${m.state}) ${String(m.content).slice(0, 40)}`).join("\n")}`
+            : `没有主题是「${tail}」的记忆`,
+          "info",
+        );
         return;
       }
 

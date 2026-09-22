@@ -19,14 +19,17 @@ import { MAX_CANDIDATES } from "../jev/adapter.ts";
 import { ruleScope } from "../jev/rule.ts";
 import { embed } from "../embed/encoder.ts";
 import {
-  addRelation, addTrace, insertMemory, putEmbedding,
+  addRelation, addTrace, distinctTopics, insertMemory, putEmbedding,
   type InsertMemory, type OpenedDb,
 } from "../storage/db.ts";
 import { recallCandidates } from "./recall.ts";
-import { queueAfterWrite, type ReviewItem } from "./review.ts";
+import { queueAfterWrite, queueTopicNaming, type ReviewItem } from "./review.ts";
 
 /** 低于这个概率就不写。实测 §4.1：明确要求记住的给出 0.86–0.89，无关内容 0.2。 */
 export const KEEP_THRESHOLD = 0.5;
+
+/** 引擎不可用时照存的那条记忆给多少重要性 —— 低到会先被衰减/归档，高到还能被召回。 */
+export const FAIL_OPEN_IMPORTANCE = 0.3;
 
 /** 短于这个长度的用户输入不值得评估（"继续"、"好"、"嗯"）。 */
 const MIN_LENGTH = 8;
@@ -152,9 +155,18 @@ export async function writeFlow(
     return { action: "duplicate", memory: dup, reason: `与已有记忆相同（${dup.id.slice(0, 8)}）` };
   }
 
-  const j = await adapter.judgeWrite(content, redact(input.context), candidates);
+  // J4：把**现有主题**给引擎，让它只在里面挑（它不许生成新词）。项目库和全局库的主题
+  // 合起来给 —— 主题是跨库的分组，不是作用域。
+  const topics = [...new Set([...distinctTopics(projectDb), ...distinctTopics(globalDb)])].slice(0, 30);
+  const j = await adapter.judgeWrite(content, redact(input.context), candidates, topics);
 
-  if (j.worthKeeping.noul < KEEP_THRESHOLD) {
+  // §6.1 fail-open：引擎「不可用」时**不卡写入闸** —— 丢一条记忆的代价大于存一条噪声。
+  // （原来的写法是先算 worth_keeping 再比阈值，于是引擎挂了、规则兜底给出 0.2，
+  // 记忆就静默丢了 —— 那是 fail-closed，跟设计写反了。）
+  // 代价是对付噪声：这样存进来的记忆 importance 压到 0.3，衰减和归档会比正常记忆快，
+  // 也不会盖过正常记住的东西。
+  const unavailable = j.meta.status === "unavailable";
+  if (!unavailable && j.worthKeeping.noul < KEEP_THRESHOLD) {
     addTrace(projectDb, {
       stage: "write", gate: j.meta.gate, action: "skip",
       reason: `worth_keeping=${j.worthKeeping.noul.toFixed(2)} < ${KEEP_THRESHOLD}`,
@@ -174,8 +186,10 @@ export async function writeFlow(
     content,
     type: j.type.choice,
     scope: resolved.scope,
+    topic: j.topic,
     scopeId: resolved.scope === "project" ? session.projectId : resolved.scope === "session" ? session.sessionId : null,
-    importance: j.worthKeeping.noul,
+    // 引擎不可用时照存，但压成低重要性（见上面 fail-open 的说明）
+    importance: unavailable ? FAIL_OPEN_IMPORTANCE : j.worthKeeping.noul,
     source: session.sessionId,
   };
   const memory = insertMemory(target, insert);
@@ -193,7 +207,10 @@ export async function writeFlow(
 
   // 引擎不确定的事（§6 的 <0.5 档）和「看着是同一件事」（§9.3 合并）排进待确认队列。
   // 这里只提议、不动数据 —— 判不了就交给用户，别让污染记忆自己沉淀下去。
-  const review = queueAfterWrite(target, memory, candidates, j.relation);
+  const review = [
+    ...queueAfterWrite(target, memory, candidates, j.relation),
+    ...queueTopicNaming(target, memory, topics),
+  ];
 
   addTrace(target, {
     memoryId: memory.id, stage: "write", gate: j.meta.gate, action: "keep",

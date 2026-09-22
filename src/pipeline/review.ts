@@ -21,7 +21,7 @@ import type { OpenedDb } from "../storage/db.ts";
 import { addRelation, enqueueReview, pendingReviews, resolveReview, setState, type ReviewRow } from "../storage/db.ts";
 import { longestSharedRun } from "./feedback.ts";
 
-export type ReviewKind = "merge" | "conflict";
+export type ReviewKind = "merge" | "conflict" | "topic";
 
 /** 用户可选的处置。保留两条是最安全的默认。 */
 export const RESOLUTIONS = ["keep_both", "keep_new", "keep_old"] as const;
@@ -91,6 +91,26 @@ export function queueAfterWrite(
     if (id) out.push({ id, kind: "merge", memoryId: memory.id, otherId: best.c.id, question, options });
   }
   return out;
+}
+
+/**
+ * J4 的起名环节：引擎在**已有主题**里挑不出合适的（topic=null）时，问用户要不要起一个。
+ *
+ * 为什么是用户起名而不是引擎生成：给记忆起名是**生成文本**，§15 原则 1 明确不让引擎干。
+ * 而主题树的价值只在「同一个人会反复用到同一批主题」时才成立 —— 用户起的名字天然稳定，
+ * 引擎每次生成的名字会碎成一地同义词（"数据迁移"/"数据库迁移"/"DB 迁移"）。
+ *
+ * 只在够重要的记忆上问（importance 偏低的多半是一次性事件，不值得占用户一次输入）。
+ */
+export const TOPIC_ASK_IMPORTANCE = 0.7;
+
+export function queueTopicNaming(o: OpenedDb, memory: MemoryNode, existingTopics: readonly string[]): ReviewItem[] {
+  if (memory.topic) return [];
+  if (memory.importance < TOPIC_ASK_IMPORTANCE) return [];
+  const options = [...existingTopics.slice(0, 6), "先不起主题"];
+  const question = `要不要给这条记忆起个主题？（方便以后按主题找回）\n${clip(memory.content, 80)}`;
+  const id = enqueueReview(o, { kind: "topic", memoryId: memory.id, otherId: null, question, options });
+  return id ? [{ id, kind: "topic", memoryId: memory.id, otherId: null, question, options }] : [];
 }
 
 export function pendingItems(o: OpenedDb, limit = 20): ReviewRow[] {

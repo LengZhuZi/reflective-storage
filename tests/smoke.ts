@@ -66,6 +66,7 @@ const okFetch: typeof fetch = async (_url, init) => {
     else if (key === "memory_type") answers[key] = { type: "choice", choice: "event", confidence: 1, probabilities: { event: 1 } };
     else if (key === "memory_scope") answers[key] = { type: "choice", choice: "project", confidence: 0.9, probabilities: {} };
     else if (key === "relation") answers[key] = { type: "choice", choice: "supersedes", confidence: 0.84, probabilities: {} };
+    else if (key === "topic") answers[key] = { type: "choice", choice: "none", confidence: 0.7, probabilities: {} };
     else if (key === "target") answers[key] = { type: "choice", choice: Object.keys(q.criteria ?? {}).filter((k) => k !== "none")[1] ?? "none", confidence: 0.8, probabilities: {} };
     else if (key === "need_recall") answers[key] = { type: "noul", noul: 0.9 };
     else if (key === "new_topic") answers[key] = { type: "noul", noul: 0.1 };

@@ -81,6 +81,19 @@ export interface WriteResult {
   reason?: string;
 }
 
+/** 有疑问句形状且没有持久化信号 —— 就是提问，不是记忆。 */
+function isPureQuestion(t: string): boolean {
+  return (QUESTION.test(t) || QUESTION_TAIL.test(t)) && !DURABLE_SIGNAL.test(t);
+}
+
+/**
+ * 按句切开。实测：一句话里夹问句很常见（「这个怎么拆？另外以后都用 X」），
+ * 不切就把提问也一起存进记忆，以后注入时模型看到的是噪声。
+ */
+function sentences(text: string): string[] {
+  return text.split(/(?<=[。！？!?])/).map((s) => s.trim()).filter(Boolean);
+}
+
 /**
  * 本地预筛：决定这份内容值不值得花一次 JEV 调用。
  * 它只负责省钱，不负责判断内容好坏 —— 那是 J1 的活。
@@ -89,17 +102,19 @@ export function worthEvaluating(text: string): { ok: boolean; reason?: string } 
   const t = text.trim();
   if (t.length < MIN_LENGTH) return { ok: false, reason: `太短（${t.length} < ${MIN_LENGTH}）` };
   if (NOISE.test(t)) return { ok: false, reason: "纯确认/催促" };
-  if ((QUESTION.test(t) || QUESTION_TAIL.test(t)) && !DURABLE_SIGNAL.test(t)) {
+  if (isPureQuestion(t)) {
     return { ok: false, reason: "疑问句，不是记忆" };
   }
   return { ok: true };
 }
 
-/** 把本轮的候选内容拼成一段交给 J1。多条用户消息合在一起判断，省调用。 */
+/** 把本轮的候选内容拼成一段交给 J1。多条用户消息合在一起判断，省调用。
+ *  纯提问的句子（哪怕夹在陈述中间）先剔掉：它们不是记忆，还会把噪声带进注入块。 */
 export function buildCandidate(input: TurnInput): string {
   return input.userTexts
-    .map((t) => redact(t.replace(/\s+/g, " ").trim()))
-    .filter((t) => t.length > 0)
+    .flatMap((t) => sentences(t))
+    .map((s) => redact(s.replace(/\s+/g, " ")))
+    .filter((s) => s.length > 0 && !isPureQuestion(s))
     .join("\n");
 }
 

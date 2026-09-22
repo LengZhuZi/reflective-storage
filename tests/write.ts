@@ -14,7 +14,7 @@ const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "reflect-write-"));
 process.env.REFLECTIVE_HOME = tmp;
 
 const { openDb, countMemories, listInScope } = await import("../src/storage/db.ts");
-const { writeFlow, worthEvaluating, redact, KEEP_THRESHOLD } = await import("../src/pipeline/write.ts");
+const { writeFlow, worthEvaluating, buildCandidate, redact, KEEP_THRESHOLD } = await import("../src/pipeline/write.ts");
 
 const project = openDb(path.join(tmp, "proj.db"));
 const global = openDb(path.join(tmp, "global.db"));
@@ -54,6 +54,18 @@ assert.equal(worthEvaluating("这个仓库提交的时候要怎么拆？").ok, f
 assert.equal(worthEvaluating("Why is the build failing?").ok, false);
 assert.equal(worthEvaluating("记住：上线前为什么要先跑一遍 index 重建？").ok, true, "带明确要求的问题句必须留");
 assert.equal(worthEvaluating("以后这个仓库的提交都必须一个模块一个提交").ok, true, "陈述句照常");
+// 一句话里夹问句：提问要剔掉，陈述要留下（实测这样存出来的记忆才干净）
+assert.equal(
+  buildCandidate({ userTexts: ["这个仓库提交的时候要怎么拆？另外以后提交都必须一个模块一个提交"], context: "" }),
+  "另外以后提交都必须一个模块一个提交",
+  "夹在陈述里的提问不该被存进记忆",
+);
+assert.equal(buildCandidate({ userTexts: ["怎么拆？"], context: "" }), "", "整句都是提问就什么都不存");
+assert.equal(
+  buildCandidate({ userTexts: ["记住：上线前为什么要先跑一遍 index 重建？"], context: "" }),
+  "记住：上线前为什么要先跑一遍 index 重建？",
+  "带明确要求的问题句照样留",
+);
 console.log("✓ 本地预筛挡掉短输入和纯确认（这一步免费，JEV 才是花钱的）");
 
 // ------------------------------------------------------------ 脱敏

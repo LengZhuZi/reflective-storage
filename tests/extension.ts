@@ -99,7 +99,18 @@ assert.ok(first.message.content.includes("Flyway"), "注入块里要有记忆原
 assert.ok(first.message.content.includes("\\u003c/retrieved-memories"), "记忆里的 < 必须被转义");
 assert.ok(!first.message.content.includes("<system>"), "转义后不能留下可解析的标签");
 
-assert.equal(await call("before_agent_start", { prompt: PROMPT }), undefined, "每会话只注入一次：第二次注入会毁了前缀缓存");
+// 同一话题再问一遍不该重复插（上下文里已经有了），但「本会话不再注入」不是死条件
+assert.equal(await call("before_agent_start", { prompt: PROMPT }), undefined, "同一话题不重复注入");
+// 隔够轮数 + 换了话题 → 允许再注入一次（无感要求：聊到 X 时 X 的记忆恰好在）
+await call("before_agent_start", { prompt: "先看看别的" });
+await call("before_agent_start", { prompt: "再看看别的" });
+await call("before_agent_start", { prompt: "还是别的" });
+const again = await call("before_agent_start", { prompt: "阴影的着色器参数怎么写" }) as { message: unknown } | undefined;
+assert.ok(again?.message, "隔了至少 3 轮又换了话题，该再注入一次");
+notes.length = 0;
+await runCommand("");
+assert.match(notes.at(-1)!, /注入：.*2 次/, "/memory 要能看出本会话注入过几次、上限是多少");
+assert.match(notes.at(-1)!, /注入策略：每会话最多 3 次/, "策略本身也要看得见");
 await call("session_compact");
 const afterCompact = await call("before_agent_start", { prompt: PROMPT }) as { message: unknown } | undefined;
 assert.ok(afterCompact?.message, "压缩把注入块带走了，所以压缩后要允许重新注入");

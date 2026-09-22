@@ -18,7 +18,7 @@ import { Type } from "typebox";
 import type { JudgeMeta } from "./src/jev/types.ts";
 import type { MemoryNode, SessionInfo } from "./src/core/types.ts";
 import { createJudgeAdapter, type JevAdapter } from "./src/jev/adapter.ts";
-import { loadConfig, proxyHint } from "./src/config.ts";
+import { loadConfig, proxyHint, type InjectConfig } from "./src/config.ts";
 import {
   addTrace, countMemories, getMemory, hardDelete, listInScope, openGlobalDb, openProjectDb,
   projectIdFor, recentRecalls, tracesFor, type OpenedDb,
@@ -39,6 +39,8 @@ interface Runtime {
   pending: Promise<unknown>;
   /** 本会话已经消化过的用户原话，防同一句被评估两次。 */
   digested: Set<string>;
+  /** 本会话的注入策略（config.inject）。 */
+  inject: InjectConfig;
   /** 配置读取时发现的问题（文件缺失 / 权限不对 / 解析失败），/memory 要能看见。 */
   configProblems: string[];
   /** 本会话用哪个判断引擎（rules / jev / openai），/memory 要能看见。 */
@@ -130,7 +132,8 @@ function statusText(r: Runtime): string {
   const lines = [
     `项目库 ${projectIdFor(r.session.cwd)}：${countMemories(r.projectDb)} 条`,
     `全局库：${countMemories(r.globalDb)} 条`,
-    `本会话注入：${r.state.doneThisSession ? `${r.state.injectedIds.size} 条` : "未注入"}`,
+    `本会话注入：${r.state.doneThisSession ? `${r.state.injectedIds.size} 条 / ${r.state.injectionCount} 次` : "未注入"}`,
+    `注入策略：每会话最多 ${r.inject.maxPerSession} 次，间隔 ≥${r.inject.minTurnsBetween} 轮，换话题才再注入`,
     `判断引擎：${r.engine}`,
   ];
   const lr = r.lastRecall;
@@ -175,6 +178,7 @@ export default function reflectiveStorage(pi: ExtensionAPI): void {
       globalDb,
       adapter: createJudgeAdapter(judge),
       engine: judge.provider,
+      inject: loaded.inject,
       session: {
         sessionId: ctx.sessionManager.getSessionId() ?? "ephemeral",
         cwd: ctx.cwd,
@@ -201,7 +205,8 @@ export default function reflectiveStorage(pi: ExtensionAPI): void {
 
   pi.on("before_agent_start", async (event, _ctx) => {
     const r = rt;
-    if (!r || r.state.doneThisSession) return;
+    if (!r) return;
+    r.state.tick();
 
     // J13 复活要先跑，而且必须在预判之前：它是纯本地二字组比对（不吃 token、不调引擎），
     // 而预判可能因为「输入太短」直接返回 —— 实测就是这样漏掉一次本该发生的复活。
@@ -219,6 +224,14 @@ export default function reflectiveStorage(pi: ExtensionAPI): void {
       return;
     }
 
+    // 是不是该注入：首轮一定查；之后要同时满足「没到上限 + 隔够轮数 + 换了话题」，
+    // 否则上下文里已经有了，再插一遍只是白搭前缀缓存。
+    const gate = r.state.shouldInject(event.prompt, r.inject);
+    if (!gate.ok) {
+      r.lastRecall = { status: "skipped", candidates: 0, injected: 0, detail: gate.reason, at: Date.now() };
+      return;
+    }
+
     try {
       const res = await recallFlow(event.prompt, {
         projectDb: r.projectDb,
@@ -232,7 +245,7 @@ export default function reflectiveStorage(pi: ExtensionAPI): void {
         injected: res.injected.length, detail: res.detail, at: Date.now(),
       };
       if (res.injected.length === 0) return;   // fail-closed：沉默优于噪声
-      r.state.markInjected(res.injected.map((x) => x.memory.id));
+      r.state.markInjected(res.injected.map((x) => x.memory.id), event.prompt);
       return { message: { customType: "reflective-memory", content: res.block, display: true } };
     } catch (e) {
       // 注入 fail-closed：任何意外都不许穿透到 agent 启动

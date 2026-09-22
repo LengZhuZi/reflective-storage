@@ -113,6 +113,8 @@ sqlite3 $D/projects/*.db "select content,type,scope from memories; select gate,a
 | `REFLECTIVE_JUDGE_API_KEY` / `_BASE_URL` / `_MODEL` | 判断引擎自己的凭据和端点，覆盖上面的 `TYPESAFE_*` |
 | `REFLECTIVE_JUDGE_TIMEOUT_MS` / `_WRITE_TIMEOUT_MS` | 交互路径 / 写入路径超时，缺省 2500 / 8000。本地模型要调大 |
 | `REFLECTIVE_JUDGE_THRESHOLD` | 相关性阈值，缺省 0.7。本地小模型分数普遍偏低时调小 |
+
+行为开关只放配置文件（环境变量留给凭据和端点）：`inject.maxPerSession`（缺省 3，设 1 = 每会话只注入一次）、`inject.minTurnsBetween`（缺省 3）、`inject.topicOverlapBelow`（缺省 0.3）。
 | `REFLECTIVE_PROXY` | 代理地址，等价于配置文件里的 `proxy.http` |
 | `HTTP_PROXY` / `HTTPS_PROXY` | JEV 端点需要代理时用，配合下面的开关 |
 | `NODE_USE_ENV_PROXY=1` | **必需**（要用代理时）。Node 的内置 fetch 默认不读代理变量，且必须在启动进程前设置 —— 进程内改无效 |

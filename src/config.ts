@@ -54,8 +54,16 @@ export interface JudgeConfig {
 export interface LoadedConfig {
   config: JevConfig;
   judge: JudgeConfig;
+  inject: InjectConfig;
   /** 读取时发现的问题。降级时必须把这些说出去，不能静默（§6.2）。 */
   problems: string[];
+}
+
+/** 注入策略（§8.3）。默认不再是「每会话一次」，理由见 src/pipeline/inject.ts。 */
+export interface InjectConfig {
+  maxPerSession: number;
+  minTurnsBetween: number;
+  topicOverlapBelow: number;
 }
 
 const str = (v: unknown): string | undefined =>
@@ -100,7 +108,19 @@ export function loadConfig(): LoadedConfig {
   const timeout = typesafe.timeoutMs;
   if (typeof timeout === "number" && timeout > 0) config.timeoutMs = timeout;
 
-  return { config, judge: resolveJudge(judge, config), problems };
+  return { config, judge: resolveJudge(judge, config), inject: resolveInject(file?.inject), problems };
+}
+
+/** 注入策略。只从配置文件读 —— 行为开关放文件里，环境变量留给凭据和端点。 */
+function resolveInject(raw: unknown): InjectConfig {
+  const file = (raw ?? {}) as Record<string, unknown>;
+  const num = (v: unknown, fallback: number, min: number, max = Number.MAX_SAFE_INTEGER) =>
+    typeof v === "number" && Number.isFinite(v) && v >= min && v <= max ? v : fallback;
+  return {
+    maxPerSession: num(file.maxPerSession, 3, 1),
+    minTurnsBetween: num(file.minTurnsBetween, 3, 1),
+    topicOverlapBelow: num(file.topicOverlapBelow, 0.3, 0, 1),
+  };
 }
 
 /**

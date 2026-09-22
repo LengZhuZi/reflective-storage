@@ -66,7 +66,7 @@ const state = new InjectionState();
 assert.equal(state.doneThisSession, false);
 assert.deepEqual([...state.injectedIds], []);
 
-state.markInjected(["m1", "m2"]);
+state.markInjected(["m1", "m2"], "影子太黑怎么调");
 assert.equal(state.doneThisSession, true, "注入过就必须置位，否则第二次注入会毁掉前缀缓存");
 assert.deepEqual([...state.injectedIds].sort(), ["m1", "m2"], "已注入的 id 要在调 JEV 之前被排除掉");
 
@@ -74,9 +74,59 @@ state.reset();
 assert.equal(state.doneThisSession, false, "压缩后要允许重新注入");
 assert.deepEqual([...state.injectedIds], [], "压缩把注入块也带走了，id 不该还算「已见过」");
 
-state.markInjected(["m3"]);
-state.markInjected(["m3", "m4"]);
+state.markInjected(["m3"], "q1");
+state.markInjected(["m3", "m4"], "q2");
 assert.deepEqual([...state.injectedIds].sort(), ["m3", "m4"], "重复标记要幂等");
 console.log("✓ 每会话只注入一次 + 压缩后解锁");
+
+// ------------------------------------------------------------ 注入策略（§8.3 的默认放宽成有界多次）
+const { DEFAULT_INJECT_POLICY, isNewTopic } = await import("../src/pipeline/inject.ts");
+const st = new InjectionState();
+const P = DEFAULT_INJECT_POLICY;
+
+// 首轮一定注入
+st.tick();
+assert.equal(st.shouldInject("提交要按什么拆？", P).ok, true, "首轮必须查");
+
+// 注入了之后：同一话题、隔的轮数不够，都不再插一遍（上下文里已经有了）
+st.markInjected(["a"], "提交要按什么拆？");
+st.tick();
+assert.equal(st.shouldInject("提交要按什么拆？", P).ok, false);
+assert.equal(st.shouldInject("提交怎么拆？", P).ok, false, "换了个说法但话题没变，还是同一件事");
+assert.equal(st.shouldInject("提交要按什么拆？", P).reason?.includes("只隔"), true, "要说得清为什么跳过");
+
+// 隔够轮数 + 换了话题 → 允许第二次
+for (let i = 0; i < P.minTurnsBetween; i++) st.tick();
+const second = st.shouldInject("库里的 embedding 模型怎么换？", P);
+assert.equal(second.ok, true, `换了话题又隔了 ${P.minTurnsBetween} 轮，就该再注入一次`);
+assert.equal(second.reason, undefined);
+st.markInjected(["b"], "库里的 embedding 模型怎么换？");
+assert.equal(st.injectionCount, 2);
+
+// 上限到顶就不再注入（前缀缓存的损失有界）
+let injected = 2;
+while (injected < P.maxPerSession) {
+  for (let i = 0; i < P.minTurnsBetween; i++) st.tick();
+  assert.equal(st.shouldInject(`第 ${injected} 个全新话题「${"甲乙丙丁戊己庚辛"[injected] as string}」`, P).ok, true);
+  st.markInjected([`m${injected}`], `第 ${injected} 个全新话题`);
+  injected++;
+}
+for (let i = 0; i < P.minTurnsBetween; i++) st.tick();
+const capped = st.shouldInject("又一个完全不相关的话题", P);
+assert.equal(capped.ok, false, "到上限就不再注入");
+assert.match(String(capped.reason), /上限/);
+assert.equal(st.injectionCount, P.maxPerSession);
+
+// 压缩后立刻又行（上下文被重写过了）
+st.reset();
+assert.equal(st.shouldInject("压缩之后的第一句话", P).ok, true, "压缩后不该被轮次/话题条件拦住");
+assert.ok(P.maxPerSession >= 1 && P.minTurnsBetween >= 1);
+
+// 话题判定本身
+assert.equal(isNewTopic("影子太黑怎么调", "", 0.3), true, "没有上次的提问时算新话题");
+assert.equal(isNewTopic("影子太黑怎么调", "影子强度怎么算", 0.3), false, "共享二字组多 = 同一话题");
+assert.equal(isNewTopic("数据库迁移用哪个工具", "影子强度怎么算", 0.3), true);
+assert.equal(isNewTopic("", "影子", 0.3), false, "空输入不算新话题");
+console.log("✓ 注入策略：首轮必查、同话题不重复、隔够轮数 + 换话题才再注入、上限到顶、压缩后解锁");
 
 console.log("\n全部通过");

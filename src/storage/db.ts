@@ -393,6 +393,36 @@ export function countMemories(o: OpenedDb): number {
   return Number((o.db.prepare(`SELECT count(*) c FROM memories`).get() as Row).c);
 }
 
+/**
+ * 生命周期扫描用：按状态取一段。排序把「最久没碰的」放前面（从没碰过的最前），
+ * 这样有上限时先处理最该处理的那些。
+ */
+export function listByStates(o: OpenedDb, states: readonly MemoryState[], limit = 200): MemoryNode[] {
+  const marks = states.map(() => "?").join(",");
+  const rows = o.db
+    .prepare(
+      `SELECT * FROM memories WHERE state IN (${marks})
+        ORDER BY last_accessed ASC NULLS FIRST, created_at ASC LIMIT ?`,
+    )
+    .all(...states, limit) as Row[];
+  return rows.map(toNode);
+}
+
+/** 生命周期只改这三个字段，单独开一个写入口，免得 SQL 散在各个 pipeline 里。 */
+export function updateLifecycle(
+  o: OpenedDb,
+  id: string,
+  fields: { decayScore: number; state: MemoryState; importance?: number },
+): void {
+  if (fields.importance === undefined) {
+    o.db.prepare(`UPDATE memories SET decay_score = ?, state = ? WHERE id = ?`).run(fields.decayScore, fields.state, id);
+    return;
+  }
+  o.db
+    .prepare(`UPDATE memories SET decay_score = ?, state = ?, importance = ? WHERE id = ?`)
+    .run(fields.decayScore, fields.state, fields.importance, id);
+}
+
 /** 某条记忆的判断轨迹，用于回答「为什么记住的」。按时间正序，最早的判断在最前面。 */
 export function tracesFor(o: OpenedDb, memoryId: string): Row[] {
   return o.db

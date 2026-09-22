@@ -37,6 +37,7 @@ src/storage/db.ts       node:sqlite + FTS5 + sqlite-vec
 src/pipeline/write.ts   写入流程：预筛、脱敏、J1+J2+J3、作用域分流、fail-open
 src/pipeline/recall.ts  召回流程：多路召回、作用域门禁、J7、J8、预算截断
 src/pipeline/inject.ts  注入块组装与「每会话只注入一次」的状态
+src/pipeline/lifecycle.ts 生命周期：J10 衰减 / J9 巩固 / J12 归档 / J13 复活（纯后台）
 ```
 
 ## 判断引擎（三档，都是正式档位）
@@ -69,6 +70,7 @@ node tests/smoke.ts       # storage + embedding + 四个 gate 的成功路径与
 node tests/config.ts      # 配置与凭据：环境变量覆盖、600 权限把关、报错可读、代理提示
 node tests/judge.ts       # 三档引擎、阈值跟着引擎走、OpenAI 兼容的编译与解析
 node tests/governance.ts  # J14b 置信度分级（作用域只许收窄）+ J14c 一句人话
+node tests/lifecycle.ts   # J10 衰减公式、J9 巩固、J12 归档（高 importance 不动）、J13 复活、fail-silent
 node tests/write.ts       # 写入流程：预筛、脱敏、作用域分流、fail-open
 node tests/recall.ts      # 召回流程：门禁、阈值、fail-degraded、fail-closed、预算
 node tests/inject.ts      # 注入块：声明、转义、预算截断、状态机
@@ -147,7 +149,7 @@ sqlite3 $D/projects/*.db "select content,type,scope from memories; select gate,a
 
 ## 状态
 
-Phase 1 进行中。已完成存储层、embedding、四个 gate（J1/J2/J3、J5、J7、J8）与其失败姿态、写入流程、召回流程、判断引擎可插拔（rules / jev / openai）、治理（J14a 硬过滤 + J14b 兜底路由 + J14c 理由）、J15 轻量反馈日志、pi 扩展入口（hooks / 工具 / `/memory` 命令）。
+Phase 1 完成；Phase 2 第一片（生命周期）也做完了。已完成：存储层、embedding、四个 gate（J1/J2/J3、J5、J7、J8）与其失败姿态、写入流程、召回流程、判断引擎可插拔（rules / jev / openai）、治理（J14a 硬过滤 + J14b 兜底路由 + J14c 理由）、J15 轻量反馈日志、生命周期（J9 巩固 / J10 衰减 / J12 归档 / J13 复活）、pi 扩展入口（hooks / 工具 / `/memory` 命令）。
 
 J14b 只有作用域分级：低置信度时作用域**只许收窄**（引擎说 global 但只有 0.55 → 收窄到 project）。宽窄代价不对称 —— 放宽会把项目内的步骤带去别的项目，收窄只是少看见几条。
 
@@ -155,6 +157,6 @@ J15 只记事实（query / 召回集 / 注入集），`cited_ids` 和 `user_feed
 
 J5 目前不调用：§10.4 的本地规则已经覆盖了「要不要花这次钱」，而本会话只注入一次，所以 J5 在首轮永远是一次白花的调用。`adapter.judgeRecallNeed` 留着给压缩后重注入和将来的主动召回。
 
-待做：J9–J13 生命周期（衰减 / 合并 / 遗忘 / 复活，挂在 `session_start` 的懒执行上 —— §14 把它划在 Phase 2）、J14c 的复核 UI、J15 的 `cited` 事后核对与用户反馈入口。路线图见 DESIGN.md §14。
+待做：J11 合并（需要引擎级语义判断；J3 的 `supersedes` 已覆盖最常见的情形）、J4 树路由、J14c 的复核 UI、J15 的 `cited` 事后核对与用户反馈入口。路线图见 DESIGN.md §14。
 
 真 pi 无感闭环已验证：会话 1 顺口说一条约定（零命令、没说「记住」）→ 自动入库一条；会话 2 新会话直接问 → 自动召回 + 注入，回答直接用上。跑法见上面「真 pi 验收」。

@@ -25,6 +25,7 @@ import {
 } from "./src/storage/db.ts";
 import { writeFlow } from "./src/pipeline/write.ts";
 import { recallFlow, worthRecalling } from "./src/pipeline/recall.ts";
+import { resurrectFor, runLifecycle } from "./src/pipeline/lifecycle.ts";
 import { DEFAULT_MAX_TOKENS, InjectionState, MEMORY_OPEN } from "./src/pipeline/inject.ts";
 
 /** 本会话的运行时状态。每次 session_start 重建，session_shutdown 拆掉。 */
@@ -185,6 +186,17 @@ export default function reflectiveStorage(pi: ExtensionAPI): void {
       digested: new Set<string>(),
       configProblems: [...loaded.problems, ...judge.problems],
     };
+
+    // 懒生命周期（§9.3）：没有定时任务，就挂在 session_start 上跑一次，且有上限。
+    // 纯后台（fail-silent）：不 await、出错也不影响会话。
+    const lifecycle = rt;
+    void Promise.resolve()
+      .then(() => {
+        const s = runLifecycle(lifecycle.projectDb);
+        runLifecycle(lifecycle.globalDb);
+        if (s.errors.length) lifecycle.error = `生命周期：${s.errors[0]}`;
+      })
+      .catch((e) => { lifecycle.error = `生命周期：${errText(e)}`; });
   });
 
   pi.on("before_agent_start", async (event, _ctx) => {
@@ -199,6 +211,9 @@ export default function reflectiveStorage(pi: ExtensionAPI): void {
     }
 
     try {
+      // J13 复活：先把归档的放回来，再召回 —— 否则刚复活的那条赶不上这次注入。
+      resurrectFor(r.projectDb, event.prompt);
+      resurrectFor(r.globalDb, event.prompt);
       const res = await recallFlow(event.prompt, {
         projectDb: r.projectDb,
         globalDb: r.globalDb,

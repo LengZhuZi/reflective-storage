@@ -19,7 +19,7 @@ const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "reflect-ext-"));
 process.env.REFLECTIVE_HOME = tmp;
 process.env.TYPESAFE_API_KEY = "test-key";
 
-const { default: factory, userTexts, assistantText, lastUserText } = await import("../index.ts");
+const { default: factory, userTexts, assistantText, lastUserText, conversationContext } = await import("../index.ts");
 const { openDb, insertMemory, countMemories, projectIdFor } = await import("../src/storage/db.ts");
 const { MEMORY_OPEN } = await import("../src/pipeline/inject.ts");
 
@@ -47,8 +47,10 @@ const call = (name: string, event?: unknown) => handlers.get(name)!(event, ctx);
 const runCommand = (args: string) => commands.get("memory")!.handler(args, ctx);
 
 const realFetch = globalThis.fetch;
+let lastState = "";
 const jevFetch: typeof fetch = async (_url, init) => {
-  const req = JSON.parse(String(init?.body)) as { questions: Record<string, { type: string }> };
+  const req = JSON.parse(String(init?.body)) as { questions: Record<string, { type: string }>; state?: string };
+  lastState = String(req.state ?? "");
   const answers: Record<string, unknown> = {};
   for (const [key, q] of Object.entries(req.questions)) {
     if (key === "worth_keeping") answers[key] = { type: "noul", noul: 0.9 };
@@ -129,8 +131,28 @@ assert.deepEqual(userTexts([injectedUserMessage]), [], "注入块是 role=user �
 assert.deepEqual(userTexts([{ role: "user", content: "以后数据库迁移都用 Flyway" }]), ["以后数据库迁移都用 Flyway"]);
 assert.deepEqual(userTexts([{ role: "toolResult", content: "TOKEN=abc123" }]), [], "工具结果绝不写进记忆");
 assert.equal(assistantText([{ role: "assistant", content: [{ type: "text", text: "好" }, { type: "thinking", text: "不该出现" }] }]), "好");
+// J1/J3 的上下文里要带上**前面几轮用户说的话**：用户说「不对，改成 Y」时，
+// 只给本轮助手的话，JEV 只能靠词形猜，而不是靠「上一轮说的是 X」。
+const cc = conversationContext(
+  [
+    { type: "message", message: { role: "user", content: "影子强度先按海拔调" } },
+    { type: "message", message: { role: "assistant", content: [{ type: "text", text: "好" }] } },
+    injectedUserMessage,
+    { role: "user", content: "不对，改成按立面高度算" },
+  ],
+  ["不对，改成按立面高度算"],
+  "改成按立面高度算了",
+);
+assert.match(cc, /USER SAID EARLIER IN THIS SESSION:\n影子强度先按海拔调/, "要带上前几轮用户的话");
+assert.ok(!cc.includes("不对，改成按立面高度算"), "本轮的话不重复给（它已经在 NEW CONTENT 里）");
+assert.ok(!cc.includes("注入的记忆块"), "注入块不是用户的话");
+assert.match(cc, /ASSISTANT SAID IN THIS TURN:\n改成按立面高度算了/);
+assert.equal(conversationContext([], [], ""), "", "什么都没有就给空串");
+assert.equal(conversationContext([{ role: "user", content: "a" }], [], "", 0), "", "轮数上限为 0 时什么都不带");
 
 const before = countMemories(seed);
+// 前几轮用户说过的话（真 pi 里来自 sessionManager.getBranch()）
+branch.push({ type: "message", message: { role: "user", content: "我们在讨论提交要按什么拆" } });
 await call("agent_end", {
   messages: [
     injectedUserMessage,
@@ -149,7 +171,8 @@ for (let i = 0; i < 100 && !writtenId; i++) {
   else await new Promise((r) => setTimeout(r, 50));
 }
 assert.ok(writtenId, "agent_end 写的记忆该落地（后台队列不拖用户，但不能丢）");
-console.log("✓ agent_end 只取用户自己的话，重复的那句不会被评估两次");
+assert.match(lastState, /USER SAID EARLIER IN THIS SESSION:\n我们在讨论提交要按什么拆/, "真链路上也要把前面几轮用户的话送给判断引擎");
+console.log("✓ agent_end 只取用户自己的话，重复的那句不会被评估两次；上下文带上前几轮");
 
 // ------------------------------------------------------------ 工具 + 命令
 const search = await tools.get("memory_search")!.execute(undefined, { query: "影子" }, undefined, undefined, ctx) as { content: Array<{ text: string }> };

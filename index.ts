@@ -113,6 +113,39 @@ export function assistantText(messages: readonly unknown[]): string {
 }
 
 /**
+ * 给 JEV 判断用的对话上下文：**最近几轮用户说过的话** + 本轮助手说过的话。
+ *
+ * 为什么要有前面几轮的用户话：只给本轮助手的话时，用户说「不对，改成 Y」这种，
+ * JEV 只能靠词形（"不对"、"改成"）猜，而不是靠「上一轮说的是 X」。判断该不该记、
+ * 跟哪条旧记忆冲突，都需要知道上一句是什么。
+ *
+ * 为什么不用整段会话：token 和噪声都涨，判断质量并不会跟着涨。最近 2 轮够用。
+ * 本轮用户的话在这里排除掉 —— 它已经在 NEW CONTENT 里了，重复给一遍只会让
+ * JEV 以为用户说了两次。
+ */
+export function conversationContext(
+  branch: readonly unknown[],
+  currentUserTexts: readonly string[],
+  thisRunAssistant: string,
+  maxTurns = 2,
+): string {
+  const current = new Set(currentUserTexts.map((t) => t.trim()));
+  const previous: string[] = [];
+  for (let i = branch.length - 1; i >= 0 && previous.length < maxTurns; i--) {
+    const entry = branch[i] as { role?: string; content?: unknown; message?: { role?: string; content?: unknown } };
+    const msg = entry?.message ?? entry;
+    if (msg?.role !== "user") continue;
+    const text = textOf(msg.content).trim();
+    if (!text || text.includes(MEMORY_OPEN) || current.has(text)) continue;
+    previous.unshift(text.slice(0, 300));
+  }
+  const parts: string[] = [];
+  if (previous.length) parts.push(`USER SAID EARLIER IN THIS SESSION:\n${previous.join("\n")}`);
+  if (thisRunAssistant.trim()) parts.push(`ASSISTANT SAID IN THIS TURN:\n${thisRunAssistant}`);
+  return parts.join("\n\n");
+}
+
+/**
  * 本会话最后一条用户消息。
  *
  * memory_add 用它而不是用模型给的 content：记忆原文必须由系统控制（§15 原则 1），
@@ -285,19 +318,24 @@ export default function reflectiveStorage(pi: ExtensionAPI): void {
     }
   });
 
-  pi.on("agent_end", async (event) => {
+  pi.on("agent_end", async (event, ctx) => {
     const r = rt;
     if (!r) return;
     const texts = userTexts(event.messages).filter((t) => !r.digested.has(t));
     for (const t of texts) r.digested.add(t);
-    const context = assistantText(event.messages);
+    const replyText = assistantText(event.messages);
+    const context = conversationContext(ctx.sessionManager.getBranch(), texts, replyText);
     // J15 事后核对：这一轮助手的回复到底用上了哪几条注入过的记忆。纯本地、不联网，
     // 所以直接同步算（写库也在这儿），不走后台队列。
-    try {
-      const fb = closeFeedbackLoop(r.projectDb, r.session.sessionId, context);
-      if (fb.injected > 0) r.lastFeedback = { injected: fb.injected, cited: fb.cited.length, score: fb.effectScore, at: Date.now() };
-    } catch (e) {
-      r.error = errText(e);
+    // 没有助手回复的轮次（重试/中断）**不核对**：拿一段不含回复的上下文去算，
+    // 只会把上一轮「确凿用上」的结论覆盖成 0，等于报假账。
+    if (replyText.trim()) {
+      try {
+        const fb = closeFeedbackLoop(r.projectDb, r.session.sessionId, replyText);
+        if (fb.injected > 0) r.lastFeedback = { injected: fb.injected, cited: fb.cited.length, score: fb.effectScore, at: Date.now() };
+      } catch (e) {
+        r.error = errText(e);
+      }
     }
     if (texts.length === 0) return;
     // 写入 fail-open 且不该拖住用户：排队后台跑，session_shutdown 冲刷。

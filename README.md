@@ -25,6 +25,7 @@ JEV 驱动的长期记忆运行时，作为 [pi](https://pi.dev) 的原生扩展
 index.ts                pi 扩展入口：六个 hook + 三个工具 + /memory 命令
 src/config.ts           配置与凭据解析（环境变量 > config.json > 报错）
 src/core/types.ts       记忆节点与作用域模型
+src/core/governance.ts  J14b 兜底路由（置信度分级）+ J14c 一句人话
 src/jev/types.ts        判断结果类型（三态 status）
 src/jev/http.ts         JEV 传输层：超时、重试、usage
 src/jev/llm.ts          OpenAI 兼容引擎：任何 /chat/completions
@@ -67,6 +68,7 @@ bash scripts/fetch-model.sh
 node tests/smoke.ts       # storage + embedding + 四个 gate 的成功路径与三条失败路径
 node tests/config.ts      # 配置与凭据：环境变量覆盖、600 权限把关、报错可读、代理提示
 node tests/judge.ts       # 三档引擎、阈值跟着引擎走、OpenAI 兼容的编译与解析
+node tests/governance.ts  # J14b 置信度分级（作用域只许收窄）+ J14c 一句人话
 node tests/write.ts       # 写入流程：预筛、脱敏、作用域分流、fail-open
 node tests/recall.ts      # 召回流程：门禁、阈值、fail-degraded、fail-closed、预算
 node tests/inject.ts      # 注入块：声明、转义、预算截断、状态机
@@ -121,8 +123,12 @@ node tests/extension.ts   # pi 绑定：hook/工具/命令、每会话一次、�
 
 ## 状态
 
-Phase 1 进行中。已完成存储层、embedding、四个 gate（J1/J2/J3、J5、J7、J8）与其失败姿态、写入流程、召回流程、判断引擎可插拔（rules / jev / openai）、pi 扩展入口（hooks / 工具 / `/memory` 命令）。
+Phase 1 进行中。已完成存储层、embedding、四个 gate（J1/J2/J3、J5、J7、J8）与其失败姿态、写入流程、召回流程、判断引擎可插拔（rules / jev / openai）、治理（J14a 硬过滤 + J14b 兜底路由 + J14c 理由）、J15 轻量反馈日志、pi 扩展入口（hooks / 工具 / `/memory` 命令）。
+
+J14b 只有作用域分级：低置信度时作用域**只许收窄**（引擎说 global 但只有 0.55 → 收窄到 project）。宽窄代价不对称 —— 放宽会把项目内的步骤带去别的项目，收窄只是少看见几条。
+
+J15 只记事实（query / 召回集 / 注入集），`cited_ids` 和 `user_feedback` 留空：前者要等事后核对，后者要等 UI。
 
 J5 目前不调用：§10.4 的本地规则已经覆盖了「要不要花这次钱」，而本会话只注入一次，所以 J5 在首轮永远是一次白花的调用。`adapter.judgeRecallNeed` 留着给压缩后重注入和将来的主动召回。
 
-待做：J9–J13 生命周期（衰减 / 合并 / 遗忘 / 复活，挂在 `session_start` 的懒执行上）、J14c 用户可见理由、J15 轻量反馈日志。路线图见 DESIGN.md §14。
+待做：J9–J13 生命周期（衰减 / 合并 / 遗忘 / 复活，挂在 `session_start` 的懒执行上 —— §14 把它划在 Phase 2）、J14c 的复核 UI、J15 的 `cited` 事后核对与用户反馈入口。路线图见 DESIGN.md §14。

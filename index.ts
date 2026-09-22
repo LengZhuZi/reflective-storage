@@ -21,7 +21,7 @@ import { createJudgeAdapter, type JevAdapter } from "./src/jev/adapter.ts";
 import { loadConfig, proxyHint } from "./src/config.ts";
 import {
   addTrace, countMemories, getMemory, hardDelete, listInScope, openGlobalDb, openProjectDb,
-  projectIdFor, tracesFor, type OpenedDb,
+  projectIdFor, recentRecalls, tracesFor, type OpenedDb,
 } from "./src/storage/db.ts";
 import { writeFlow } from "./src/pipeline/write.ts";
 import { recallFlow, worthRecalling } from "./src/pipeline/recall.ts";
@@ -113,6 +113,13 @@ function statusText(r: Runtime): string {
   const lr = r.lastRecall;
   if (lr) lines.push(`上次召回：${label(lr.status)}，候选 ${lr.candidates} → 注入 ${lr.injected}${lr.detail ? `（${lr.detail}）` : ""}`);
   if (r.lastWrite) lines.push(`上次写入：${r.lastWrite.action}${r.lastWrite.reason ? `（${r.lastWrite.reason}）` : ""}`);
+  // J15：最近几次召回的事实（没注入的时候最需要看到这个）
+  const recalls = recentRecalls(r.projectDb, 3);
+  for (const q of recalls) {
+    const injected = JSON.parse(String(q.injected_ids ?? "[]")) as unknown[];
+    const recalled = JSON.parse(String(q.recalled_ids ?? "[]")) as unknown[];
+    lines.push(`召回记录：候选 ${recalled.length} → 注入 ${injected.length} 「${String(q.query).slice(0, 24)}」`);
+  }
   for (const p of r.configProblems) lines.push(`配置：${p}`);
   if (r.error) lines.push(`最近错误：${r.error}`);
   return lines.join("\n");
@@ -366,7 +373,7 @@ export default function reflectiveStorage(pi: ExtensionAPI): void {
           `[${m.id}] (${m.type}/${m.scope}) ${m.content}`,
           `importance ${m.importance.toFixed(2)} · 访问 ${m.accessCount} 次 · 状态 ${m.state}`,
           ...(traces.length
-            ? traces.map((t) => `${t.gate} ${t.action} ${t.reason ?? ""} [${t.status ?? "?"}/${t.fallback_used ?? "?"}]`)
+            ? traces.map((t) => `${t.user_visible ?? ""}\n    ${t.gate} ${t.action} ${t.reason ?? ""} [${t.status ?? "?"}/${t.fallback_used ?? "?"}]${t.judgment ? ` 路由=${t.judgment}` : ""}`)
             : ["没有判断轨迹"]),
         ].join("\n"), "info");
         return;

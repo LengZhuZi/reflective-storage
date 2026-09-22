@@ -183,6 +183,15 @@ assert.ok(traces.some((t) => t.gate === "J8" && t.action === "inject"), "J8 要�
 assert.ok(traces.some((t) => t.status === "unavailable"), "降级必须留痕（§6.2 降级可见）");
 console.log("✓ 每次 JEV 判断都留痕（含降级）");
 
+// ------------------------------------------------------------ J15：召回登记
+const { recentRecalls } = await import("../src/storage/db.ts");
+const logged = recentRecalls(project, 20) as Array<Record<string, unknown>>;
+assert.ok(logged.length > 0, "每次召回都要登记一条（J15 轻量反馈）");
+const injectedInLog = logged.map((r) => JSON.parse(String(r.injected_ids)) as string[]);
+assert.ok(injectedInLog.some((ids) => ids.length > 0), "注入了就要记下来注入了什么");
+assert.ok(logged.some((r) => JSON.parse(String(r.recalled_ids)).length === 0), "一条都没召回时也要记 —— 那正是排查「为什么没注入」时最想看的一次");
+console.log("✓ J15 召回日志：记事实，不推断效果");
+
 project.close();
 global.close();
 fs.rmSync(tmp, { recursive: true, force: true });

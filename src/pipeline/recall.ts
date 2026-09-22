@@ -23,7 +23,7 @@ import type { JudgeMeta } from "../jev/types.ts";
 import { DEFAULT_RELEVANCE_THRESHOLD } from "../jev/types.ts";
 import { embed } from "../embed/encoder.ts";
 import {
-  addTrace, listInScope, markAccessed, searchByKeyword, searchByVector, type OpenedDb,
+  addTrace, listInScope, markAccessed, recordRecall, searchByKeyword, searchByVector, type OpenedDb,
 } from "../storage/db.ts";
 import { buildInjectionBlock, fitBudget } from "./inject.ts";
 
@@ -186,6 +186,19 @@ function worst(a: JudgeMeta["status"], b: JudgeMeta["status"]): JudgeMeta["statu
 }
 
 export async function recallFlow(query: string, deps: RecallDeps): Promise<RecallResult> {
+  const result = await runRecall(query, deps);
+  // J15 轻量反馈：只记事实（召回了什么、注入了什么），不推断效果 ——
+  // cited / user_feedback 在 Phase 1 编不出来，留空比编一个强（§7.1）。
+  recordRecall(deps.projectDb, {
+    sessionId: deps.session.sessionId,
+    query,
+    recalledIds: result.candidates.map((r) => r.memory.id),
+    injectedIds: result.injected.map((r) => r.memory.id),
+  });
+  return result;
+}
+
+async function runRecall(query: string, deps: RecallDeps): Promise<RecallResult> {
   const now = Date.now();
   const limit = deps.limit ?? MAX_CANDIDATES;
   const pool = await gather(query, deps);

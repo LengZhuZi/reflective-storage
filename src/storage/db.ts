@@ -15,6 +15,7 @@ import * as path from "node:path";
 import { createRequire } from "node:module";
 import { randomUUID } from "node:crypto";
 import type { MemoryNode, MemoryScope, MemoryState, MemoryType } from "../core/types.ts";
+import { userVisibleReason, type FallbackRoute } from "../core/governance.ts";
 import { EMBED_DIM, toVecBlob } from "../embed/encoder.ts";
 
 const require = createRequire(import.meta.url);
@@ -69,6 +70,21 @@ CREATE TABLE IF NOT EXISTS reflection_traces (
   created_at      INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_traces_created ON reflection_traces(created_at DESC);
+
+-- J15 轻量反馈（§7.1）。Phase 1 只记录 recalled / injected；cited 与 user_feedback
+-- 留空 —— 「模型有没有真用上」要等 Phase 2 的事后核对，现在编不出来。
+CREATE TABLE IF NOT EXISTS feedback_logs (
+  id              TEXT PRIMARY KEY,
+  session_id      TEXT,
+  query           TEXT,
+  recalled_ids    TEXT,
+  injected_ids    TEXT,
+  cited_ids       TEXT,
+  user_feedback   TEXT,
+  effect_score    REAL,
+  created_at      INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_feedback_created ON feedback_logs(created_at DESC);
 
 CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(
   content, summary, content='memories', content_rowid='rowid'
@@ -324,19 +340,53 @@ export interface TraceInput {
   status?: string | null;
   fallbackUsed?: string | null;
   latencyMs?: number | null;
+  /** J14b 的路由结果，由调用方给；不给就不过滤。 */
+  route?: FallbackRoute;
+  /** J14c 的一句人话；不给就用模板拼。 */
+  userVisible?: string;
 }
 
 export function addTrace(o: OpenedDb, t: TraceInput): void {
   o.db
     .prepare(
-      `INSERT INTO reflection_traces (id, memory_id, stage, gate, action, target_id, reason,
-                                      confidence, status, fallback_used, latency_ms, created_at)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
+      `INSERT INTO reflection_traces (id, memory_id, stage, gate, action, target_id, judgment,
+                                      reason, confidence, status, fallback_used, user_visible,
+                                      latency_ms, created_at)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
     )
     .run(
-      randomUUID(), t.memoryId ?? null, t.stage, t.gate, t.action, t.targetId ?? null, t.reason ?? null,
-      t.confidence ?? null, t.status ?? null, t.fallbackUsed ?? null, t.latencyMs ?? null, Date.now(),
+      randomUUID(), t.memoryId ?? null, t.stage, t.gate, t.action, t.targetId ?? null,
+      t.route ?? null, t.reason ?? null, t.confidence ?? null, t.status ?? null,
+      t.fallbackUsed ?? null,
+      t.userVisible ?? userVisibleReason({ stage: t.stage, action: t.action, status: t.status, route: t.route, reason: t.reason }),
+      t.latencyMs ?? null, Date.now(),
     );
+}
+
+/** J15：一次召回登记一条。只记事实（召回了什么、注入了什么），不推断效果。 */
+export interface RecallLog {
+  sessionId: string;
+  query: string;
+  recalledIds: string[];
+  injectedIds: string[];
+}
+
+export function recordRecall(o: OpenedDb, log: RecallLog): void {
+  o.db
+    .prepare(
+      `INSERT INTO feedback_logs (id, session_id, query, recalled_ids, injected_ids, cited_ids,
+                                 user_feedback, effect_score, created_at)
+       VALUES (?,?,?,?,?,?,?,?,?)`,
+    )
+    .run(randomUUID(), log.sessionId, log.query, JSON.stringify(log.recalledIds), JSON.stringify(log.injectedIds),
+      null, null, null, Date.now());
+}
+
+/** 最近几次召回，给 /memory 看「为什么这次没注入」。 */
+export function recentRecalls(o: OpenedDb, limit = 3): Row[] {
+  return o.db
+    .prepare(`SELECT query, recalled_ids, injected_ids, created_at FROM feedback_logs ORDER BY created_at DESC LIMIT ?`)
+    .all(limit) as Row[];
 }
 
 export function countMemories(o: OpenedDb): number {
@@ -347,7 +397,7 @@ export function countMemories(o: OpenedDb): number {
 export function tracesFor(o: OpenedDb, memoryId: string): Row[] {
   return o.db
     .prepare(
-      `SELECT gate, action, reason, status, fallback_used, confidence, created_at
+      `SELECT gate, action, reason, status, fallback_used, confidence, judgment, user_visible, created_at
          FROM reflection_traces WHERE memory_id = ? ORDER BY created_at`,
     )
     .all(memoryId) as Row[];

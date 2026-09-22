@@ -13,8 +13,10 @@
  */
 
 import type { MemoryNode, SessionInfo } from "../core/types.ts";
+import { resolveScope } from "../core/governance.ts";
 import type { JevAdapter } from "../jev/adapter.ts";
 import { MAX_CANDIDATES } from "../jev/adapter.ts";
+import { ruleScope } from "../jev/rule.ts";
 import { embed } from "../embed/encoder.ts";
 import {
   addRelation, addTrace, insertMemory, listInScope, putEmbedding,
@@ -99,13 +101,17 @@ export async function writeFlow(
     return { action: "skipped", reason: `worth_keeping ${j.worthKeeping.noul.toFixed(2)}` };
   }
 
+  // J14b：作用域分了置信度就分别对待。低置信度只许收窄（§11 原则 6），
+  // 默认值取规则档的判断当参照 —— 引擎不确定时至少要有个「更窄」的方向。
+  const resolved = resolveScope(j.scope.choice, j.scope.confidence, ruleScope(j.type.choice).choice);
+
   // 作用域决定落哪个库：偏好之类跨项目的进 global，其余进当前项目。
-  const target = j.scope.choice === "global" ? globalDb : projectDb;
+  const target = resolved.scope === "global" ? globalDb : projectDb;
   const insert: InsertMemory = {
     content,
     type: j.type.choice,
-    scope: j.scope.choice,
-    scopeId: j.scope.choice === "project" ? session.projectId : j.scope.choice === "session" ? session.sessionId : null,
+    scope: resolved.scope,
+    scopeId: resolved.scope === "project" ? session.projectId : resolved.scope === "session" ? session.sessionId : null,
     importance: j.worthKeeping.noul,
     source: session.sessionId,
   };
@@ -124,9 +130,10 @@ export async function writeFlow(
 
   addTrace(target, {
     memoryId: memory.id, stage: "write", gate: j.meta.gate, action: "keep",
-    targetId: j.targetId, reason: `${j.type.choice}/${j.scope.choice}`,
+    targetId: j.targetId, reason: `${j.type.choice}/${j.scope.choice} → ${resolved.scope}（${j.type.confidence.toFixed(2)}/${j.scope.confidence.toFixed(2)}）`,
     confidence: j.worthKeeping.noul, status: j.meta.status,
     fallbackUsed: j.meta.fallbackUsed, latencyMs: j.meta.latencyMs,
+    route: resolved.route,
   });
 
   return { action: "stored", memory };

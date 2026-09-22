@@ -151,11 +151,14 @@ assert.ok(listed.content[0].text.includes("什么都没删"), "只给 query 不�
 
 await runCommand("        ");
 assert.match(notes.at(-1)!, /本会话注入/, "/memory 默认显示状态");
+assert.match(notes.at(-1)!, /召回记录：候选/, "J15 的召回记录要能在 /memory 看到（没注入的时候最需要它）");
 assert.match(notes.at(-1)!, /上次写入/, "/memory 要能看到上一次判断的结果");
 // Phase 1 验收标准的第三个问题「为什么记住」：轨迹要能回答，并且能看出降级没降级。
 await runCommand(`why ${writtenId}`);
 assert.match(notes.at(-1)!, /J1\+J2\+J3 keep/, "/memory why 要说得出「为什么记住」");
 assert.match(notes.at(-1)!, /ok\/none/, "轨迹要能看出判断是不是降级过的");
+assert.match(notes.at(-1)!, /记住了这条/, "J14c 的一句人话要出现在轨迹里");
+assert.match(notes.at(-1)!, /路由=auto/, "J14b 的路由要留痕");
 await runCommand(`why ${evil.id}`);
 assert.match(notes.at(-1)!, /没有判断轨迹/, "手工入库的条目没有轨迹，就得说没有，不能编一条");
 await runCommand(`forget ${evil.id}`);

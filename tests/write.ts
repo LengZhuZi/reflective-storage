@@ -21,13 +21,13 @@ const global = openDb(path.join(tmp, "global.db"));
 const session = { sessionId: "s1", cwd: tmp, projectId: "P", injectedIds: new Set<string>() };
 
 /** 假 adapter：只实现 writeFlow 用到的那一个方法。 */
-function fakeAdapter(worth: number, opts: { scope?: "global" | "project" | "session"; relation?: string; fail?: boolean } = {}) {
+function fakeAdapter(worth: number, opts: { scope?: "global" | "project" | "session"; relation?: string; fail?: boolean; confidence?: number; type?: string } = {}) {
   return {
     async judgeWrite() {
       return {
         worthKeeping: { noul: worth },
-        type: { choice: "event", confidence: 0.9, probabilities: {} },
-        scope: { choice: opts.scope ?? "project", confidence: 0.9, probabilities: {} },
+        type: { choice: opts.type ?? "event", confidence: opts.confidence ?? 0.9, probabilities: {} },
+        scope: { choice: opts.scope ?? "project", confidence: opts.confidence ?? 0.9, probabilities: {} },
         relation: { choice: opts.relation ?? "none", confidence: 0.8, probabilities: {} },
         targetId: null,
         meta: {
@@ -125,6 +125,41 @@ assert.ok(!stored.content.includes("root:x:0:0"), "工具输出不能被写进�
 assert.ok(!stored.content.includes("abc123456"), "上下文里的 token 不能在落盘内容里");
 assert.equal(countMemories(project), before + 1);
 console.log("✓ 只消化用户自己的话，工具输出不入库");
+
+// ------------------------------------------------------------ J14b：作用域只许收窄
+const p0 = countMemories(project);
+const g0 = countMemories(global);
+const low = await writeFlow(project, global, fakeAdapter(0.8, { scope: "global", confidence: 0.55 }), session, {
+  userTexts: ["迁移前必须先备份整个库再执行"],
+  context: "",
+});
+assert.equal(low.memory?.scope, "project", "引擎说 global 但只有 0.55 置信度：必须收窄，否则这条会跑去别的项目");
+assert.equal(countMemories(global), g0, "低置信的 global 不许进全局库");
+assert.equal(countMemories(project), p0 + 1);
+const lowTrace = project.db.prepare(`SELECT judgment, user_visible FROM reflection_traces WHERE memory_id = ?`).get(low.memory!.id) as Record<string, unknown>;
+assert.equal(lowTrace.judgment, "rule", "走的是规则复核，要留痕");
+assert.match(String(lowTrace.user_visible), /规则复核/);
+
+const high = await writeFlow(project, global, fakeAdapter(0.8, { scope: "global", confidence: 0.99 }), session, {
+  userTexts: ["我平时喜欢先看结论再看细节"],
+  context: "",
+});
+assert.equal(high.memory?.scope, "global", "置信度够高就原样采用，不能把用户偏好也收窄掉");
+assert.equal(countMemories(global), g0 + 1);
+const highTrace = global.db.prepare(`SELECT judgment, user_visible FROM reflection_traces WHERE memory_id = ?`).get(high.memory!.id) as Record<string, unknown>;
+assert.equal(highTrace.judgment, "auto");
+assert.equal(highTrace.user_visible, "记住了这条（引擎判断）");
+console.log("✓ J14b 置信度分级：0.55 的 global 收窄到 project，0.99 的原样进全局库");
+
+// ------------------------------------------------------------ J15：每次召回登记一条
+const projectDb = await import("../src/storage/db.ts");
+projectDb.recordRecall(project, { sessionId: "s1", query: "迁移工具", recalledIds: ["a"], injectedIds: ["a"] });
+const logged = projectDb.recentRecalls(project, 5) as Array<Record<string, unknown>>;
+assert.equal(logged.length, 1, "召回过就该有记录（J15 轻量反馈）");
+assert.equal(logged[0].query, "迁移工具");
+assert.deepEqual(JSON.parse(String(logged[0].injected_ids)), ["a"]);
+assert.equal(logged[0].cited_ids, undefined, "cited 要等 Phase 2 的事后核对，现在不编");
+console.log("✓ J15 召回日志：只记事实，cited / user_feedback 留空");
 
 // ------------------------------------------------------------ 断言常量
 assert.ok(KEEP_THRESHOLD > 0.2 && KEEP_THRESHOLD < 0.86, "阈值必须落在实测的无关(0.2)和明确要求(0.86)之间");

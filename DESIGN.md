@@ -361,6 +361,20 @@ const res = await fetch("https://api.typesafe.ai/v1/systemone", {
 | < 0.5 | 交给用户确认，或走保守策略 |
 | JEV 不可用 | 降级到规则引擎 + 关键词检索 |
 
+**分级怎么落地（J14b，`src/core/governance.ts`）**：Phase 1 只有**作用域**需要分级 ——
+它是唯一一个「判断错了会跨项目泄露」的字段，而且宽窄代价不对称：放宽会把一条项目内的
+步骤带去别的项目（§15 原则 6），收窄只是少看见几条。所以低置信时作用域**只许收窄**
+（取引擎结论与规则结论里更窄的那个），类型保留引擎的判断（类型不泄露，也没有更安全的
+替代值可填）。
+
+`< 0.5` 的「交给用户确认」在本地版没有 UI，落地为收窄 + 在 trace 里记
+`judgment='user'`，等 Phase 2 的复核入口。路由结果写进 `reflection_traces.judgment`，
+一句人话写进 `user_visible`（J14c，模板拼接，不调引擎），`/memory why <id>` 直接显示。
+
+**J15 记录什么**：每次召回写一条 `feedback_logs`，只记事实 —— query、召回集、注入集。
+`cited_ids` 和 `user_feedback` 留空：前者要等事后核对（模型有没真的用上），后者要等 UI。
+编一个出来比空着更坏。
+
 **失败模式与兜底策略**：
 
 | 失败场景 | 兜底策略 |
@@ -450,7 +464,7 @@ CREATE TABLE reflection_traces (
   confidence      REAL,
   status          TEXT,                   -- ok/degraded/unavailable
   fallback_used   TEXT,                   -- rule/llm/user/none
-  user_visible    TEXT,                   -- 给用户看的一句理由（本地版只写日志）
+  user_visible    TEXT,                   -- 给用户看的一句理由（模板拼接，/memory why 显示）
   jev_request     TEXT,
   jev_response    TEXT,
   latency_ms      INTEGER,

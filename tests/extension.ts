@@ -35,9 +35,11 @@ factory({
 } as never);
 
 const notes: string[] = [];
+/** 假的当前分支：memory_add 要从中取「用户自己的话」（真 pi 里是 sessionManager.getBranch()）。 */
+const branch: unknown[] = [];
 const ctx = {
   cwd: tmp,
-  sessionManager: { getSessionId: () => "s1" },
+  sessionManager: { getSessionId: () => "s1", getBranch: () => branch },
   ui: { notify: (text: string) => { notes.push(text); } },
 } as never;
 
@@ -139,14 +141,25 @@ assert.ok(writtenId, "agent_end 写的记忆该落地（后台队列不拖用户
 console.log("✓ agent_end 只取用户自己的话，重复的那句不会被评估两次");
 
 // ------------------------------------------------------------ 工具 + 命令
-const search = await tools.get("memory_search")!.execute(undefined, { query: "影子" }) as { content: Array<{ text: string }> };
+const search = await tools.get("memory_search")!.execute(undefined, { query: "影子" }, undefined, undefined, ctx) as { content: Array<{ text: string }> };
 assert.ok(search.content[0].text.includes(evil.id), "memory_search 要返回 id，用户才能照它删");
 assert.ok(search.content[0].text.includes("Flyway"), "memory_search 要返回记忆原文");
 
-const added = await tools.get("memory_add")!.execute(undefined, { content: "用户要求所有命令都先说明影响再执行" }) as { content: Array<{ text: string }> };
+// memory_add 写的是**用户自己的话**，不是模型的重述：实测模型的重述和 agent_end 自动存的
+// 原话对不上，查重拦不住，同一个约定就存了两行。
+branch.push({ role: "user", content: "所有命令都先说明影响再执行" });
+const added = await tools.get("memory_add")!.execute(undefined, { content: "用户要求所有命令都先说明影响再执行" }, undefined, undefined, ctx) as { content: Array<{ text: string }> };
 assert.ok(added.content[0].text.startsWith("已记住"), `memory_add 应该写入，实际：${added.content[0].text}`);
+assert.ok(added.content[0].text.includes("所有命令都先说明影响再执行"), "写的必须是用户的原话");
+assert.ok(!added.content[0].text.includes("用户要求所有命令"), "不能把模型的重述当原文存进去");
+// 同一轮 agent_end 再走一遍自动写入 → 精确查重命中，不产生第二行
+const beforeDup = countMemories(seed);
+await call("agent_end", { messages: [{ role: "user", content: "所有命令都先说明影响再执行" }] });
+await new Promise((r) => setTimeout(r, 60));
+assert.equal(countMemories(seed), beforeDup, "同一条内容经过 memory_add + agent_end 也只能有一行（实测过两行）");
+branch.length = 0;
 
-const listed = await tools.get("memory_forget")!.execute(undefined, { query: "Flyway" }) as { content: Array<{ text: string }> };
+const listed = await tools.get("memory_forget")!.execute(undefined, { query: "Flyway" }, undefined, undefined, ctx) as { content: Array<{ text: string }> };
 assert.ok(listed.content[0].text.includes("什么都没删"), "只给 query 不能直接删：硬删不可逆，先让模型拿 id 回来确认");
 
 await runCommand("        ");
@@ -163,7 +176,7 @@ await runCommand(`why ${evil.id}`);
 assert.match(notes.at(-1)!, /没有判断轨迹/, "手工入库的条目没有轨迹，就得说没有，不能编一条");
 await runCommand(`forget ${evil.id}`);
 assert.match(notes.at(-1)!, /已删除/);
-assert.ok(!(await tools.get("memory_search")!.execute(undefined, { query: "Flyway" }) as { content: Array<{ text: string }> }).content[0].text.includes(evil.id));
+assert.ok(!(await tools.get("memory_search")!.execute(undefined, { query: "Flyway" }, undefined, undefined, ctx) as { content: Array<{ text: string }> }).content[0].text.includes(evil.id));
 console.log("✓ 三个工具 + /memory 命令（query 只列不删，id 才真删）");
 
 // ------------------------------------------------------------ 收尾冲刷待写队列

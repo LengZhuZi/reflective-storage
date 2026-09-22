@@ -103,6 +103,24 @@ export function assistantText(messages: readonly unknown[]): string {
   return parts.join("\n").slice(-2000);
 }
 
+/**
+ * 本会话最后一条用户消息。
+ *
+ * memory_add 用它而不是用模型给的 content：记忆原文必须由系统控制（§15 原则 1），
+ * 而且模型的重述与 agent_end 自动存的原话对不上，查重也拦不住 —— 实测同一个约定
+ * 就这样存了两行。写用户自己的话，两条路径的内容天然一致，精确查重直接命中。
+ */
+export function lastUserText(branch: readonly unknown[]): string | null {
+  for (let i = branch.length - 1; i >= 0; i--) {
+    const msg = branch[i] as { role?: string; content?: unknown };
+    if (msg?.role !== "user") continue;
+    const text = textOf(msg.content);
+    if (!text.trim() || text.includes(MEMORY_OPEN)) continue;
+    return text;
+  }
+  return null;
+}
+
 function statusText(r: Runtime): string {
   const lines = [
     `项目库 ${projectIdFor(r.session.cwd)}：${countMemories(r.projectDb)} 条`,
@@ -278,17 +296,22 @@ export default function reflectiveStorage(pi: ExtensionAPI): void {
     parameters: Type.Object({
       content: Type.String({ description: "要记住的内容，一句话说清楚，别贴日志或文件内容" }),
     }),
-    async execute(_id, params) {
+    async execute(_id, params, _signal, _onUpdate, ctx) {
       const r = rt;
       if (!r) throw new Error("记忆库未打开（没有活动会话）");
+      // 优先存用户自己的话（见 lastUserText 的说明）；拿不到当前用户消息时才用模型给的文本。
+      const said = lastUserText(ctx.sessionManager.getBranch());
+      const texts = said ? [said] : [params.content];
       const res = await writeFlow(r.projectDb, r.globalDb, r.adapter, r.session, {
-        userTexts: [params.content],
-        context: "memory_add 工具：模型主动要求记住这条",
+        userTexts: texts,
+        context: `memory_add 工具：模型判断这条值得记（${ctx.sessionManager.getSessionId() ?? "?"}）`,
       });
       r.lastWrite = { action: res.action, reason: res.reason, at: Date.now() };
       const text = res.action === "stored"
-        ? `已记住 [${res.memory?.id}] (${res.memory?.type}/${res.memory?.scope})`
-        : `没有写入（${res.action}：${res.reason ?? "写入闸没放行"}）`;
+        ? `已记住 [${res.memory?.id}] (${res.memory?.type}/${res.memory?.scope})： ${(res.memory?.content ?? "").slice(0, 80)}`
+        : res.action === "duplicate"
+          ? `已经有这条了（${res.reason}），没有重复写入`
+          : `没有写入（${res.action}：${res.reason ?? "写入闸没放行"}）`;
       return { content: [{ type: "text", text }], details: { action: res.action, id: res.memory?.id } };
     },
   });

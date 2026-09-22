@@ -46,11 +46,15 @@ interface Runtime {
   configProblems: string[];
   /** 本会话用哪个判断引擎（rules / jev / openai），/memory 要能看见。 */
   engine: string;
-  lastRecall?: { status: JudgeMeta["status"] | "skipped"; candidates: number; injected: number; detail?: string; at: number };
+  /** query 存着给 J5 用：下次它要判断「这个提问还是上次那件事吗」。 */
+  lastRecall?: { status: JudgeMeta["status"] | "skipped"; candidates: number; injected: number; detail?: string; query?: string; at: number };
   lastWrite?: { action: string; reason?: string; at: number };
   lastFeedback?: { injected: number; cited: number; score: number | null; at: number };
   error?: string;
 }
+
+/** J5 的阈值：低于它就不值得花这次召回的钱。§6 把 0.5 定成「交给规则二次确认」的下界。 */
+const NEED_RECALL_THRESHOLD = 0.5;
 
 function errText(e: unknown): string {
   return e instanceof Error ? `${e.name}: ${e.message}` : String(e);
@@ -230,12 +234,33 @@ export default function reflectiveStorage(pi: ExtensionAPI): void {
       return;
     }
 
-    // 是不是该注入：首轮一定查；之后要同时满足「没到上限 + 隔够轮数 + 换了话题」，
-    // 否则上下文里已经有了，再插一遍只是白搭前缀缓存。
-    const gate = r.state.shouldInject(event.prompt, r.inject);
+    // 机械约束（次数上限 / 隔几轮）过了之后，**该不该查由 J5 判** ——
+    // 「这个提问是不是已经在上下文里的那件事」是内容判断，不该让本地二字组规则兼职。
+    // 首轮不问 J5：§10.4 第一条规则就是「首轮直接走完整召回」。
+    const gate = r.state.shouldInject(r.inject);
     if (!gate.ok) {
       r.lastRecall = { status: "skipped", candidates: 0, injected: 0, detail: gate.reason, at: Date.now() };
       return;
+    }
+    if (!gate.first) {
+      try {
+        const need = await r.adapter.judgeRecallNeed(event.prompt, {
+          ...r.session,
+          lastInjectedQuery: r.lastRecall?.query ?? null,
+        });
+        if (need.noul < NEED_RECALL_THRESHOLD) {
+          r.lastRecall = {
+            status: "skipped", candidates: 0, injected: 0, query: event.prompt,
+            detail: `J5 判断不必再查（${need.noul.toFixed(2)}${need.meta.detail ? `，${need.meta.detail}` : ""}）`,
+            at: Date.now(),
+          };
+          return;
+        }
+      } catch (e) {
+        // 问不动就不查：保守方向（少召回一条），比多插一块噪声好。
+        r.error = errText(e);
+        return;
+      }
     }
 
     try {
@@ -248,10 +273,10 @@ export default function reflectiveStorage(pi: ExtensionAPI): void {
       });
       r.lastRecall = {
         status: res.status, candidates: res.candidates.length,
-        injected: res.injected.length, detail: res.detail, at: Date.now(),
+        injected: res.injected.length, detail: res.detail, query: event.prompt, at: Date.now(),
       };
       if (res.injected.length === 0) return;   // fail-closed：沉默优于噪声
-      r.state.markInjected(res.injected.map((x) => x.memory.id), event.prompt);
+      r.state.markInjected(res.injected.map((x) => x.memory.id));
       return { message: { customType: "reflective-memory", content: res.block, display: true } };
     } catch (e) {
       // 注入 fail-closed：任何意外都不许穿透到 agent 启动

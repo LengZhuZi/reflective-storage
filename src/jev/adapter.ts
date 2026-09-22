@@ -17,7 +17,7 @@ import type { JudgeConfig } from "../config.ts";
 import { JevHttpClient, JevUnavailableError, type AskOptions, type Answer, type JevResponse, type Questions } from "./http.ts";
 import { LlmClient } from "./llm.ts";
 import { createRuleAdapter, RULE_RELEVANCE_THRESHOLD } from "./rule-adapter.ts";
-import { ruleRelation, ruleRelevance, ruleScope, ruleType, ruleWorthKeeping } from "./rule.ts";
+import { ruleRelation, ruleRelevance, ruleScope, ruleType, ruleWorthKeeping, sameTopic } from "./rule.ts";
 import type { InjectionJudgment, Judged, NoulResult, RecallJudgment, WriteJudgment } from "./types.ts";
 
 /**
@@ -204,24 +204,46 @@ export function createJevAdapter(client: JudgeClient, opts: JudgeTimeouts = {}):
       }
     },
 
-    async judgeRecallNeed(utterance, _session): Promise<Judged<NoulResult>> {
+    async judgeRecallNeed(utterance, session): Promise<Judged<NoulResult>> {
       const t0 = Date.now();
+      const already = session.lastInjectedQuery ?? "";
       const questions: Questions = {
         need_recall: {
           type: "noul",
           instructions: "Answering this request would benefit from the user's stored long-term memory about this project or their preferences",
         },
+        // 第二次及以后的注入才需要问这句：上下文里已经有一条记忆块了，
+        // 同一个话题再插一遍只是白搭前缀缓存。
+        ...(already
+          ? {
+              new_topic: {
+                type: "noul" as const,
+                instructions:
+                  "THIS REQUEST is about a different subject than ALREADY IN CONTEXT above. It needs its own memories rather than the ones already injected",
+              },
+            }
+          : {}),
       };
+      const state = already
+        ? `ALREADY IN CONTEXT (injected earlier in this session, for this request):\n${already}\n\nNEW REQUEST:\n${utterance}`
+        : utterance;
       try {
-        const res = await client.ask(utterance, questions);
+        const res = await client.ask(state, questions, { timeoutMs: fast });
+        const need = num(res.answers.need_recall, "noul");
+        const fresh = already ? num(res.answers.new_topic, "noul") : 1;
         return {
-          noul: num(res.answers.need_recall, "noul"),
-          meta: okMeta("J5", res, questions, t0),
+          // 两个问题都过才需要再召回：一个说「用得上记忆」，另一个说「不是已经在上下文里的那件事」。
+          noul: Math.min(need, fresh),
+          meta: { ...okMeta("J5", res, questions, t0), detail: already ? `need_recall=${need.toFixed(2)} new_topic=${fresh.toFixed(2)}` : undefined },
         };
       } catch (e) {
-        // 本地规则兜底：太短的输入不值得查（"继续"、"好"）。
-        const noul = utterance.replace(/\s+/g, "").length >= 15 ? 0.5 : 0;
-        return { noul, meta: degradation("J5", e, t0, "JEV 不可用，按长度规则判断") };
+        // fail-degraded：本地规则兜底（太短不查、同话题不查），不能因为引擎挂了就不召回。
+        const short = utterance.replace(/\s+/g, "").length < 15;
+        const same = already ? sameTopic(utterance, already) : false;
+        return {
+          noul: short || same ? 0 : 0.5,
+          meta: degradation("J5", e, t0, same ? "JEV 不可用，按同话题跳过" : "JEV 不可用，按长度规则判断"),
+        };
       }
     },
 

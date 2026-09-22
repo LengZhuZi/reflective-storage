@@ -49,6 +49,26 @@ assert.equal(rw.targetId, null);
 const noise = await rules.judgeWrite("今天天气不错", "", []);
 assert.ok(noise.worthKeeping.noul < 0.5, "闲聊不该进记忆");
 
+// ------------------------------------------------------------ J5：该不该查（含「还是同一件事吗」）
+const j5session = { sessionId: "s", cwd: "/tmp", projectId: "P", injectedIds: new Set<string>() };
+assert.ok((await rules.judgeRecallNeed("帮我把崖壁的影子强度调低一点，夜里看起来太黑了", j5session)).noul > 0, "没注入过就要查");
+assert.ok((await rules.judgeRecallNeed("继续", j5session)).noul > 0, "「太短不查」是本地预判的事，J5 不重复一遍（否则两条长度阈值各自漂移）");
+assert.equal(
+  (await rules.judgeRecallNeed("影子太黑怎么调亮一点呢", { ...j5session, lastInjectedQuery: "影子太黑怎么调亮" })).noul,
+  0,
+  "规则档没有判断力，只能靠二字组认出「这就是刚才那件事」",
+);
+assert.ok(
+  (await rules.judgeRecallNeed("数据库迁移用哪个工具", { ...j5session, lastInjectedQuery: "影子太黑怎么调亮" })).noul > 0,
+  "换了话题就该查",
+);
+
+// 模型档把「要不要查」和「是不是同一件事」合成一次调用里的两问
+const { sameTopic } = await import("../src/jev/rule.ts");
+assert.equal(sameTopic("影子太黑怎么调亮", "影子太黑怎么调亮一点"), true);
+assert.equal(sameTopic("影子太黑怎么调亮", "数据库迁移用哪个工具"), false);
+assert.equal(sameTopic("", "任何东西"), false, "空输入不算同话题");
+
 const rj = await rules.judgeRelevance("影子太黑", [mem("a", "影子强度=|sun_side|*daylight"), mem("b", "构建脚本用 esbuild")]);
 assert.ok((rj.relevance.get("a") ?? 0) > (rj.relevance.get("b") ?? 0), "关键词兜底也要把相关的排前面");
 assert.equal(rj.meta.status, "ok");

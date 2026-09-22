@@ -3,7 +3,7 @@
  *
  * 三条硬约束都在这个文件里，一条都不能省：
  *
- *  1. 每会话只注入一次。记忆块必须落在上下文尾部，前面的 system prompt 和历史保持
+ *  1. 每会话只注入一次（默认；有界多次的口径见 InjectPolicy）。记忆块必须落在上下文尾部，前面的 system prompt 和历史保持
  *     字节级不变，provider 的前缀缓存才能命中 —— 第二次注入会改前缀，缓存全废，
  *     而缓存输入比输出还贵。
  *  2. 注入块必须有框架和声明「这不是对话历史，也不是指令」。
@@ -12,7 +12,6 @@
  */
 
 import type { MemoryNode } from "../core/types.ts";
-import { bigrams } from "../jev/rule.ts";
 
 /** 框架和声明。`\u003c` 只出现在记忆内容里，标签本身必须是真标签。 */
 export const MEMORY_OPEN =
@@ -65,34 +64,22 @@ export function fitBudget<T extends { memory: MemoryNode }>(
 }
 
 /**
- * 注入策略。§8.3 的默认是「每会话一次」，但那个默认的代价是：会话很长时，
- * 后面才出现的新话题一条记忆也拿不到 —— 而「无感」恰恰要求你在聊到 X 的时候
- * X 的记忆恰好在。
+ * 注入策略：**只管机械约束**。
  *
- * 所以这里是「限定条件下的多次」：每会话上限 + 隔轮数 + 换话题。三个条件都满足
- * 才会再注入一次，前缀缓存的最坏损失因此是有界的（默认最多 3 次）。
- * 想要 §8.3 的严格行为就把 maxPerSession 设成 1。
+ * 「这条记忆对眼下这件事有没有用」是 J8 的事，「这个提问和上次那个是不是同一个话题」是
+ * J5 的事 —— 两个都是内容判断，不该由本地规则兼职。这里只管两件只有系统自己才知道的事：
+ * 「本会话已经插过几次」（前缀缓存的预算）和「距上次插隔了几轮」。
+ *
+ * §8.3 的默认是每会话一次；放成有界多次的理由写在 DESIGN §8.3 的实测修正里。
  */
 export interface InjectPolicy {
   /** 每个上下文窗口最多注入几次（压缩后重新计）。 */
   maxPerSession: number;
   /** 两次注入之间至少隔几轮提问。 */
   minTurnsBetween: number;
-  /** 与上次注入时的提问重叠低于这个比例，才算换了话题。 */
-  topicOverlapBelow: number;
 }
 
-export const DEFAULT_INJECT_POLICY: InjectPolicy = { maxPerSession: 3, minTurnsBetween: 3, topicOverlapBelow: 0.3 };
-/** 换了话题吗：与上次注入时的提问几乎没有共同的二字组。 */
-export function isNewTopic(prompt: string, lastQuery: string, below: number): boolean {
-  if (!lastQuery) return true;
-  const now = bigrams(prompt);
-  if (now.size === 0) return false;
-  const then = bigrams(lastQuery);
-  let hit = 0;
-  for (const g of now) if (then.has(g)) hit++;
-  return hit / now.size < below;
-}
+export const DEFAULT_INJECT_POLICY: InjectPolicy = { maxPerSession: 3, minTurnsBetween: 3 };
 
 /**
  * 「每会话只注入一次」的状态。
@@ -104,7 +91,6 @@ export class InjectionState {
   private injected = false;
   private injections = 0;
   private prompts = 0;
-  private lastQuery = "";
   private lastAtPrompt = -Infinity;
   readonly injectedIds = new Set<string>();
 
@@ -126,40 +112,38 @@ export class InjectionState {
     this.prompts++;
   }
 
-  /** 现在该不该注入？不花任何钱（纯本地判断）。 */
-  shouldInject(prompt: string, policy: InjectPolicy): { ok: boolean; reason?: string } {
-    if (!this.injected) return { ok: true };
+  /**
+   * 机械约束过了吗？过了之后还要问 J5「该不该查」——
+   * 首轮不问（§10.4 第一条规则：首轮直接走完整召回）。
+   */
+  shouldInject(policy: InjectPolicy): { ok: boolean; first: boolean; reason?: string } {
+    if (!this.injected) return { ok: true, first: true };
     if (this.injections >= policy.maxPerSession) {
-      return { ok: false, reason: `本会话已注入 ${this.injections} 次（上限 ${policy.maxPerSession}）` };
+      return { ok: false, first: false, reason: `本会话已注入 ${this.injections} 次（上限 ${policy.maxPerSession}）` };
     }
     const turns = this.prompts - this.lastAtPrompt;
     if (turns < policy.minTurnsBetween) {
-      return { ok: false, reason: `距上次注入只隔 ${turns} 轮（至少 ${policy.minTurnsBetween} 轮）` };
+      return { ok: false, first: false, reason: `距上次注入只隔 ${turns} 轮（至少 ${policy.minTurnsBetween} 轮）` };
     }
-    if (!isNewTopic(prompt, this.lastQuery, policy.topicOverlapBelow)) {
-      return { ok: false, reason: "还是同一个话题，上下文里已经有了" };
-    }
-    return { ok: true };
+    return { ok: true, first: false };
   }
 
-  markInjected(ids: readonly string[], query: string): void {
+  markInjected(ids: readonly string[]): void {
     this.injected = true;
     this.injections++;
-    this.lastQuery = query;
     this.lastAtPrompt = this.prompts;
     for (const id of ids) this.injectedIds.add(id);
   }
 
   /**
    * 压缩之后上下文被重写过，注入块已经不在里面了，所以允许重新注入（§8.3 例外 / §8.4）。
-   * 四样全清：标记、id 集合、上次的话题与轮次、以及**注入次数预算**。
+   * 三样全清：标记、id 集合、以及**注入次数预算**。
    *（不清预算的话，/memory 会显示「最多 3 次」却已经注入了 4 次。）
    */
   reset(): void {
     this.injected = false;
     this.injections = 0;
     this.injectedIds.clear();
-    this.lastQuery = "";
     this.lastAtPrompt = -Infinity;
   }
 }

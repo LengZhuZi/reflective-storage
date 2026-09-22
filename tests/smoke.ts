@@ -67,6 +67,8 @@ const okFetch: typeof fetch = async (_url, init) => {
     else if (key === "memory_scope") answers[key] = { type: "choice", choice: "project", confidence: 0.9, probabilities: {} };
     else if (key === "relation") answers[key] = { type: "choice", choice: "supersedes", confidence: 0.84, probabilities: {} };
     else if (key === "target") answers[key] = { type: "choice", choice: Object.keys(q.criteria ?? {}).filter((k) => k !== "none")[1] ?? "none", confidence: 0.8, probabilities: {} };
+    else if (key === "need_recall") answers[key] = { type: "noul", noul: 0.9 };
+    else if (key === "new_topic") answers[key] = { type: "noul", noul: 0.1 };
     else if (key.startsWith("rel_")) answers[key] = { type: "noul", noul: key === `rel_${a.id}` ? 0.85 : 0.03 };
     else if (key.startsWith("inj_")) answers[key] = { type: "choice", choice: key === `inj_${a.id}` ? "inject" : "skip", confidence: 0.8, probabilities: {} };
   }
@@ -81,6 +83,16 @@ assert.equal(w.type.choice, "event");
 assert.equal(w.relation.choice, "supersedes");
 assert.equal(w.targetId, b.id, "target 应该解析成真实的记忆 id");
 console.log("✓ J1+J2+J3 一次调用，target 解析成真实 id");
+
+// J5：第一次只有一问；已经注入过时多问一句「还是同一件事吗」，两个都过才需要再查。
+const need1 = await live.judgeRecallNeed("影子太黑怎么调亮", { sessionId: "s", cwd: ".", projectId: "P", injectedIds: new Set() });
+assert.equal(need1.meta.status, "ok");
+const need2 = await live.judgeRecallNeed("影子太黑怎么调亮一点", {
+  sessionId: "s", cwd: ".", projectId: "P", injectedIds: new Set(), lastInjectedQuery: "影子太黑怎么调亮",
+});
+assert.match(String(need2.meta.detail), /new_topic/, "第二次注入要问「还是同一件事吗」");
+assert.equal(need2.noul, 0.1, "两问取最小值：任何一个说不用，就不查");
+console.log("✓ J5：内容判断交给引擎（要不要查 + 还是不是同一件事）");
 
 const r = await live.judgeRelevance("影子太黑", [getMemory(o, a.id)!, getMemory(o, b.id)!]);
 assert.equal(r.meta.status, "ok");

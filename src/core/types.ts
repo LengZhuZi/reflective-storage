@@ -50,6 +50,13 @@ export interface SessionInfo {
   projectId: string;
   /** 本会话已注入过的记忆 id —— 判断时要先排除，见 DESIGN.md §8.3。 */
   injectedIds: Set<string>;
+  /**
+   * 上一次注入时用的提问。
+   *
+   * J5 靠它判断「这次是不是同一个话题」—— 是的话上下文里已经有了，不必再插一遍。
+   * 这件事必须由判断引擎做，不能让本地二字组规则兼职（那是内容判断，不是机械约束）。
+   */
+  lastInjectedQuery?: string | null;
 }
 
 export interface TokenBudget {

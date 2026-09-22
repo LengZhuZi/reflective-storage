@@ -12,7 +12,7 @@
  */
 
 import type { TokenBudget } from "../core/types.ts";
-import { ruleRelevance, ruleRelation, ruleScope, ruleType, ruleWorthKeeping } from "./rule.ts";
+import { ruleRelevance, ruleRelation, ruleScope, ruleType, ruleWorthKeeping, sameTopic } from "./rule.ts";
 import type { JevAdapter } from "./adapter.ts";
 
 /** 规则分需要的阈值。JEV 的 0.7 是在 JEV 自己的分数尺度上标定的，移到规则上会全被卡掉。 */
@@ -40,9 +40,12 @@ export function createRuleAdapter(relevanceThreshold: number = RULE_RELEVANCE_TH
       };
     },
 
-    async judgeRecallNeed(utterance) {
-      // 只留长度这一条：太短的输入不值得查（"继续"、"好"）。
-      return { noul: utterance.replace(/\s+/g, "").length >= 15 ? 0.6 : 0, meta: meta("J5(rules)") };
+    async judgeRecallNeed(utterance, session) {
+      // 规则档只能判一件事：「这个提问是不是刚才那件事」。
+      // 「太短不查」由调用方的本地预判负责（§10.4），不在这里重复，
+      // 否则两条长度阈值会各自漂移（真踩过：这里写 15、预判写 6）。
+      const same = session.lastInjectedQuery ? sameTopic(utterance, session.lastInjectedQuery) : false;
+      return { noul: same ? 0 : 0.6, meta: meta("J5(rules)") };
     },
 
     async judgeRelevance(query, candidates) {

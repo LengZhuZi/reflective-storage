@@ -48,6 +48,17 @@ export function ruleRelation(): ChoiceResult<Relation> {
   return { choice: "none", confidence: 0, probabilities: { none: 1 } };
 }
 
+/** 话题没变吗（二字组重叠）。放在规则层：规则档用它当 J5 的兑底，模型档不靠它。 */
+export function sameTopic(a: string, b: string, overlapAtLeast = 0.6): boolean {
+  if (!a || !b) return false;
+  const x = bigrams(a);
+  const y = bigrams(b);
+  if (x.size === 0 || y.size === 0) return false;
+  let hit = 0;
+  for (const g of x) if (y.has(g)) hit++;
+  return hit / x.size >= overlapAtLeast;
+}
+
 /**
  * 关键词兜底的相关性。FTS5 的 trigram 分词器对中文是字符三元组匹配，
  * 「影子太黑」匹配不到「影子强度」（没有共同三字组，见 DESIGN.md §7.3），

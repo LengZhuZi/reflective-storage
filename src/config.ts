@@ -59,11 +59,10 @@ export interface LoadedConfig {
   problems: string[];
 }
 
-/** 注入策略（§8.3）。默认不再是「每会话一次」，理由见 src/pipeline/inject.ts。 */
+/** 注入策略（§8.3）。只管机械约束（次数上限、隔多少轮）；「是不是同一话题」归 J5。 */
 export interface InjectConfig {
   maxPerSession: number;
   minTurnsBetween: number;
-  topicOverlapBelow: number;
 }
 
 const str = (v: unknown): string | undefined =>
@@ -119,7 +118,6 @@ function resolveInject(raw: unknown): InjectConfig {
   return {
     maxPerSession: num(file.maxPerSession, 3, 1),
     minTurnsBetween: num(file.minTurnsBetween, 3, 1),
-    topicOverlapBelow: num(file.topicOverlapBelow, 0.3, 0, 1),
   };
 }
 

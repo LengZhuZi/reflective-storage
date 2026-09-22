@@ -19,7 +19,7 @@ const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "reflect-ext-"));
 process.env.REFLECTIVE_HOME = tmp;
 process.env.TYPESAFE_API_KEY = "test-key";
 
-const { default: factory, userTexts, assistantText } = await import("../index.ts");
+const { default: factory, userTexts, assistantText, lastUserText } = await import("../index.ts");
 const { openDb, insertMemory, countMemories, projectIdFor } = await import("../src/storage/db.ts");
 const { MEMORY_OPEN } = await import("../src/pipeline/inject.ts");
 
@@ -147,7 +147,13 @@ assert.ok(search.content[0].text.includes("Flyway"), "memory_search 要返回记
 
 // memory_add 写的是**用户自己的话**，不是模型的重述：实测模型的重述和 agent_end 自动存的
 // 原话对不上，查重拦不住，同一个约定就存了两行。
-branch.push({ role: "user", content: "所有命令都先说明影响再执行" });
+// 真 pi 的 getBranch() 给的是会话条目形状，不是裸消息 —— 认错形状就取不到用户的话，
+// 又会退回去存模型的重述（实测漏过一次）。两种形状都钉住。
+branch.push({ type: "message", id: "e1", message: { role: "user", content: "所有命令都先说明影响再执行" } });
+assert.equal(lastUserText(branch), "所有命令都先说明影响再执行", "会话条目形状要认");
+assert.equal(lastUserText([{ role: "user", content: "裸消息形状" }]), "裸消息形状", "裸消息形状也要认");
+assert.equal(lastUserText([injectedUserMessage]), null, "注入块不是用户的话");
+assert.equal(lastUserText([]), null);
 const added = await tools.get("memory_add")!.execute(undefined, { content: "用户要求所有命令都先说明影响再执行" }, undefined, undefined, ctx) as { content: Array<{ text: string }> };
 assert.ok(added.content[0].text.startsWith("已记住"), `memory_add 应该写入，实际：${added.content[0].text}`);
 assert.ok(added.content[0].text.includes("所有命令都先说明影响再执行"), "写的必须是用户的原话");

@@ -112,7 +112,11 @@ export function assistantText(messages: readonly unknown[]): string {
  */
 export function lastUserText(branch: readonly unknown[]): string | null {
   for (let i = branch.length - 1; i >= 0; i--) {
-    const msg = branch[i] as { role?: string; content?: unknown };
+    const entry = branch[i] as { role?: string; content?: unknown; message?: { role?: string; content?: unknown } };
+    // 真时 getBranch() 给的是会话条目 { type:"message", message:{role,content} }，
+    // 而 agent_end 给的是裸消息。两种形状都要认，否则这里永远取不到用户的话，
+    // 又退回去存模型的重述（实测就是这样漏回去的）。
+    const msg = entry?.message ?? entry;
     if (msg?.role !== "user") continue;
     const text = textOf(msg.content);
     if (!text.trim() || text.includes(MEMORY_OPEN)) continue;

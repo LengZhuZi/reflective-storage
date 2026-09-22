@@ -342,3 +342,13 @@ export function addTrace(o: OpenedDb, t: TraceInput): void {
 export function countMemories(o: OpenedDb): number {
   return Number((o.db.prepare(`SELECT count(*) c FROM memories`).get() as Row).c);
 }
+
+/** 某条记忆的判断轨迹，用于回答「为什么记住的」。按时间正序，最早的判断在最前面。 */
+export function tracesFor(o: OpenedDb, memoryId: string): Row[] {
+  return o.db
+    .prepare(
+      `SELECT gate, action, reason, status, fallback_used, confidence, created_at
+         FROM reflection_traces WHERE memory_id = ? ORDER BY created_at`,
+    )
+    .all(memoryId) as Row[];
+}

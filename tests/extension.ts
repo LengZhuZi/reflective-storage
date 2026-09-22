@@ -128,6 +128,14 @@ await call("agent_end", {
 await call("agent_end", {
   messages: [{ role: "user", content: "以后所有数据库迁移脚本都用 Flyway，不要用 Liquibase" }],
 });
+// 后台写入是排队跑的（不能拖住用户），所以这里等它落地再查轨迹。
+let writtenId = "";
+for (let i = 0; i < 100 && !writtenId; i++) {
+  const row = seed.db.prepare(`SELECT id FROM memories WHERE content LIKE '%Liquibase%'`).get() as { id: string } | undefined;
+  if (row) writtenId = row.id;
+  else await new Promise((r) => setTimeout(r, 50));
+}
+assert.ok(writtenId, "agent_end 写的记忆该落地（后台队列不拖用户，但不能丢）");
 console.log("✓ agent_end 只取用户自己的话，重复的那句不会被评估两次");
 
 // ------------------------------------------------------------ 工具 + 命令
@@ -144,6 +152,12 @@ assert.ok(listed.content[0].text.includes("什么都没删"), "只给 query 不�
 await runCommand("        ");
 assert.match(notes.at(-1)!, /本会话注入/, "/memory 默认显示状态");
 assert.match(notes.at(-1)!, /上次写入/, "/memory 要能看到上一次判断的结果");
+// Phase 1 验收标准的第三个问题「为什么记住」：轨迹要能回答，并且能看出降级没降级。
+await runCommand(`why ${writtenId}`);
+assert.match(notes.at(-1)!, /J1\+J2\+J3 keep/, "/memory why 要说得出「为什么记住」");
+assert.match(notes.at(-1)!, /ok\/none/, "轨迹要能看出判断是不是降级过的");
+await runCommand(`why ${evil.id}`);
+assert.match(notes.at(-1)!, /没有判断轨迹/, "手工入库的条目没有轨迹，就得说没有，不能编一条");
 await runCommand(`forget ${evil.id}`);
 assert.match(notes.at(-1)!, /已删除/);
 assert.ok(!(await tools.get("memory_search")!.execute(undefined, { query: "Flyway" }) as { content: Array<{ text: string }> }).content[0].text.includes(evil.id));

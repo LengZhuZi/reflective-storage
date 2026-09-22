@@ -21,7 +21,7 @@ import { createJevAdapter, type JevAdapter } from "./src/jev/adapter.ts";
 import { JevHttpClient } from "./src/jev/http.ts";
 import {
   addTrace, countMemories, getMemory, hardDelete, listInScope, openGlobalDb, openProjectDb,
-  projectIdFor, type OpenedDb,
+  projectIdFor, tracesFor, type OpenedDb,
 } from "./src/storage/db.ts";
 import { writeFlow } from "./src/pipeline/write.ts";
 import { recallFlow, worthRecalling } from "./src/pipeline/recall.ts";
@@ -311,7 +311,7 @@ export default function reflectiveStorage(pi: ExtensionAPI): void {
   });
 
   pi.registerCommand("memory", {
-    description: "长期记忆状态 / 搜索 / 删除（/memory、/memory search <词>、/memory forget <id>）",
+    description: "长期记忆状态 / 搜索 / 查为什么 / 删除（/memory、search <词>、why <id>、forget <id>）",
     handler: async (args: string, ctx: ExtensionContext) => {
       const r = rt;
       if (!r) {
@@ -331,6 +331,24 @@ export default function reflectiveStorage(pi: ExtensionAPI): void {
             : `${label(res.status)}\n${res.candidates.map(foundLine).join("\n")}`,
           "info",
         );
+        return;
+      }
+
+      if (sub === "why" && tail) {
+        // Phase 1 验收标准要的第三个问题「为什么记住」就靠这段轨迹回答。
+        const m = getMemory(r.projectDb, tail) ?? getMemory(r.globalDb, tail);
+        if (!m) {
+          ctx.ui.notify(`没有 id 为 ${tail} 的记忆`, "error");
+          return;
+        }
+        const traces = tracesFor(m.scope === "global" ? r.globalDb : r.projectDb, m.id);
+        ctx.ui.notify([
+          `[${m.id}] (${m.type}/${m.scope}) ${m.content}`,
+          `importance ${m.importance.toFixed(2)} · 访问 ${m.accessCount} 次 · 状态 ${m.state}`,
+          ...(traces.length
+            ? traces.map((t) => `${t.gate} ${t.action} ${t.reason ?? ""} [${t.status ?? "?"}/${t.fallback_used ?? "?"}]`)
+            : ["没有判断轨迹"]),
+        ].join("\n"), "info");
         return;
       }
 

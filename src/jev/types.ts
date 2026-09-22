@@ -64,3 +64,10 @@ export interface InjectionJudgment {
   /** J8：memoryId -> inject / skip。 */
   decisions: Map<string, "inject" | "skip">;
 }
+
+/**
+ * 相关性阈值的缺省值（JEV 的标定值，见 DESIGN.md §4.1 / §10.1）。
+ * 每个判断引擎的分数尺度不同，所以真正生效的是 `JevAdapter.relevanceThreshold`，
+ * 这个常量只在适配器没给的时候兜底。
+ */
+export const DEFAULT_RELEVANCE_THRESHOLD = 0.7;

@@ -13,9 +13,20 @@
  */
 
 import { MEMORY_TYPES, type MemoryNode, type MemoryScope, type MemoryType, type Relation, type SessionInfo, type TokenBudget } from "../core/types.ts";
-import { JevHttpClient, JevUnavailableError, type Answer, type Questions } from "./http.ts";
+import type { JudgeConfig } from "../config.ts";
+import { JevHttpClient, JevUnavailableError, type AskOptions, type Answer, type JevResponse, type Questions } from "./http.ts";
+import { LlmClient } from "./llm.ts";
+import { createRuleAdapter } from "./rule-adapter.ts";
 import { ruleRelation, ruleRelevance, ruleScope, ruleType, ruleWorthKeeping } from "./rule.ts";
 import type { InjectionJudgment, Judged, NoulResult, RecallJudgment, WriteJudgment } from "./types.ts";
+
+/**
+ * 判断引擎只需要这一个方法。JEV HTTP 和任何 OpenAI 兼容端点（见 llm.ts）都满足它，
+ * 所以「换引擎」= 换一个 client，下面的流程、失败姿态、留痕一行都不用改。
+ */
+export interface JudgeClient {
+  ask(state: string, questions: Questions, opts?: AskOptions): Promise<JevResponse>;
+}
 
 /**
  * 交给 JEV 的候选上限。实测（DESIGN.md §4.1）：20 条时区分度最好
@@ -24,7 +35,22 @@ import type { InjectionJudgment, Judged, NoulResult, RecallJudgment, WriteJudgme
  */
 export const MAX_CANDIDATES = 20;
 
+/** 交给 createJevAdapter 的时间预算。本地模型比 JEV 慢一个量级，所以这两个值可以调。 */
+export interface JudgeTimeouts {
+  /** 交互路径（J5/J7/J8，在 before_agent_start 里）。宁可不注入，也不能拖住用户。 */
+  interactiveTimeoutMs?: number;
+  /** 写入路径（J1/J2/J3，在 agent_end 里）。质量比延迟重要，且必须成功。 */
+  writeTimeoutMs?: number;
+  /** 这个引擎的相关性阈值。缺省 0.7（JEV 的标定值）。 */
+  relevanceThreshold?: number;
+}
+
 export interface JevAdapter {
+  /**
+   * 这个引擎自己的相关性阈值（§10.1 的 >0.7 是 JEV 的标定值，不是通用真理）。
+   * 规则引擎和本地小模型的分数尺度完全不同，拿 0.7 去卡它们会把候选全卡光。
+   */
+  readonly relevanceThreshold: number;
   /** J1 + J2 + J3，一次调用。 */
   judgeWrite(content: string, context: string, candidates: MemoryNode[]): Promise<Judged<WriteJudgment>>;
   /** J5。 */
@@ -88,8 +114,14 @@ function okMeta(gate: string, res: { model: string; usage: { input_tokens: numbe
   };
 }
 
-export function createJevAdapter(client: JevHttpClient): JevAdapter {
+export function createJevAdapter(client: JudgeClient, opts: JudgeTimeouts = {}): JevAdapter {
+  // 交互路径（在 before_agent_start 里）宁可不注入也不能拖住用户；写入路径可以慢，
+  // 但必须成功。本地模型比 JEV 慢一个量级，所以这两个值可以从 config 调大。
+  const fast = opts.interactiveTimeoutMs ?? 2500;
+  const slow = opts.writeTimeoutMs ?? 8000;
   return {
+    relevanceThreshold: opts.relevanceThreshold ?? 0.7,
+
     async judgeWrite(content, context, candidates): Promise<Judged<WriteJudgment>> {
       const t0 = Date.now();
       const state =
@@ -146,7 +178,7 @@ export function createJevAdapter(client: JevHttpClient): JevAdapter {
       try {
         // 写入路径可以慢一点，但必须成功：多给时间并重试一次。
         // 实测冷启动第一个请求会莫名卡死（见 http.ts 的说明）。
-        const res = await client.ask(state, questions, { timeoutMs: 8000, retries: 1 });
+        const res = await client.ask(state, questions, { timeoutMs: slow, retries: 1 });
         const type = choiceOf(res.answers.memory_type, MEMORY_TYPES) as MemoryType | null;
         const scope = choiceOf(res.answers.memory_scope, ["global", "project", "session"]) as MemoryScope | null;
         const relation = choiceOf(res.answers.relation, ["none", "extends", "supersedes", "contradicts"]) as Relation | null;
@@ -217,7 +249,7 @@ export function createJevAdapter(client: JevHttpClient): JevAdapter {
 
       try {
         // 召回/注入在 before_agent_start 里，宁可不注入也不能拖住用户：短超时、不重试。
-        const res = await client.ask(state, questions, { timeoutMs: 2500 });
+        const res = await client.ask(state, questions, { timeoutMs: fast });
         for (const m of capped) relevance.set(m.id, num(res.answers[`rel_${m.id}`], "noul"));
         return {
           relevance,
@@ -257,7 +289,7 @@ export function createJevAdapter(client: JevHttpClient): JevAdapter {
 
       try {
         // 同 J7：这是用户提交 prompt 后、回答前的那段等待，不能等太久。
-        const res = await client.ask(state, questions, { timeoutMs: 2500 });
+        const res = await client.ask(state, questions, { timeoutMs: fast });
         for (const m of candidates) {
           decisions.set(m.id, choiceOf(res.answers[`inj_${m.id}`], ["inject", "skip"]) === "inject" ? "inject" : "skip");
         }
@@ -283,4 +315,49 @@ function degradation(gate: string, e: unknown, t0: number, detail: string) {
     latencyMs: Date.now() - t0,
     detail: `${detail} — ${(e as Error).message}`.slice(0, 300),
   };
+}
+
+/**
+ * 引擎选择。三个档位都是正式档位，不是「主 / 备」：
+ *
+ *   rules   零配置、零联网、零成本。默认档 —— 装了就有用，但判断粗。
+ *   jev     TypeSafe AI 的 JEV，本设计的标定基准（§4.1）。
+ *   openai  任何 OpenAI 兼容 /chat/completions：DeepSeek / Ollama / LM Studio / vLLM…
+ *
+ * 选哪个只影响判断质量，不影响流程、失败姿态和落库格式。
+ */
+export function createJudgeAdapter(config: JudgeConfig, deps: { fetchImpl?: typeof fetch } = {}): JevAdapter {
+  const timeouts: JudgeTimeouts = {
+    interactiveTimeoutMs: config.timeoutMs,
+    writeTimeoutMs: config.writeTimeoutMs,
+    relevanceThreshold: config.relevanceThreshold,
+  };
+  switch (config.provider) {
+    case "rules":
+      // 规则引擎不用外面给的阈值：它的 0.7 是自己分数尺度上的，外面调它没意义。
+      return createRuleAdapter();
+    case "openai":
+      return createJevAdapter(
+        new LlmClient({
+          baseUrl: config.baseUrl ?? "",
+          apiKey: config.apiKey,
+          model: config.model ?? "",
+          timeoutMs: config.timeoutMs,
+          fetchImpl: deps.fetchImpl,
+        }),
+        timeouts,
+      );
+    case "jev":
+    default:
+      return createJevAdapter(
+        new JevHttpClient({
+          apiKey: config.apiKey,
+          baseUrl: config.baseUrl,
+          model: config.model,
+          timeoutMs: config.timeoutMs,
+          fetchImpl: deps.fetchImpl,
+        }),
+        timeouts,
+      );
+  }
 }

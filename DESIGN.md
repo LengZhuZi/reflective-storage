@@ -283,12 +283,39 @@ export interface JevAdapter {
 
 ### 5.1 实现约定
 
-- **一个 gate 一次调用**：把同一次判断的多个问题（J1+J2+J3）**合并成一次 API 调用**，JEV 的多个问题并行评估，加问题几乎不加延迟（实测：3 问 0.99s，20 问 0.97s）。
+- **一个 gate 一次调用**：把同一次判断的多个问题（J1+J2+J3）**合并成一次 API 调用**，JEV 的多个问题并行评估，加问题几乎不加延迟（实测：3 问 0.99s，20 问 0.97s；换网后重测 20 问 0.38s，相关 0.63–0.75 / 无关 0.05）。
 - **每问必须原子**：一个问题只问一件事。要加权多个维度就在代码里组合，而不是写一个复合问题。
-- **实现结构**：`JevAdapter` 是接口；`JevHttpAdapter` 是真实实现；`RuleAdapter` / `MockAdapter` 是降级与测试实现。三者同签名，可整体替换。
-- **全部返回结构化结果 + 置信度**，便于降级和兜底（见 §6）。
+- **别让候选列表污染类型判断**（实测）：给 J3 用的 `EXISTING MEMORIES` 会锚定 J2 —— 库里有 1 条 project 记忆时，「我一般喜欢先给结论」被判成 project；候选清空后同句给 global 0.99。合并调用是核心省钱手段所以不能拆，改成在 `memory_type` / `memory_scope` 的 instructions 里明确「只看 NEW CONTENT 判断，候选列表只服务于 relation 那一问」。
+- **全部返回结构化结果 + 置信度**，便于降级和兜底（见 §6）。`ChoiceResult.probabilities` 要真的填，置信度分级要用它。
+- **只让引擎输出数字和枚举标签，不让它生成记忆原文**（§15 原则 1）。
 
-### 5.2 HTTP 细节（已实测）
+### 5.2 判断引擎可替换（不是绑死 JEV）
+
+流程只通过**一个方法**使用判断引擎：
+
+```typescript
+export interface JudgeClient {
+  ask(state: string, questions: Questions, opts?: AskOptions): Promise<JevResponse>;
+}
+```
+
+失败姿态、留痕、落库格式都在 `pipeline/` 里，全部只依赖它。所以「换引擎」= 换一个 client，`pipeline/` 一行不改。
+
+| 档位 | 实现 | 依赖 | 特点 |
+| --- | --- | --- | --- |
+| `rules` | `src/jev/rule-adapter.ts` | 无 | **默认档**（没配 key 时）。零配置、零联网、零成本。判断粗：J3 不做语义冲突检测（一律新建）、类型/作用域是关键词规则。`relevanceThreshold` = 0.5 |
+| `jev` | `src/jev/http.ts` + `adapter.ts` | TypeSafe API key | 本设计的标定基准（§4.1），质量最好，`relevanceThreshold` = 0.7 |
+| `openai` | `src/jev/llm.ts` | OpenAI 兼容 `/chat/completions` | DeepSeek / Ollama / LM Studio / vLLM / DashScope 兼容模式等；本地小模型分数普遍偏低，阈值要调 |
+
+**为什么必须有 `rules` 档**：没有模型时如果每个 gate 都按「不可用」处理，注入会 fail-closed，表现就是「装了什么都没发生」—— 对只想装个长期记忆的用户来说等于没这个扩展。所以规则引擎是正式档位，不是主/备关系：它的 `meta.status` 是 `ok`，`fallbackUsed` 是 `rule`，不假装自己降级。
+
+**按引擎给阈值**：`JevAdapter.relevanceThreshold` 由引擎自己给。§10.1 的 `>0.7` 是在 JEV 的分数尺度上标定的，搬到规则引擎或本地小模型上会把候选全卡光（实测：规则分 0.6 的命中在 0.7 下被丢，在规则档的 0.5 下正常注入）。
+
+**超时可配**：交互路径缺省 2500ms、写入路径 8000ms（§5.3）。本地模型慢一个量级，所以这两个值能从配置调大。
+
+**`openai` 档不继承 `typesafe.*` 的 key**：别人可能同时配了两家，把 JEV 的 key 发到另一个端点上是不能接受的。
+
+### 5.3 HTTP 细节（已实测）
 
 ```typescript
 const res = await fetch("https://api.typesafe.ai/v1/systemone", {
@@ -473,37 +500,31 @@ CREATE VIRTUAL TABLE memory_fts USING fts5(
 pi 扩展是**运行在 pi 进程内的 TypeScript 模块**，通过 jiti 加载，无需编译。
 
 ```
-~/.pi/agent/extensions/reflective-storage/
-├── index.ts              # 入口：注册 hooks / tools / command
-├── package.json          # { "pi": { "extensions": ["./index.ts"] } }
-└── src/
-    ├── jev/
-    │   ├── adapter.ts        # JevAdapter 接口 + 实现选择
-    │   ├── http.ts           # JEV HTTP 客户端（超时/降级/留痕）
-    │   └── rule.ts           # RuleAdapter（JEV 不可用时的兜底）
-    ├── core/
-    │   ├── node.ts           # MemoryNode 模型与类型
-    │   ├── tree.ts           # 树结构与遍历
-    │   ├── lifecycle.ts      # 生命周期状态机
-    │   └── scope.ts          # 作用域解析与硬过滤
-    ├── reflection/
-    │   ├── write-gate.ts     # J1→J2→J3→J4（一次调用打完）
-    │   ├── recall-gate.ts    # J5→J6→J7
-    │   ├── injection-gate.ts # J8
-    │   ├── lifecycle-gate.ts # J9–J13
-    │   └── governance-gate.ts# J14a–J14c
-    ├── storage/
-    │   ├── db.ts             # node:sqlite 连接与迁移
-    │   ├── relational.ts     # 记忆 CRUD
-    │   ├── keyword.ts        # FTS5
-    │   └── vector.ts         # sqlite-vec（Phase 2）
-    ├── retrieval/
-    │   ├── multi-recall.ts   # 多路召回（目标：压到 ≤20 条）
-    │   ├── scope-filter.ts   # 作用域硬过滤
-    │   └── context-builder.ts# 注入块组装（含转义）
-    ├── tools.ts              # memory_search / memory_add / memory_forget
-    └── command.ts            # /memory 命令
+reflective-storage/
+├── index.ts                  # 入口：六个 hook + 三个工具 + /memory 命令
+├── package.json              # { "pi": { "extensions": ["./index.ts"] } }
+├── src/
+│   ├── config.ts             # 配置与凭据：环境变量 > config.json > 报错
+│   ├── core/types.ts         # MemoryNode / 作用域 / 预算 等模型
+│   ├── embed/encoder.ts      # 本地 bge-small-zh-v1.5（512 维，离线）
+│   ├── jev/
+│   │   ├── adapter.ts        # JevAdapter 接口 + 四个 gate + 档位选择
+│   │   ├── http.ts           # JEV HTTP 客户端（超时/降级/留痕）
+│   │   ├── llm.ts            # OpenAI 兼容引擎（任何 /chat/completions）
+│   │   ├── rule-adapter.ts   # 纯规则引擎（默认档）
+│   │   ├── rule.ts           # 规则原子（关键词、类型、作用域、相关性）
+│   │   └── types.ts          # 判断结果类型（三态 status）
+│   ├── storage/db.ts         # node:sqlite + FTS5 + sqlite-vec + 硬过滤
+│   └── pipeline/
+│       ├── write.ts          # 写入流程：预筛 → J1+J2+J3 → 作用域分流
+│       ├── recall.ts         # 召回流程：多路召回 → 门禁 → J7 → 阈值
+│       └── inject.ts         # J8 之后：预算截断、转义、每会话一次
+└── tests/                    # 断言风格自检，一个模块一个文件，不用框架
 ```
+
+（v3.0 里的 `reflection/*-gate.ts` 与 `retrieval/*.ts` 最终没有拆成那么多小文件：
+每个 gate 只有一两个函数，拆开只会让调用链跨三个目录。判断原子在 `jev/`，流程编排
+在 `pipeline/`，硬过滤在 `storage/db.ts` + `recall.ts` 的 `inScope()`。）
 
 ### 8.2 钩子映射
 
@@ -566,7 +587,7 @@ pi 扩展是**运行在 pi 进程内的 TypeScript 模块**，通过 jiti 加载
 ~/.pi/agent/reflective-storage/
 ├── global.db                 # scope='global'
 ├── projects/<project-id>.db  # scope='project'，一个项目一个库
-└── config.json                # 阈值、开关、budget、凭据（权限必须 600；见 §5.2）
+└── config.json                # 阈值、开关、budget、凭据（权限必须 600；见 §5.3）
 ```
 
 `project-id` 解析：最近 `.git` 祖先目录名（与既有实践一致——用 cwd 的 basename 会在深层目录下解析出 `java` 这种垃圾库名）。
@@ -759,7 +780,7 @@ function recall(db: Database, query: string, scope: Scope, scopeId: string) {
 | embedding | 本地 `bge-small-zh-v1.5`（ONNX q8，512 维，进程内 CPU） | 同左 | 同左 | **已跑通**：加载 172ms，单条 ~4ms，离线 |
 | 关键词 | FTS5 | tsvector | Elasticsearch | **已验证**：broader 可用，trigram 对中文有局限（§7.3） |
 | 缓存 | 无 | Redis | Redis | — |
-| JEV | TypeSafe AI API（`jev-latest`） | 同左 | 同左 + 本地缓存 | **已验证**：走代理可达，1 秒级 |
+| 判断引擎 | `rules`（零依赖）/ JEV / 任何 OpenAI 兼容端点 | 同左 + 本地缓存 | 同左 | **已验证**：JEV 直连 0.3–1.2s、20 问 0.38s；三档详见 §5.2 |
 | 定时任务 | 无（用会话事件） | Celery | Celery + K8s | — |
 
 ### 13.1 embedding 是什么
@@ -820,6 +841,7 @@ curl -sL -x http://127.0.0.1:7897 -o models/bge-small-zh-v1.5/onnx/model_quantiz
 - J5 是否需要召回、J7 相关性重排、J8 上下文注入
 - J14a 作用域隔离（硬过滤）、J14b 兜底路由、J14c 理由写日志
 - J15 轻量反馈：只记录 `recalled / injected / cited / 用户反馈`
+- **判断引擎可插拔**：`rules`（默认档，零配置）/ `jev` / 任何 OpenAI 兼容端点（§5.2）
 - `/memory` 命令 + `memory_search` / `memory_add` / `memory_forget` 工具
 
 **不做**：

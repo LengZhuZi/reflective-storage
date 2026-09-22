@@ -4,6 +4,8 @@ JEV 驱动的长期记忆运行时，作为 [pi](https://pi.dev) 的原生扩展
 
 记忆在写入前先反思，在召回时先判断，在使用后能进化。
 
+**不需要任何 API key 也能用**：默认走纯规则引擎（离线、零成本）。配上 key 或用任何 OpenAI 兼容的本地模型，判断质量会好很多。判断引擎可替换，流程和失败姿态不变 —— 详见 [DESIGN.md](./DESIGN.md) §5.2。
+
 ## 这套东西解决什么
 
 | 痛点 | 对应机制 |
@@ -25,8 +27,10 @@ src/config.ts           配置与凭据解析（环境变量 > config.json > 报
 src/core/types.ts       记忆节点与作用域模型
 src/jev/types.ts        判断结果类型（三态 status）
 src/jev/http.ts         JEV 传输层：超时、重试、usage
-src/jev/rule.ts         JEV 不可用时的规则兜底
-src/jev/adapter.ts      四个 gate 的组装与失败姿态
+src/jev/llm.ts          OpenAI 兼容引擎：任何 /chat/completions
+src/jev/rule.ts         规则原子（关键词、类型、作用域、相关性）
+src/jev/rule-adapter.ts 纯规则引擎：默认档，零配置、离线
+src/jev/adapter.ts      四个 gate 的组装、失败姿态、档位选择
 src/embed/encoder.ts    本地 bge-small-zh-v1.5，512 维，完全离线
 src/storage/db.ts       node:sqlite + FTS5 + sqlite-vec
 src/pipeline/write.ts   写入流程：预筛、脱敏、J1+J2+J3、作用域分流、fail-open
@@ -34,11 +38,21 @@ src/pipeline/recall.ts  召回流程：多路召回、作用域门禁、J7、J8�
 src/pipeline/inject.ts  注入块组装与「每会话只注入一次」的状态
 ```
 
+## 判断引擎（三档，都是正式档位）
+
+| 档位 | 配置 | 依赖 | 说明 |
+| --- | --- | --- | --- |
+| `rules` | 什么都不配 | 无 | **默认档**。零配置、不联网。判断粗：不做语义冲突检测（一律新建），类型/作用域靠关键词 |
+| `jev` | 配了 JEV key 就自动用 | TypeSafe key | 质量最好，本设计的标定基准 |
+| `openai` | `judge.provider = "openai"` + baseUrl + model | 任何 `/chat/completions` | DeepSeek / Ollama / LM Studio / vLLM… |
+
+没配 key 时默认`rules`，不会出现「装了什么都没发生」。想换模型只改配置，流程一行不改。
+
 ## 依赖
 
 - **Node.js 24+** —— 用到内置的 `node:sqlite`，无需第三方数据库驱动
-- **JEV API key** —— 从 https://console.typesafe.ai/keys 获取，放 `~/.pi/agent/reflective-storage/config.json`（权限 600）或环境变量
 - 本地 embedding 模型 —— 用 `scripts/fetch-model.sh` 拉一次，之后完全离线
+- **可选**：JEV API key（从 https://console.typesafe.ai/keys 获取），或任何 OpenAI 兼容端点。不加也能用（`rules` 档）
 
 ```bash
 npm install --ignore-scripts   # 见下方说明
@@ -52,6 +66,7 @@ bash scripts/fetch-model.sh
 ```bash
 node tests/smoke.ts       # storage + embedding + 四个 gate 的成功路径与三条失败路径
 node tests/config.ts      # 配置与凭据：环境变量覆盖、600 权限把关、报错可读、代理提示
+node tests/judge.ts       # 三档引擎、阈值跟着引擎走、OpenAI 兼容的编译与解析
 node tests/write.ts       # 写入流程：预筛、脱敏、作用域分流、fail-open
 node tests/recall.ts      # 召回流程：门禁、阈值、fail-degraded、fail-closed、预算
 node tests/inject.ts      # 注入块：声明、转义、预算截断、状态机
@@ -66,6 +81,10 @@ node tests/extension.ts   # pi 绑定：hook/工具/命令、每会话一次、�
 | --- | --- |
 | `TYPESAFE_API_KEY` | JEV API key。配置文件或环境变量，两者都只在本机，不落盘到仓库、不入库、不进日志 |
 | `TYPESAFE_BASE_URL` / `TYPESAFE_MODEL` | JEV 端点和模型，缺省 `https://api.typesafe.ai` / `jev-latest` |
+| `REFLECTIVE_JUDGE_PROVIDER` | `rules` / `jev` / `openai`。缺省：有 key 走 jev，没 key 走 rules |
+| `REFLECTIVE_JUDGE_API_KEY` / `_BASE_URL` / `_MODEL` | 判断引擎自己的凭据和端点，覆盖上面的 `TYPESAFE_*` |
+| `REFLECTIVE_JUDGE_TIMEOUT_MS` / `_WRITE_TIMEOUT_MS` | 交互路径 / 写入路径超时，缺省 2500 / 8000。本地模型要调大 |
+| `REFLECTIVE_JUDGE_THRESHOLD` | 相关性阈值，缺省 0.7。本地小模型分数普遍偏低时调小 |
 | `REFLECTIVE_PROXY` | 代理地址，等价于配置文件里的 `proxy.http` |
 | `HTTP_PROXY` / `HTTPS_PROXY` | JEV 端点需要代理时用，配合下面的开关 |
 | `NODE_USE_ENV_PROXY=1` | **必需**（要用代理时）。Node 的内置 fetch 默认不读代理变量，且必须在启动进程前设置 —— 进程内改无效 |
@@ -76,6 +95,7 @@ node tests/extension.ts   # pi 绑定：hook/工具/命令、每会话一次、�
 ```json
 {
   "typesafe": { "apiKey": "...", "baseUrl": "https://api.typesafe.ai", "model": "jev-latest" },
+  "judge": { "provider": "openai", "baseUrl": "http://localhost:11434/v1", "model": "qwen3:8b" },
   "proxy": { "http": "http://127.0.0.1:7897" }
 }
 ```
@@ -101,7 +121,7 @@ node tests/extension.ts   # pi 绑定：hook/工具/命令、每会话一次、�
 
 ## 状态
 
-Phase 1 进行中。已完成存储层、embedding、四个 gate（J1/J2/J3、J5、J7、J8）与其失败姿态、写入流程、召回流程、pi 扩展入口（hooks / 工具 / `/memory` 命令）。
+Phase 1 进行中。已完成存储层、embedding、四个 gate（J1/J2/J3、J5、J7、J8）与其失败姿态、写入流程、召回流程、判断引擎可插拔（rules / jev / openai）、pi 扩展入口（hooks / 工具 / `/memory` 命令）。
 
 J5 目前不调用：§10.4 的本地规则已经覆盖了「要不要花这次钱」，而本会话只注入一次，所以 J5 在首轮永远是一次白花的调用。`adapter.judgeRecallNeed` 留着给压缩后重注入和将来的主动召回。
 

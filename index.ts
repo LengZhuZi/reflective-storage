@@ -17,9 +17,8 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { Type } from "typebox";
 import type { JudgeMeta } from "./src/jev/types.ts";
 import type { MemoryNode, SessionInfo } from "./src/core/types.ts";
-import { createJevAdapter, type JevAdapter } from "./src/jev/adapter.ts";
-import { JevHttpClient } from "./src/jev/http.ts";
-import { proxyHint } from "./src/config.ts";
+import { createJudgeAdapter, type JevAdapter } from "./src/jev/adapter.ts";
+import { loadConfig, proxyHint } from "./src/config.ts";
 import {
   addTrace, countMemories, getMemory, hardDelete, listInScope, openGlobalDb, openProjectDb,
   projectIdFor, tracesFor, type OpenedDb,
@@ -41,6 +40,8 @@ interface Runtime {
   digested: Set<string>;
   /** 配置读取时发现的问题（文件缺失 / 权限不对 / 解析失败），/memory 要能看见。 */
   configProblems: string[];
+  /** 本会话用哪个判断引擎（rules / jev / openai），/memory 要能看见。 */
+  engine: string;
   lastRecall?: { status: JudgeMeta["status"] | "skipped"; candidates: number; injected: number; detail?: string; at: number };
   lastWrite?: { action: string; reason?: string; at: number };
   error?: string;
@@ -107,6 +108,7 @@ function statusText(r: Runtime): string {
     `项目库 ${projectIdFor(r.session.cwd)}：${countMemories(r.projectDb)} 条`,
     `全局库：${countMemories(r.globalDb)} 条`,
     `本会话注入：${r.state.doneThisSession ? `${r.state.injectedIds.size} 条` : "未注入"}`,
+    `判断引擎：${r.engine}`,
   ];
   const lr = r.lastRecall;
   if (lr) lines.push(`上次召回：${label(lr.status)}，候选 ${lr.candidates} → 注入 ${lr.injected}${lr.detail ? `（${lr.detail}）` : ""}`);
@@ -126,17 +128,23 @@ export default function reflectiveStorage(pi: ExtensionAPI): void {
   pi.on("session_start", async (_event, ctx) => {
     const projectDb = openProjectDb(ctx.cwd);
     const globalDb = openGlobalDb();
-    const client = new JevHttpClient();
+    const loaded = loadConfig();
+    const judge = loaded.judge;
 
-    // 代理只影响 JEV 能不能连上，连不上就是召回 fail-degraded、注入 fail-closed。
-    // 但必须提示：不提示的话表现是「JEV 一直超时」，看不出是代理没生效。
-    const hint = proxyHint(client.config);
+    // 代理只影响判断引擎能不能连上，连不上就是召回 fail-degraded、注入 fail-closed。
+    // 但必须提示：不提示的话表现是「一直超时」，看不出是代理没生效。
+    const hint = loaded.config.proxy ? proxyHint(loaded.config) : null;
     if (hint && ctx.hasUI) ctx.ui.notify(hint, "warning");
+    // 引擎配错了（openai 缺 baseUrl 之类）也要当场说，否则表现只是「judge 一直降级」。
+    if (judge.problems.length && ctx.hasUI) {
+      ctx.ui.notify(`reflective-storage 判断引擎配置：\n${judge.problems.join("\n")}`, "warning");
+    }
 
     rt = {
       projectDb,
       globalDb,
-      adapter: createJevAdapter(client),
+      adapter: createJudgeAdapter(judge),
+      engine: judge.provider,
       session: {
         sessionId: ctx.sessionManager.getSessionId() ?? "ephemeral",
         cwd: ctx.cwd,
@@ -146,7 +154,7 @@ export default function reflectiveStorage(pi: ExtensionAPI): void {
       state: new InjectionState(),
       pending: Promise.resolve(),
       digested: new Set<string>(),
-      configProblems: client.problems,
+      configProblems: [...loaded.problems, ...judge.problems],
     };
   });
 

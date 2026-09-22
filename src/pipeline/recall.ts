@@ -20,14 +20,15 @@ import type { MemoryNode, SessionInfo, TokenBudget } from "../core/types.ts";
 import type { JevAdapter } from "../jev/adapter.ts";
 import { MAX_CANDIDATES } from "../jev/adapter.ts";
 import type { JudgeMeta } from "../jev/types.ts";
+import { DEFAULT_RELEVANCE_THRESHOLD } from "../jev/types.ts";
 import { embed } from "../embed/encoder.ts";
 import {
   addTrace, listInScope, markAccessed, searchByKeyword, searchByVector, type OpenedDb,
 } from "../storage/db.ts";
 import { buildInjectionBlock, fitBudget } from "./inject.ts";
 
-/** J7 之后的相关性阈值。实测那两条相关的给 0.85 / 0.70，所以是 >= 而不是 >（§10.1）。 */
-export const RELEVANCE_THRESHOLD = 0.7;
+/** J7 之后的相关性阈值。每个引擎的分数尺度不同，所以实际用的是 adapter.relevanceThreshold。 */
+export const RELEVANCE_THRESHOLD = DEFAULT_RELEVANCE_THRESHOLD;
 
 /** 每一路各取多少条再合并，合并后再压到 MAX_CANDIDATES。 */
 const PER_SOURCE_LIMIT = 50;
@@ -211,8 +212,10 @@ export async function recallFlow(query: string, deps: RecallDeps): Promise<Recal
 
   // 阈值只在 J7 正常时生效。降级时规则分本来就偏低，卡阈值等于把 fail-degraded
   // 变成 fail-closed；召回该「少召几条」，不是「一条都不召」（§6.1）。
+  // 阈值取自引擎自己：JEV 的 0.7 搬到规则引擎或本地小模型上会把候选全卡光。
+  const threshold = deps.adapter.relevanceThreshold ?? DEFAULT_RELEVANCE_THRESHOLD;
   const passed = j7.meta.status === "ok"
-    ? scored.filter((r) => r.relevance >= RELEVANCE_THRESHOLD)
+    ? scored.filter((r) => r.relevance >= threshold)
     : scored;
 
   addTrace(deps.projectDb, {

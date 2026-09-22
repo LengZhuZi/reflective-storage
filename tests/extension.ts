@@ -175,17 +175,33 @@ after.close();
 seed.close();
 console.log("✓ session_shutdown 冲刷待写队列，注入块没被写回库");
 
-// ------------------------------------------------------------ §6.2 降级必须可见
+// ------------------------------------------------------------ 没配 key：默认 rules 档
+// 这一档存在的理由：对别的用户来说，「没配 key 就什么都不发生」等于没装这个扩展。
 delete process.env.TYPESAFE_API_KEY;
 await call("session_start");
-assert.equal(await call("before_agent_start", { prompt: PROMPT }), undefined, "JEV 不可用时 fail-closed：不注入");
 notes.length = 0;
 await runCommand("");
-assert.match(notes.at(-1)!, /降级/, "JEV 不可用必须显示成「降级」，不能报告成「没有记忆」（§6.2）");
-assert.match(notes.at(-1)!, /JEV/, "降级原因要说清是 JEV 不可用");
-assert.match(notes.at(-1)!, /配置：.*配置文件不存在/, "配置来源的问题要能在 /memory 直接看到，不用去翻代码（600 权限也是这么被发现在的）");
+assert.match(notes.at(-1)!, /判断引擎：rules/, "没 key 时默认档是纯规则，不是「装了没反应」");
+assert.match(notes.at(-1)!, /按 rules/, "走到 rules 的原因要说清");
+assert.match(notes.at(-1)!, /配置：.*配置文件不存在/, "配置来源的问题要能在 /memory 直接看到（600 权限也是这么被发现的）");
 await call("session_shutdown");
-console.log("✓ JEV 不可用时 fail-closed，且 /memory 说的是「降级」不是「没有记忆」");
+console.log("✓ 没配 key：默认走 rules 档，/memory 说清为什么");
+
+// ------------------------------------------------------------ 引擎真失败：fail-closed
+const deadFetch: typeof fetch = async () => { throw new Error("模拟引擎连不上"); };
+globalThis.fetch = deadFetch;
+process.env.REFLECTIVE_JUDGE_PROVIDER = "jev";
+process.env.TYPESAFE_API_KEY = "test-key";
+await call("session_start");
+assert.equal(await call("before_agent_start", { prompt: PROMPT }), undefined, "引擎连不上时 fail-closed：不注入");
+notes.length = 0;
+await runCommand("");
+assert.match(notes.at(-1)!, /判断引擎：jev/);
+assert.match(notes.at(-1)!, /降级/, "引擎连不上必须显示成「降级」，不能报告成「没有记忆」（§6.2）");
+assert.match(notes.at(-1)!, /JEV/, "降级原因要说清是引擎不可用");
+await call("session_shutdown");
+delete process.env.REFLECTIVE_JUDGE_PROVIDER;
+console.log("✓ 引擎连不上时 fail-closed，且 /memory 说的是「降级」不是「没有记忆」");
 
 fs.rmSync(tmp, { recursive: true, force: true });
 console.log("\n全部通过");

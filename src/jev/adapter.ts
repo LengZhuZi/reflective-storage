@@ -50,6 +50,10 @@ const choiceOf = (a: Answer | undefined, allowed: readonly string[]): string | n
 const confidenceOf = (a: Answer | undefined): number =>
   a && a.type !== "noul" && typeof a.confidence === "number" ? a.confidence : 0;
 
+/** 概率分布要带出来：§6 的置信度分级和 /memory 排查都靠它，空对象等于把信息丢了。 */
+const probabilitiesOf = (a: Answer | undefined): Record<string, number> =>
+  a && a.type !== "noul" && a.probabilities && typeof a.probabilities === "object" ? a.probabilities : {};
+
 function candidateBlock(candidates: MemoryNode[]): string {
   return candidates.map((m, i) => `[${m.id}] (${m.type}) ${m.content}`).join("\n");
 }
@@ -100,10 +104,13 @@ export function createJevAdapter(client: JevHttpClient): JevAdapter {
         },
         memory_type: {
           type: "choice",
-          instructions: "Which class of memory is the NEW CONTENT",
+          // 候选列表是给 relation 那一问用的。不加这句，JEV 会拿候选的作用域去锚定
+          // 类型/作用域判断（实测：库里有 1 条 project 记忆时，一句「我一般喜欢…」被
+          // 判成 project；没有候选时同句给 global 0.99）。
+          instructions: "Which class of memory is the NEW CONTENT. Judge this from the NEW CONTENT alone — the EXISTING MEMORIES are listed only for the relation question",
           criteria: {
-            fact: "A stable piece of knowledge about the project or system",
-            preference: "A lasting preference of the user about how work should be done",
+            fact: "A stable piece of knowledge, decision or project convention: how this project or system works. Includes a correction to an earlier decision or a rule about how this project does things",
+            preference: "A lasting preference of the user themselves about how they want work done in general (tone, length, language, tools), not a rule about this project",
             event: "Something that happened: a bug, a fix, a change, a session outcome",
             procedure: "Steps to accomplish something",
             emotion: "The user's mood or attitude, not durable knowledge",
@@ -112,11 +119,11 @@ export function createJevAdapter(client: JevHttpClient): JevAdapter {
         },
         memory_scope: {
           type: "choice",
-          instructions: "How widely should this memory apply",
+          instructions: "How widely should this memory apply. Judge this from the NEW CONTENT alone — the EXISTING MEMORIES are listed only for the relation question",
           criteria: {
-            global: "Applies to every project: a user preference or a general working convention",
-            project: "Specific to the current project",
-            session: "Only relevant to the current session",
+            global: "True for this user in every project: what the user themselves prefers, or a convention they follow everywhere",
+            project: "True only inside the current project: how this codebase or system works, and decisions about it",
+            session: "True only right now: temporary state of the current session",
           },
         },
         relation: {
@@ -147,9 +154,9 @@ export function createJevAdapter(client: JevHttpClient): JevAdapter {
 
         return {
           worthKeeping: { noul: num(res.answers.worth_keeping, "noul") },
-          type: { choice: type ?? "event", confidence: confidenceOf(res.answers.memory_type), probabilities: {} },
-          scope: { choice: scope ?? "project", confidence: confidenceOf(res.answers.memory_scope), probabilities: {} },
-          relation: { choice: relation ?? "none", confidence: confidenceOf(res.answers.relation), probabilities: {} },
+          type: { choice: type ?? "event", confidence: confidenceOf(res.answers.memory_type), probabilities: probabilitiesOf(res.answers.memory_type) },
+          scope: { choice: scope ?? "project", confidence: confidenceOf(res.answers.memory_scope), probabilities: probabilitiesOf(res.answers.memory_scope) },
+          relation: { choice: relation ?? "none", confidence: confidenceOf(res.answers.relation), probabilities: probabilitiesOf(res.answers.relation) },
           targetId: relation && relation !== "none" && target && target !== "none" ? target : null,
           meta: okMeta("J1+J2+J3", res, questions, t0),
         };

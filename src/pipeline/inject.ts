@@ -74,7 +74,7 @@ export function fitBudget<T extends { memory: MemoryNode }>(
  * 想要 §8.3 的严格行为就把 maxPerSession 设成 1。
  */
 export interface InjectPolicy {
-  /** 每会话最多注入几次。 */
+  /** 每个上下文窗口最多注入几次（压缩后重新计）。 */
   maxPerSession: number;
   /** 两次注入之间至少隔几轮提问。 */
   minTurnsBetween: number;
@@ -83,7 +83,6 @@ export interface InjectPolicy {
 }
 
 export const DEFAULT_INJECT_POLICY: InjectPolicy = { maxPerSession: 3, minTurnsBetween: 3, topicOverlapBelow: 0.3 };
-
 /** 换了话题吗：与上次注入时的提问几乎没有共同的二字组。 */
 export function isNewTopic(prompt: string, lastQuery: string, below: number): boolean {
   if (!lastQuery) return true;
@@ -153,10 +152,12 @@ export class InjectionState {
 
   /**
    * 压缩之后上下文被重写过，注入块已经不在里面了，所以允许重新注入（§8.3 例外 / §8.4）。
-   * 三样都清：标记、id 集合、上次的话题与轮次 —— 否则话题/轮次条件会拦住压缩后的第一次注入。
+   * 四样全清：标记、id 集合、上次的话题与轮次、以及**注入次数预算**。
+   *（不清预算的话，/memory 会显示「最多 3 次」却已经注入了 4 次。）
    */
   reset(): void {
     this.injected = false;
+    this.injections = 0;
     this.injectedIds.clear();
     this.lastQuery = "";
     this.lastAtPrompt = -Infinity;

@@ -135,7 +135,7 @@ await call("agent_end", {
   messages: [
     injectedUserMessage,
     { role: "user", content: "以后所有数据库迁移脚本都用 Flyway，不要用 Liquibase" },
-    { role: "assistant", content: [{ type: "text", text: "记住了" }] },
+    { role: "assistant", content: [{ type: "text", text: "知道了，数据库迁移统一用 Flyway，以后按这个来。" }] },
   ],
 });
 await call("agent_end", {
@@ -182,6 +182,10 @@ assert.ok(listed.content[0].text.includes("什么都没删"), "只给 query 不�
 await runCommand("        ");
 assert.match(notes.at(-1)!, /本会话注入/, "/memory 默认显示状态");
 assert.match(notes.at(-1)!, /召回记录：候选/, "J15 的召回记录要能在 /memory 看到（没注入的时候最需要它）");
+// J15 事后核对：回复里出现了注入记忆的原样片段（「数据库迁移统一用 Flyway」），
+// 就该被算成确凿用上 —— 没有这个信号，召回阈值和注入上限只能拍脑袋调。
+assert.match(notes.at(-1)!, /上次注入效果：注入 1 条，确凿用上 1 条（命中率 100%）/, "J15 的事后核对要能在 /memory 看到");
+assert.match(notes.at(-1)!, /确凿用上 1/, "召回记录里也要带上核对结果");
 assert.match(notes.at(-1)!, /上次写入/, "/memory 要能看到上一次判断的结果");
 // Phase 1 验收标准的第三个问题「为什么记住」：轨迹要能回答，并且能看出降级没降级。
 await runCommand(`why ${writtenId}`);

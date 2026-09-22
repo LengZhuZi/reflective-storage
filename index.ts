@@ -26,6 +26,7 @@ import {
 import { writeFlow } from "./src/pipeline/write.ts";
 import { recallFlow, worthRecalling } from "./src/pipeline/recall.ts";
 import { resurrectFor, runLifecycle } from "./src/pipeline/lifecycle.ts";
+import { closeFeedbackLoop } from "./src/pipeline/feedback.ts";
 import { DEFAULT_MAX_TOKENS, InjectionState, MEMORY_OPEN } from "./src/pipeline/inject.ts";
 
 /** 本会话的运行时状态。每次 session_start 重建，session_shutdown 拆掉。 */
@@ -47,6 +48,7 @@ interface Runtime {
   engine: string;
   lastRecall?: { status: JudgeMeta["status"] | "skipped"; candidates: number; injected: number; detail?: string; at: number };
   lastWrite?: { action: string; reason?: string; at: number };
+  lastFeedback?: { injected: number; cited: number; score: number | null; at: number };
   error?: string;
 }
 
@@ -139,12 +141,16 @@ function statusText(r: Runtime): string {
   const lr = r.lastRecall;
   if (lr) lines.push(`上次召回：${label(lr.status)}，候选 ${lr.candidates} → 注入 ${lr.injected}${lr.detail ? `（${lr.detail}）` : ""}`);
   if (r.lastWrite) lines.push(`上次写入：${r.lastWrite.action}${r.lastWrite.reason ? `（${r.lastWrite.reason}）` : ""}`);
+  if (r.lastFeedback) {
+    lines.push(`上次注入效果：注入 ${r.lastFeedback.injected} 条，确凿用上 ${r.lastFeedback.cited} 条${r.lastFeedback.score === null ? "" : `（命中率 ${(r.lastFeedback.score * 100).toFixed(0)}%）`}`);
+  }
   // J15：最近几次召回的事实（没注入的时候最需要看到这个）
   const recalls = recentRecalls(r.projectDb, 3);
   for (const q of recalls) {
     const injected = JSON.parse(String(q.injected_ids ?? "[]")) as unknown[];
     const recalled = JSON.parse(String(q.recalled_ids ?? "[]")) as unknown[];
-    lines.push(`召回记录：候选 ${recalled.length} → 注入 ${injected.length} 「${String(q.query).slice(0, 24)}」`);
+    const cited = JSON.parse(String(q.cited_ids ?? "[]")) as unknown[];
+    lines.push(`召回记录：候选 ${recalled.length} → 注入 ${injected.length} → 确凿用上 ${cited.length} 「${String(q.query).slice(0, 24)}」`);
   }
   for (const p of r.configProblems) lines.push(`配置：${p}`);
   if (r.error) lines.push(`最近错误：${r.error}`);
@@ -258,9 +264,17 @@ export default function reflectiveStorage(pi: ExtensionAPI): void {
     const r = rt;
     if (!r) return;
     const texts = userTexts(event.messages).filter((t) => !r.digested.has(t));
-    if (texts.length === 0) return;
     for (const t of texts) r.digested.add(t);
     const context = assistantText(event.messages);
+    // J15 事后核对：这一轮助手的回复到底用上了哪几条注入过的记忆。纯本地、不联网，
+    // 所以直接同步算（写库也在这儿），不走后台队列。
+    try {
+      const fb = closeFeedbackLoop(r.projectDb, r.session.sessionId, context);
+      if (fb.injected > 0) r.lastFeedback = { injected: fb.injected, cited: fb.cited.length, score: fb.effectScore, at: Date.now() };
+    } catch (e) {
+      r.error = errText(e);
+    }
+    if (texts.length === 0) return;
     // 写入 fail-open 且不该拖住用户：排队后台跑，session_shutdown 冲刷。
     r.pending = r.pending
       .then(async () => {

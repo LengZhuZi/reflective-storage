@@ -385,8 +385,27 @@ export function recordRecall(o: OpenedDb, log: RecallLog): void {
 /** 最近几次召回，给 /memory 看「为什么这次没注入」。 */
 export function recentRecalls(o: OpenedDb, limit = 3): Row[] {
   return o.db
-    .prepare(`SELECT query, recalled_ids, injected_ids, created_at FROM feedback_logs ORDER BY created_at DESC LIMIT ?`)
+    // rowid 兜底：同一毫秒内可能插了好几行（before_agent_start 和 memory_search 挨着跑），
+    // 只按 created_at 排的话「最近一次」是不确定的。
+    .prepare(`SELECT query, recalled_ids, injected_ids, cited_ids, effect_score, created_at FROM feedback_logs ORDER BY created_at DESC, rowid DESC LIMIT ?`)
     .all(limit) as Row[];
+}
+
+/** 本会话最近一次「真的注入过」的召回 —— J15 的事后核对要对着它算。 */
+export function latestRecallWithInjection(o: OpenedDb, sessionId: string): Row | null {
+  return (o.db
+    .prepare(
+      `SELECT id, recalled_ids, injected_ids FROM feedback_logs
+        WHERE session_id = ? AND injected_ids != '[]' ORDER BY created_at DESC, rowid DESC LIMIT 1`,
+    )
+    .get(sessionId) as Row | undefined) ?? null;
+}
+
+/** 事后核对的结果写回那一行 —— J15 只记录，不因为分数低就删记忆。 */
+export function updateRecallOutcome(o: OpenedDb, id: string, citedIds: string[], effectScore: number | null): void {
+  o.db
+    .prepare(`UPDATE feedback_logs SET cited_ids = ?, effect_score = ? WHERE id = ?`)
+    .run(JSON.stringify(citedIds), effectScore, id);
 }
 
 export function countMemories(o: OpenedDb): number {

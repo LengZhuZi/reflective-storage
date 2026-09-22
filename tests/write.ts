@@ -176,7 +176,7 @@ const logged = projectDb.recentRecalls(project, 5) as Array<Record<string, unkno
 assert.equal(logged.length, 1, "召回过就该有记录（J15 轻量反馈）");
 assert.equal(logged[0].query, "迁移工具");
 assert.deepEqual(JSON.parse(String(logged[0].injected_ids)), ["a"]);
-assert.equal(logged[0].cited_ids, undefined, "cited 要等 Phase 2 的事后核对，现在不编");
+assert.equal(logged[0].cited_ids, null, "刚登记时 cited 还是空的（要等 agent_end 事后核对）");
 console.log("✓ J15 召回日志：只记事实，cited / user_feedback 留空");
 
 // ------------------------------------------------------------ 断言常量

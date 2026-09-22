@@ -371,9 +371,16 @@ const res = await fetch("https://api.typesafe.ai/v1/systemone", {
 `judgment='user'`，等 Phase 2 的复核入口。路由结果写进 `reflection_traces.judgment`，
 一句人话写进 `user_visible`（J14c，模板拼接，不调引擎），`/memory why <id>` 直接显示。
 
-**J15 记录什么**：每次召回写一条 `feedback_logs`，只记事实 —— query、召回集、注入集。
-`cited_ids` 和 `user_feedback` 留空：前者要等事后核对（模型有没真的用上），后者要等 UI。
-编一个出来比空着更坏。
+**J15 记录什么**：每次召回写一条 `feedback_logs` —— query、召回集、注入集，然后在 `agent_end`
+做一次**事后核对**，把「回复里真的出现了这条记忆」的 id 写进 `cited_ids`，`effect_score` = cited/injected。
+
+核对用**原文片段复用**判定（`src/pipeline/feedback.ts`）：回复与该记忆之间存在连续 ≥4 个二字组
+的相同片段（≈5 个字以上的原样片段）。为什么不让引擎判：这件事每轮都要做，调一次 API 太贵，
+而且引擎判「模型有没有用上」的准确率未必比字符串比对高。
+
+**这个信号只是下限**：模型换了个说法就抓不到，所以 cited 标的是「确凿用上」，不是「用上了」。
+它可以用来看趋势、调阈值，不能当准确率。`user_feedback` 留空（要等 UI），编一个出来比空着更坏。
+空回复的轮次不做核对 —— 拿空字符串去覆盖上一轮结果等于报假账。
 
 **失败模式与兜底策略**：
 

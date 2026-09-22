@@ -1,0 +1,14 @@
+{
+  "name": "reflective-storage",
+  "private": true,
+  "type": "module",
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "dependencies": {
+    "@huggingface/transformers": "^4.3.0",
+    "sqlite-vec": "^0.1.9"
+  }
+}

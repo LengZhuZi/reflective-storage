@@ -1,0 +1,14 @@
+# 依赖
+node_modules/
+
+# 本地 embedding 模型（24MB 二进制，不入库；用 scripts/fetch-model.sh 拉）
+models/
+
+# 记忆库：本地数据，绝不入库
+*.db
+*.db-wal
+*.db-shm
+
+# 密钥
+.env
+.env.*

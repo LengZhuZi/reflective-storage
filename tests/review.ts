@@ -87,6 +87,22 @@ assert.equal(get2(o, important.id)!.topic, "发布流程");
 const inTopic = o.db.prepare(`SELECT id FROM memories WHERE topic = ?`).all("发布流程") as Array<{ id: string }>;
 assert.deepEqual(inTopic.map((r) => r.id), [important.id]);
 
+// ------------------------------------- 0.5–0.8 的冲突也要问用户（贪吃蛇 demo 验出来的）
+// 用户先说「不做音效」，后一句「音效还是加上吧」被判成 contradicts 0.54 —— 落在 0.5–0.8，
+// 而当时只在 <0.5 才问，于是两条互相矛盾的记忆都留在库里，召回给哪条看运气。
+const noSound = insertMemory(o, { content: "这个 demo 不要音效", type: "preference", scope: "project", scopeId: "P" });
+const wantSound = insertMemory(o, { content: "音效还是加上吧，吃到食物叮一声", type: "preference", scope: "project", scopeId: "P" });
+const midConf = queueAfterWrite(o, wantSound, [noSound], { choice: "contradicts", confidence: 0.54 });
+assert.equal(midConf.length, 1, "0.54 的冲突必须问用户（§6 的 0.5–0.8 档），不能两条并存");
+const item = pendingItems(o, 20).find((it) => String(it.id) === midConf[0].id)!;
+assert.match(String(item.question), /冲突/);
+// 够确信的取代不排队：write.ts 会直接标掉旧的
+assert.equal(queueAfterWrite(o, wantSound, [noSound], { choice: "supersedes", confidence: 0.9 }).length, 0, ">0.8 的取代直接执行，不打扰用户");
+// 0.5 以下同样问（原来就有的口径不能丢）
+const lowConfMemory = insertMemory(o, { content: "另一个 0.38 的情况", type: "fact", scope: "project", scopeId: "P" });
+assert.equal(queueAfterWrite(o, lowConfMemory, [noSound], { choice: "contradicts", confidence: 0.38 }).length, 1, "0.5 以下同样问");
+console.log("✓ 冲突的 0.5–0.8 档也问用户（>0.8 的取代自动执行）");
+
 // ------------------------------------------------------------ J14b：不确定就问用户（不放宽不静默）
 const { queueScopeWidening, widenScopeToGlobal, SCOPE_KEEP, SCOPE_WIDEN } = await import("../src/pipeline/review.ts");
 const narrowed = insertMemory(o, { content: "我一般喜欢用 vim 编辑", type: "preference", scope: "project", scopeId: "P", importance: 0.7 });

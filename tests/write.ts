@@ -13,7 +13,7 @@ import * as path from "node:path";
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "reflect-write-"));
 process.env.REFLECTIVE_HOME = tmp;
 
-const { openDb, countMemories, listInScope, insertMemory, putEmbedding } = await import("../src/storage/db.ts");
+const { openDb, countMemories, listInScope, insertMemory, putEmbedding, getMemory } = await import("../src/storage/db.ts");
 const { embed } = await import("../src/embed/encoder.ts");
 const { writeFlow, worthEvaluating, buildCandidate, splitForWrite, MAX_WRITES_PER_TURN, redact, KEEP_THRESHOLD } = await import("../src/pipeline/write.ts");
 
@@ -274,6 +274,29 @@ const dupTrace = project.db.prepare(`SELECT action, reason FROM reflection_trace
 assert.equal(dupTrace.action, "duplicate");
 assert.ok(String(dupTrace.reason).includes(dup1.memory!.id.slice(0, 8)), "留痕要指向被撞上的那条");
 console.log("✓ 精确查重：归一化后相同就不第二遍存，也不花 JEV 调用");
+
+// ------------------------- >0.8 的取代自动执行（贪吃蛇 demo 验出来的）
+// 「音效不做」→「音效加上」这类改口，够确信就该把旧的标掉，否则两条并存、召回给哪条看运气。
+const oldRule = insertMemory(project, { content: "这个 demo 不要音效", type: "preference", scope: "project", scopeId: "P" });
+const changed = await writeFlow(project, global, {
+  async judgeWrite() {
+    return {
+      worthKeeping: { noul: 0.9 },
+      type: { choice: "preference", confidence: 0.9, probabilities: {} },
+      scope: { choice: "project", confidence: 0.9, probabilities: {} },
+      relation: { choice: "supersedes", confidence: 0.92, probabilities: {} },
+      targetId: oldRule.id,
+      topic: null,
+      meta: { gate: "J1+J2+J3", fallbackUsed: "none", status: "ok", latencyMs: 5 },
+    };
+  },
+} as never, session, { userTexts: ["音效改成吃到食物叮一声"], context: "" });
+assert.equal(changed.action, "stored");
+assert.equal(getMemory(project, oldRule.id)!.state, "superseded", ">0.8 的取代直接把旧那条标掉（§6 的「直接执行」）");
+assert.equal((changed.review ?? []).filter((x) => x.kind === "conflict" || x.kind === "merge").length, 0, "自动执行了就不该再问冲突/合并（主题那条问不问是另一回事）");
+const sup = project.db.prepare(`SELECT action FROM reflection_traces WHERE action = 'superseded'`).get() as Record<string, unknown>;
+assert.equal(sup.action, "superseded", "自动取代要留痕");
+console.log("✓ >0.8 的取代自动标掉旧记忆（不再两条并存）");
 
 project.close();
 global.close();

@@ -16,10 +16,11 @@ import type { MemoryNode, SessionInfo } from "../core/types.ts";
 import { resolveScope } from "../core/governance.ts";
 import type { JevAdapter } from "../jev/adapter.ts";
 import { MAX_CANDIDATES } from "../jev/adapter.ts";
+import { RELATION_AUTO_BELOW } from "./review.ts";
 import { ruleScope } from "../jev/rule.ts";
 import { embed } from "../embed/encoder.ts";
 import {
-  addRelation, addTrace, distinctTopics, insertMemory, putEmbedding,
+  addRelation, addTrace, distinctTopics, insertMemory, putEmbedding, setState,
   type InsertMemory, type OpenedDb,
 } from "../storage/db.ts";
 import { recallCandidates } from "./recall.ts";
@@ -227,12 +228,24 @@ export async function writeFlow(
 
   if (j.relation.choice !== "none" && j.targetId) {
     addRelation(target, memory.id, j.targetId, j.relation.choice, j.relation.confidence);
+    // §6 的「>0.8 直接执行」：**取代**够确信就把旧那条标掉，否则两条并存的记忆
+    // 会同时在库里，召回给哪条看运气（贪吃蛇 demo 验出来的：音效「不做」和「加上」
+    // 一度并存）。冲突（contradicts）不自动执行 —— 哪条对得人来判。
+    if (j.relation.choice === "supersedes" && j.relation.confidence >= RELATION_AUTO_BELOW) {
+      const oldDb = candidates.find((c) => c.id === j.targetId)?.scope === "global" ? globalDb : projectDb;
+      setState(oldDb, j.targetId, "superseded");
+      addTrace(oldDb, {
+        memoryId: j.targetId, stage: "governance", gate: "J3", action: "superseded",
+        reason: `被更新的记忆取代（置信度 ${j.relation.confidence.toFixed(2)}）`,
+        status: j.meta.status, confidence: j.relation.confidence,
+      });
+    }
   }
 
   // 引擎不确定的事（§6 的 <0.5 档）和「看着是同一件事」（§9.3 合并）排进待确认队列。
   // 这里只提议、不动数据 —— 判不了就交给用户，别让污染记忆自己沉淀下去。
   const review = [
-    ...queueAfterWrite(target, memory, candidates, j.relation),
+    ...queueAfterWrite(target, memory, candidates, j.relation, j.targetId),
     ...queueTopicNaming(target, memory, topics),
     // J14b：引擎说 global 但我们收窄了 → 问用户要不要放宽（本地版不做 LLM 复核，就问用户）
     ...queueScopeWidening(target, memory, j.scope.choice),

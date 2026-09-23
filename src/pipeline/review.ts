@@ -78,6 +78,16 @@ export function widenScopeToGlobal(projectDb: OpenedDb, globalDb: OpenedDb, memo
 /** 看同一件事的判据：连续 6 个以上二字组（≈7 字以上原样片段）。只用来提议。 */
 export const SAME_THING_RUN = 6;
 
+/**
+ * §6 的「>0.8 直接执行」分界线：**取代**关系够确信就自动执行（旧的标 superseded），
+ * 不够确信（<0.8）连冲突一起问用户。
+ *
+ * 这条是贪吃蛇 demo 验出来的：用户先说「不做音效」，后一句「音效还是加上吧」被 J3 判成
+ * `contradicts 0.54` —— 落在 0.5–0.8，而当时的阈值只在 <0.5 才问，于是**两条互相矛盾的
+ * 记忆都留在库里**，后面召回给哪条看运气。0.5–0.8 那一档本来就该交用户确认（§6）。
+ */
+export const RELATION_AUTO_BELOW = 0.8;
+
 export interface ReviewItem {
   id: string;
   kind: ReviewKind;
@@ -98,13 +108,14 @@ export function queueAfterWrite(
   memory: MemoryNode,
   candidates: readonly MemoryNode[],
   relation: { choice: string; confidence: number },
+  targetId?: string | null,
 ): ReviewItem[] {
   const out: ReviewItem[] = [];
   const options = Object.values(RESOLUTION_LABELS);
 
-  // §6：低置信度的取代/冲突关系交用户确认
-  if ((relation.choice === "supersedes" || relation.choice === "contradicts") && relation.confidence < 0.5) {
-    const other = candidates.find((c) => c.id !== memory.id) ?? null;
+  // §6：取代/冲突关系不够确信就交用户确认（>0.8 的取代已经在 write.ts 里自动执行了）
+  if ((relation.choice === "supersedes" || relation.choice === "contradicts") && relation.confidence < RELATION_AUTO_BELOW) {
+    const other = candidates.find((c) => c.id === targetId) ?? candidates.find((c) => c.id !== memory.id) ?? null;
     const id = enqueueReview(o, {
       kind: "conflict",
       memoryId: memory.id,

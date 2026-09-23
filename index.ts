@@ -701,7 +701,11 @@ export default function reflectiveStorage(pi: ExtensionAPI): void {
             projectDb: r.projectDb, globalDb: r.globalDb, projectId: r.session.projectId,
             port: r.uiPort,
           });
-          ctx.ui.notify(`记忆库页面：${ui.url}\n（只绑 127.0.0.1，URL 里的 token 是访问凭证；关掉 pi 就停）`, "info");
+          const msg = `记忆库页面：${ui.url}\n（只绑 127.0.0.1，URL 里的 token 是访问凭证；关掉 pi 就停）`;
+          // print / json 模式没有 UI（notify 是空操作），所以那边退到 stderr —— 不然
+          // 用户敲了 /memory ui 却什么也看不到。
+          if (ctx.hasUI) ctx.ui.notify(msg, "info");
+          else console.error(`[reflective-storage] ${msg}`);
         } catch (e) {
           ctx.ui.notify(`页面起不来：${errText(e)}`, "error");
         }

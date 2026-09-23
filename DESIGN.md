@@ -802,7 +802,10 @@ final_score = w1 × jev_relevance
             + w5 × access_frequency
 ```
 
-权重可配置，默认偏向 JEV 判断。
+权重可配置（`config.json` 的 `recall.weights`），默认偏向 JEV 判断。
+实现口径：`w.relevance×jev_relevance + w.vector×vector_sim + w.topic×主题命中 + w.importance×importance + w.recency×时近性`，
+缺省 `0.55 / 0.15 / 0.1 / 0.15 / 0.05`。权重只改**排序**，不改谁能进候选（那是阈值的事）。
+给了 J15 的 cited 数据之后，「哪个权重更值」才有依据可调。
 
 ### 10.3 检索策略选择
 

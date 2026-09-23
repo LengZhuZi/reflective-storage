@@ -56,9 +56,30 @@ export interface LoadedConfig {
   judge: JudgeConfig;
   inject: InjectConfig;
   lifecycle: LifecycleConfig;
+  recall: RecallConfig;
   /** 读取时发现的问题。降级时必须把这些说出去，不能静默（§6.2）。 */
   problems: string[];
 }
+
+/**
+ * 混合排序的权重（§10.2：`final_score = w1×jev_relevance + w2×vector + …`，默认偏向 JEV）。
+ * 以前写死在代码里，现在可配 —— 有了 J15 的 cited 数据，「哪个权重更值」就有依据了。
+ */
+export interface RecallWeights {
+  relevance: number;
+  vector: number;
+  topic: number;
+  importance: number;
+  recency: number;
+}
+
+export interface RecallConfig {
+  weights: RecallWeights;
+}
+
+export const DEFAULT_RECALL_WEIGHTS: RecallWeights = {
+  relevance: 0.55, vector: 0.15, topic: 0.1, importance: 0.15, recency: 0.05,
+};
 
 /**
  * 生命周期开关（§9）。
@@ -125,7 +146,25 @@ export function loadConfig(): LoadedConfig {
     judge: resolveJudge(judge, config),
     inject: resolveInject(file?.inject),
     lifecycle: resolveLifecycle(file?.lifecycle),
+    recall: resolveRecall(file?.recall),
     problems,
+  };
+}
+
+/** 召回权重。只从配置文件读；缺项或给了非法值就按默认。 */
+function resolveRecall(raw: unknown): RecallConfig {
+  const file = (raw ?? {}) as Record<string, unknown>;
+  const w = (file.weights ?? {}) as Record<string, unknown>;
+  const num = (v: unknown, fallback: number): number =>
+    typeof v === "number" && Number.isFinite(v) && v >= 0 ? v : fallback;
+  return {
+    weights: {
+      relevance: num(w.relevance, DEFAULT_RECALL_WEIGHTS.relevance),
+      vector: num(w.vector, DEFAULT_RECALL_WEIGHTS.vector),
+      topic: num(w.topic, DEFAULT_RECALL_WEIGHTS.topic),
+      importance: num(w.importance, DEFAULT_RECALL_WEIGHTS.importance),
+      recency: num(w.recency, DEFAULT_RECALL_WEIGHTS.recency),
+    },
   };
 }
 

@@ -203,6 +203,34 @@ await recallFlow("影子太黑怎么调亮", {
 assert.ok(!seenOther.includes(topicMem.id), "没提到的主题不许硬塞进来");
 console.log("✓ J6：同主题那一路参与召回（查表捞候选，相关性仍然 J7 说了算）");
 
+// ------------------------------------------------------------ §10.2 权重可配
+// 造一对「JEV 说 A 更相关、向量说 B 更像」的候选，看权重换了排序跟不跟着换。
+const wA = insertMemory(project, { content: "灰度发布先 5% 再全量，别一次推完", type: "procedure", scope: "project", scopeId: "P" });
+const wB = insertMemory(project, { content: "认证走 OIDC，token 有效期 30 分钟", type: "fact", scope: "project", scopeId: "P" });
+putEmbedding(project, wB.id, await embed(wB.content));
+const wq = "认证走 OIDC";
+const relMap = { [wA.id]: 0.9, [wB.id]: 0.5 };
+const mapAdapter = {
+  relevanceThreshold: 0.5,
+  async judgeRelevance(_q: string, c: Array<{ id: string }>) {
+    return {
+      relevance: new Map(c.map((x) => [x.id, relMap[x.id as keyof typeof relMap] ?? 0.6])),
+      blocked: new Set(),
+      meta: { gate: "J7", fallbackUsed: "none", status: "ok", latencyMs: 0 },
+    };
+  },
+  async judgeInjection(_q: string, c: Array<{ id: string }>) {
+    return { decisions: new Map(c.map((x) => [x.id, "skip" as const])), meta: { gate: "J8", fallbackUsed: "none", status: "ok", latencyMs: 0 } };
+  },
+} as never;
+const { DEFAULT_RECALL_WEIGHTS } = await import("../src/config.ts");
+const byDefault = await recallFlow(wq, { projectDb: project, globalDb: global, session, adapter: mapAdapter, weights: DEFAULT_RECALL_WEIGHTS });
+assert.equal(byDefault.candidates[0].memory.id, wA.id, "默认权重偏向 JEV：它说更相关的那条排前面");
+const byVector = await recallFlow(wq, { projectDb: project, globalDb: global, session, adapter: mapAdapter, weights: { relevance: 0, vector: 1, topic: 0, importance: 0, recency: 0 } });
+assert.equal(byVector.candidates[0].memory.id, wB.id, "把权重全给向量，排序就跟着向量走（同一批数据、同一个 J7）");
+assert.equal(byDefault.candidates.length, byVector.candidates.length, "权重只改排序，不改谁进得来（那是阈值的事）");
+console.log("✓ §10.2 权重可配：默认偏向 JEV，换成「只看向量」排序跟着改");
+
 // ------------------------------------------------------------ J14a：边界屏蔽（不是低分）
 const gBlocked = insertMemory(global, { content: "用户喜欢用 vim，所有项目都一样", type: "preference", scope: "global", scopeId: null });
 const blockingAdapter = {

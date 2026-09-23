@@ -17,6 +17,7 @@
  */
 
 import type { MemoryNode, SessionInfo, TokenBudget } from "../core/types.ts";
+import { DEFAULT_RECALL_WEIGHTS, type RecallWeights } from "../config.ts";
 import type { JevAdapter } from "../jev/adapter.ts";
 import { MAX_CANDIDATES } from "../jev/adapter.ts";
 import type { JudgeMeta } from "../jev/types.ts";
@@ -66,6 +67,8 @@ export interface RecallDeps {
   budget?: TokenBudget;
   /** 候选上限，默认 MAX_CANDIDATES。 */
   limit?: number;
+  /** §10.2 的混合排序权重。不给就用默认（偏向 JEV 判断）。 */
+  weights?: RecallWeights;
 }
 
 export interface Recalled {
@@ -219,13 +222,16 @@ function preScore(c: Candidate, now: number): number {
     + 0.15 * recency(c.memory, now);
 }
 
-/** §10.2 混合排序。0.6 给 JEV：它是唯一真的看过 query 的那一项。 */
-function finalScore(relevance: number, c: Candidate, now: number): number {
-  return 0.55 * relevance
-    + 0.15 * c.vectorSim
-    + 0.1 * (c.sources.has("topic") ? 1 : 0)
-    + 0.15 * c.memory.importance
-    + 0.05 * recency(c.memory, now);
+/**
+ * §10.2 混合排序。默认权重把最大的一项给 JEV relevance —— 它是唯一真的看过 query 的
+ * 那一项。权重可配（DESIGN §10.2 说的「权重可配置，默认偏向 JEV 判断」）。
+ */
+function finalScore(relevance: number, c: Candidate, now: number, w: RecallWeights): number {
+  return w.relevance * relevance
+    + w.vector * c.vectorSim
+    + w.topic * (c.sources.has("topic") ? 1 : 0)
+    + w.importance * c.memory.importance
+    + w.recency * recency(c.memory, now);
 }
 
 const STATUS_RANK = { ok: 0, degraded: 1, unavailable: 2 } as const;
@@ -298,7 +304,7 @@ async function runRecall(query: string, deps: RecallDeps): Promise<RecallResult>
     .filter((c) => !blocked.has(c.memory.id))
     .map((c) => {
       const relevance = j7.relevance.get(c.memory.id) ?? 0;
-      return { memory: c.memory, relevance, score: finalScore(relevance, c, now) };
+      return { memory: c.memory, relevance, score: finalScore(relevance, c, now, deps.weights ?? DEFAULT_RECALL_WEIGHTS) };
     })
     .sort((a, b) => b.score - a.score);
 

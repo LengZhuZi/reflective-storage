@@ -18,7 +18,7 @@ import { Type } from "typebox";
 import type { JudgeMeta } from "./src/jev/types.ts";
 import type { MemoryNode, SessionInfo } from "./src/core/types.ts";
 import { createJudgeAdapter, type JevAdapter } from "./src/jev/adapter.ts";
-import { loadConfig, proxyHint, type InjectConfig } from "./src/config.ts";
+import { loadConfig, proxyHint, type InjectConfig, type RecallWeights } from "./src/config.ts";
 import {
   addTrace, countMemories, countPendingReviews, distinctTopics, getMemory, hardDelete, listInScope,
   openGlobalDb, openProjectDb, projectIdFor, recentRecalls, resolveReview, setTopic, tracesFor,
@@ -44,6 +44,8 @@ interface Runtime {
   digested: Set<string>;
   /** 本会话的注入策略（config.inject）。 */
   inject: InjectConfig;
+  /** §10.2 的混合排序权重。 */
+  weights: RecallWeights;
   /** 配置读取时发现的问题（文件缺失 / 权限不对 / 解析失败），/memory 要能看见。 */
   configProblems: string[];
   /** 本会话用哪个判断引擎（rules / jev / openai），/memory 要能看见。 */
@@ -276,6 +278,7 @@ export default function reflectiveStorage(pi: ExtensionAPI): void {
       globalDb,
       adapter: createJudgeAdapter(judge),
       engine: judge.provider,
+      weights: loaded.recall.weights,
       proxyHint: hint,
       inject: loaded.inject,
       session: {
@@ -372,6 +375,7 @@ export default function reflectiveStorage(pi: ExtensionAPI): void {
         adapter: r.adapter,
         session: r.session,
         budget: { maxTokens: DEFAULT_MAX_TOKENS },
+        weights: r.weights,
       });
       r.lastRecall = {
         status: res.status, candidates: res.candidates.length,
@@ -468,6 +472,7 @@ export default function reflectiveStorage(pi: ExtensionAPI): void {
       if (!r) throw new Error("记忆库未打开（没有活动会话）");
       const res = await recallFlow(params.query, {
         projectDb: r.projectDb, globalDb: r.globalDb, adapter: r.adapter, session: r.session,
+        weights: r.weights,
       });
       r.lastRecall = { status: res.status, candidates: res.candidates.length, injected: res.injected.length, detail: res.detail, at: Date.now() };
       if (res.candidates.length === 0) {
@@ -575,6 +580,7 @@ export default function reflectiveStorage(pi: ExtensionAPI): void {
       if (sub === "search" && tail) {
         const res = await recallFlow(tail, {
           projectDb: r.projectDb, globalDb: r.globalDb, adapter: r.adapter, session: r.session,
+          weights: r.weights,
         });
         ctx.ui.notify(
           res.candidates.length === 0

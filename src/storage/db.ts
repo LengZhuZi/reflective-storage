@@ -265,6 +265,9 @@ export function putEmbedding(o: OpenedDb, memoryId: string, vec: number[]): bool
 /**
  * 作用域硬过滤（DESIGN.md §11.2）。JEV 的判断是建议，这行 SQL 才是门禁：
  * 它必须在自己这一层挡住跨项目记忆，不能先跨项目召回再逐条让 JEV 判断。
+ *
+ * 排序都带 rowid 兜底：同一毫秒内插入的多条记忆 created_at 完全相同，只按时间排的话
+ * 「最近 N 条」是不确定的（实测让一条本该落选的记忆随机挤进候选）。
  */
 export function listInScope(o: OpenedDb, scope: MemoryScope, scopeId: string | null, limit = 200): MemoryNode[] {
   const rows = o.db
@@ -272,7 +275,7 @@ export function listInScope(o: OpenedDb, scope: MemoryScope, scopeId: string | n
       `SELECT * FROM memories
         WHERE state IN ('active','cold')
           AND ((scope = ? AND scope_id IS ?) OR scope = 'global')
-        ORDER BY created_at DESC LIMIT ?`,
+        ORDER BY created_at DESC, rowid DESC LIMIT ?`,
     )
     .all(scope, scopeId, limit) as Row[];
   return rows.map(toNode);
@@ -453,7 +456,7 @@ export function memoriesByTopic(o: OpenedDb, topic: string, limit = 30): MemoryN
     .prepare(
       `SELECT * FROM memories
         WHERE topic = ? AND state IN ('active','cold')
-        ORDER BY COALESCE(last_accessed, created_at) DESC LIMIT ?`,
+        ORDER BY COALESCE(last_accessed, created_at) DESC, rowid DESC LIMIT ?`,
     )
     .all(topic, limit) as Row[];
   return rows.map(toNode);
@@ -525,7 +528,7 @@ export function listByStates(o: OpenedDb, states: readonly MemoryState[], limit 
   const rows = o.db
     .prepare(
       `SELECT * FROM memories WHERE state IN (${marks})
-        ORDER BY last_accessed ASC NULLS FIRST, created_at ASC LIMIT ?`,
+        ORDER BY last_accessed ASC NULLS FIRST, created_at ASC, rowid ASC LIMIT ?`,
     )
     .all(...states, limit) as Row[];
   return rows.map(toNode);

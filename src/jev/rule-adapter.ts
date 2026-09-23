@@ -39,7 +39,8 @@ export function createRuleAdapter(relevanceThreshold: number = RULE_RELEVANCE_TH
         // 没有模型就没法判断语义冲突，一律新建 —— 并存比误删安全（§6.1）。
         relation: ruleRelation(),
         targetId: null,
-        topic: null,   // 规则档不猜主题（没有判断力），留空等用户起名
+        topic: null,          // 规则档不猜主题（没有判断力），留空等用户起名
+        ownerProject: null,   // 也不猜「这条属于哪个项目」
         meta: meta("J1+J2+J3(rules)"),
       };
     },
@@ -61,6 +62,15 @@ export function createRuleAdapter(relevanceThreshold: number = RULE_RELEVANCE_TH
       // 的相同片段才算确凿用上。这也是引擎不可用时 feedback.ts 的兜底 —— 同一份口径。
       const cited = new Set(injected.filter((m) => longestSharedRun(m.content, reply) >= CITED_RUN).map((m) => m.id));
       return { cited, meta: meta("J15(rules)") };
+    },
+
+    async judgeRoute() {
+      // 规则档不做上层路由：判「这句话提到哪个别的项目/主题」需要真读语义。
+      // 保守方向 = 只在当前项目里找、不限主题（与引擎不可用时同一个方向）。
+      return Object.assign(
+        { projects: new Set<string>(), topics: new Set<string>() },
+        { meta: meta("J5-route(rules)") },
+      );
     },
 
     async judgeMerge(_memory, candidates) {

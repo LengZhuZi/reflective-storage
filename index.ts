@@ -29,6 +29,7 @@ import { recallFlow, worthRecalling } from "./src/pipeline/recall.ts";
 import { resurrectFor, runLifecycle } from "./src/pipeline/lifecycle.ts";
 import { closeFeedbackLoop } from "./src/pipeline/feedback.ts";
 import { startUi, type UiHandles } from "./src/ui/server.ts";
+import { openDb, projectDbFile } from "./src/storage/db.ts";
 import {
   RESOLUTION_LABELS, SCOPE_WIDEN, applyResolution, labelToResolution, pendingItems, widenScopeToGlobal,
 } from "./src/pipeline/review.ts";
@@ -284,6 +285,38 @@ export default function reflectiveStorage(pi: ExtensionAPI): void {
   let rt: Runtime | null = null;
   /** 本地页面面板。按需启动（/memory ui），session_shutdown 关掉 —— 工厂里不起长驻资源（§8.2）。 */
   let ui: UiHandles | null = null;
+  /** 跨项目引用时打开的别人的库（按 id 缓存，收尾统一关）。 */
+  const foreignDbs = new Map<string, OpenedDb>();
+  const openForeign = (projectId: string): OpenedDb | null => {
+    if (!projectId || projectId === rt?.session.projectId) return null;
+    const cached = foreignDbs.get(projectId);
+    if (cached) return cached;
+    try {
+      const db = openDb(projectDbFile(projectId));
+      foreignDbs.set(projectId, db);
+      return db;
+    } catch (e) {
+      rt && (rt.error = errText(e));
+      return null;
+    }
+  };
+  /** 上层路由的输入：别的项目（带线索）+ 主题。线索用注册表里的主题与最近标题。 */
+  const routeInputs = (): { projects: Array<{ id: string; hint: string }>; topics: string[] } => {
+    const g = rt?.globalDb;
+    if (!g) return { projects: [], topics: [] };
+    try {
+      const rows = listRegistry(g).filter((x) => x.projectId !== rt!.session.projectId);
+      return {
+        projects: rows.slice(0, 10).map((x) => ({
+          id: x.projectId,
+          hint: `${x.count} 条记忆${x.topics.length ? `，主题：${x.topics.slice(0, 4).join("/")}` : ""}${x.recent[0] ? `，最近：${x.recent[0].slice(0, 40)}` : ""}`,
+        })),
+        topics: [...new Set([...distinctTopics(rt!.projectDb, 20), ...distinctTopics(g, 20)])].slice(0, 20),
+      };
+    } catch {
+      return { projects: [], topics: [] };
+    }
+  };
 
   pi.on("session_start", async (_event, ctx) => {
     const projectDb = openProjectDb(ctx.cwd);
@@ -416,6 +449,8 @@ export default function reflectiveStorage(pi: ExtensionAPI): void {
         budget: { maxTokens: DEFAULT_MAX_TOKENS },
         weights: r.weights,
         perSourceLimit: r.perSourceLimit,
+        route: { enabled: true, ...routeInputs() },
+        openForeign,
       });
       r.lastRecall = {
         status: res.status, candidates: res.candidates.length,
@@ -466,7 +501,10 @@ export default function reflectiveStorage(pi: ExtensionAPI): void {
         const touched = [...r.touched];
         r.touched.clear();
         for (const piece of pieces) {
-          const res = await writeFlow(r.projectDb, r.globalDb, r.adapter, r.session, { userTexts: [piece], context, paths: touched });
+          const res = await writeFlow(r.projectDb, r.globalDb, r.adapter, r.session, {
+            userTexts: [piece], context, paths: touched,
+            projects: routeInputs().projects, openForeign,
+          });
           r.lastWrite = { action: res.action, reason: res.reason, at: Date.now() };
           if (res.status === "unavailable") warnProxy(r, ctx);
           firstReviewId ??= res.review?.[0]?.id ?? null;
@@ -552,7 +590,9 @@ export default function reflectiveStorage(pi: ExtensionAPI): void {
     if (!r) return;
     ui?.close();
     ui = null;
-    await r.pending;   // 待写队列必须落地，失败已经记在 r.error 里
+    await r.pending;
+    for (const db of foreignDbs.values()) db.close();
+    foreignDbs.clear();   // 待写队列必须落地，失败已经记在 r.error 里
     // 注册表再刷一次：会话开始时刷的是**进来时**的样子，这一轮写进来的记忆还没算上。
     // 派生数据、不花钱，所以两头都刷（否则第一次进一个项目时注册表永远是空的）。
     try {

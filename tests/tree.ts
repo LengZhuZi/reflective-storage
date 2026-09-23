@@ -120,6 +120,99 @@ linkPath(project, stale.id, "/src/old/legacy/thing");
 assert.ok(pathsFor(project, stale.id).includes("/src/old/legacy/thing"), "目录改名后老路径保留（孤儿要看得见，不猜着迁移）");
 console.log("✓ 目录改名后的孤儿路径保留（不做自动迁移）");
 
+// ------------------------------------------------------------ §10.6 上层路由 + 跨项目引用
+// 这是「跨项目」真正跑起来的地方：引擎说「这次问的是项目 Q」→ 才打开 Q 的库；
+// 候选回来还要过 J14a（适用吗）；写入可以路由回 Q 的库，两边留痕。
+{
+  const {
+    insertMemory: ins, putEmbedding: put, refreshRegistry: refresh, getMemory: getM,
+  } = await import("../src/storage/db.ts");
+  const foreign = openDb(path.join(tmp, "foreign.db"));
+  const qMem = ins(foreign, { content: "后端的按钮逻辑走 rule-engine，别在接口层里写 if", type: "fact", scope: "project", scopeId: "Q" });
+  put(foreign, qMem.id, await embed(qMem.content));
+  refresh(globalDb, foreign, "Q", "/code/Q/app");
+
+  const seen: string[] = [];
+  let routeMemo: { project: string; topic: string } | null = null;
+  const routed = {
+    relevanceThreshold: 0.5,
+    async judgeRelevance(_q: string, c: Array<{ id: string }>, _o?: unknown) {
+      seen.push(...c.map((x) => x.id));
+      return { relevance: new Map(c.map((x) => [x.id, 0.9])), blocked: new Set(), meta: { gate: "J7", fallbackUsed: "none", status: "ok", latencyMs: 0 } };
+    },
+    async judgeInjection(_q: string, c: Array<{ id: string }>) {
+      return { decisions: new Map(c.map((x) => [x.id, "inject" as const])), meta: { gate: "J8", fallbackUsed: "none", status: "ok", latencyMs: 0 } };
+    },
+    async judgeRoute(_q: string, o: { projects: Array<{ id: string }>; topics: string[] }) {
+      routeMemo = { project: o.projects[0]?.id ?? "", topic: o.topics[0] ?? "" };
+      return Object.assign(
+        { projects: new Set(["Q"]), topics: new Set<string>() },
+        { meta: { gate: "J5-route", fallbackUsed: "none", status: "ok", latencyMs: 1 } },
+      );
+    },
+  } as never;
+  const session = { sessionId: "s", cwd: CWD, projectId: "P", injectedIds: new Set<string>() };
+  const out = await recallFlow("后端里那个按钮的逻辑也改一下", {
+    projectDb: project, globalDb, adapter: routed, session,
+    route: { enabled: true, projects: [{ id: "Q", hint: "后端" }], topics: ["认证"] },
+    openForeign: () => foreign,
+    budget: { maxTokens: 800 },
+  });
+  assert.ok(routeMemo && routeMemo.project === "Q", "路由那一步要真的问引擎（项目 + 主题一起问）");
+  assert.ok(seen.includes(qMem.id), "引擎说这次问的是项目 Q → 才去打开 Q 的库捞候选（第七路）");
+  assert.ok(out.block.includes("项目:Q"), `注入块要标出来源（否则模型当成当前项目的规则），实际 ${out.block.slice(0, 120)}`);
+
+  // 引擎说「只在当前项目」→ 不许打开别人的库（门禁在触发条件上）
+  let opened = 0;
+  const localOnly = {
+    ...(routed as Record<string, unknown>),
+    async judgeRoute() {
+      return Object.assign(
+        { projects: new Set<string>(), topics: new Set<string>() },
+        { meta: { gate: "J5-route", fallbackUsed: "none", status: "ok", latencyMs: 1 } },
+      );
+    },
+  } as never;
+  await recallFlow("帮我把按钮改成圆角", {
+    projectDb: project, globalDb, adapter: localOnly, session,
+    route: { enabled: true, projects: [{ id: "Q", hint: "后端" }], topics: [] },
+    openForeign: () => { opened++; return foreign; },
+    budget: { maxTokens: 800 },
+  });
+  assert.equal(opened, 0, "引擎没提到别的项目时，不许打开别人的库");
+
+  // 跨项目写入：引擎判「这条属于 Q」→ 写进 Q 的库 + 两边留痕
+  const { writeFlow } = await import("../src/pipeline/write.ts");
+  const crossAdapter = {
+    async judgeWrite() {
+      return {
+        worthKeeping: { noul: 0.9 }, type: { choice: "fact", confidence: 0.9, probabilities: {} },
+        scope: { choice: "project", confidence: 0.9, probabilities: {} },
+        relation: { choice: "none", confidence: 0.9, probabilities: {} }, targetId: null,
+        topic: null, ownerProject: "Q",
+        meta: { gate: "J1+J2+J3", fallbackUsed: "none", status: "ok", latencyMs: 2 },
+      };
+    },
+    async judgeMerge() {
+      return Object.assign(new Map<string, number>(), { meta: { gate: "J11", fallbackUsed: "none", status: "ok", latencyMs: 0 } });
+    },
+  } as never;
+  const written = await writeFlow(project, globalDb, crossAdapter, session, {
+    userTexts: ["后端那个按钮的校验规则改成读配置"], context: "",
+    projects: [{ id: "Q", hint: "后端" }], openForeign: () => foreign,
+  });
+  assert.equal(written.action, "stored");
+  assert.equal(getM(project, written.memory!.id), null, "不该写进当前项目的库");
+  assert.ok(getM(foreign, written.memory!.id), "要写进 Q 的库");
+  assert.equal(getM(foreign, written.memory!.id)!.scopeId, "Q");
+  const crossTrace = project.db.prepare(`SELECT reason FROM reflection_traces WHERE action = 'cross_write'`).get() as Record<string, unknown>;
+  assert.match(String(crossTrace.reason), /写进了项目 Q 的库/, "跨项目写入要在**发起方**的库里留痕");
+  const ownerTrace = foreign.db.prepare(`SELECT gate FROM reflection_traces WHERE memory_id = ?`).get(written.memory!.id) as Record<string, unknown>;
+  assert.equal(ownerTrace.gate, "J1+J2+J3", "被写的那边照常留写入轨迹");
+  console.log("✓ §10.6 上层路由 + 跨项目引用（第七路）/ 跨项目写入（两边留痕）");
+  foreign.close();
+}
+
 project.close();
 other.close();
 globalDb.close();

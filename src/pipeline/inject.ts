@@ -23,14 +23,20 @@ export function escapeMemoryText(s: string): string {
   return s.replace(/</g, "\\u003c");
 }
 
-/** 一条记忆一行。id 露出来，用户才能照它删，模型才能引用。 */
-function line(m: MemoryNode): string {
-  return `- [${m.id}] (${m.type}) ${escapeMemoryText(m.content)}`;
+/**
+ * 一条记忆一行。id 露出来，用户才能照它删，模型才能引用。
+ * **来源要标出来**：跨项目引用来的记忆必须写清「这是哪个项目的」，否则模型会当成
+ * 当前项目的规则用（§11：跨项目污染最贵的那种错）。
+ */
+function line(m: MemoryNode, currentProjectId?: string | null): string {
+  const from = m.scope === "global" ? "global" : m.scopeId && currentProjectId && m.scopeId !== currentProjectId ? `项目:${m.scopeId}` : null;
+  const tag = from ? ` (${m.type} · ${from})` : ` (${m.type})`;
+  return `- [${m.id}]${tag} ${escapeMemoryText(m.content)}`;
 }
 
-export function buildInjectionBlock(memories: readonly MemoryNode[]): string {
+export function buildInjectionBlock(memories: readonly MemoryNode[], currentProjectId?: string | null): string {
   if (memories.length === 0) return "";
-  return [MEMORY_OPEN, ...memories.map(line), MEMORY_CLOSE].join("\n");
+  return [MEMORY_OPEN, ...memories.map((m) => line(m, currentProjectId)), MEMORY_CLOSE].join("\n");
 }
 
 /** 默认注入预算。DESIGN §8.6 说这块以后进 config.json，先写死一个放得下十几条中文记忆的值。 */

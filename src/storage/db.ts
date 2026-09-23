@@ -207,6 +207,11 @@ export function openDb(file: string): OpenedDb {
   return { db, file, vecEnabled, close: () => db.close() };
 }
 
+/** 某个项目库的文件路径（跨项目引用时按 id 打开用）。 */
+export function projectDbFile(projectId: string): string {
+  return path.join(ROOT, "projects", `${projectId}.db`);
+}
+
 export function openProjectDb(cwd: string): OpenedDb {
   return openDb(path.join(ROOT, "projects", `${projectIdFor(cwd)}.db`));
 }

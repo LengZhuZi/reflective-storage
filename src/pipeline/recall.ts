@@ -46,7 +46,7 @@ const PER_SOURCE_LIMIT = 50;
  * 看到它。所以先给每一路保底名额，再用 preScore 补满：宁可牺牲一点排序纯度，也不让某一路
  * 整体消失。
  */
-const QUOTA: ReadonlyArray<[Source, number]> = [["vector", 8], ["topic", 5], ["path", 3], ["keyword", 3]];
+const QUOTA: ReadonlyArray<[Source, number]> = [["vector", 8], ["topic", 5], ["cross", 4], ["path", 3], ["keyword", 3]];
 
 /**
  * 短于这个长度就不值得花一次召回（"继续"、"好"）。
@@ -57,7 +57,7 @@ const QUOTA: ReadonlyArray<[Source, number]> = [["vector", 8], ["topic", 5], ["p
  */
 const MIN_PROMPT = 6;
 
-export type Source = "vector" | "keyword" | "scope" | "topic" | "path";
+export type Source = "vector" | "keyword" | "scope" | "topic" | "path" | "cross";
 
 /** 候选池的一项：同一个 id 被多路召回时合并到一条。 */
 interface Candidate {
@@ -65,6 +65,12 @@ interface Candidate {
   sources: Set<Source>;
   /** 向量余弦，没走到这一路就是 0。只用来排序，不当阈值（§13.2）。 */
   vectorSim: number;
+}
+
+/** 上层路由的结果：要不要去别的项目找、限不限主题。 */
+export interface RouteHint {
+  projectId?: string;
+  topic?: string;
 }
 
 export interface RecallDeps {
@@ -83,6 +89,18 @@ export interface RecallDeps {
   weights?: RecallWeights;
   /** 每一路召回各取多少条（默认 50）。 */
   perSourceLimit?: number;
+  /**
+   * 上层路由（§10.6）。给了就在 gather 之前问一次引擎「这次提到哪个别的项目/主题」，
+   * 命中的那层去捞候选（跨项目 = 第七路）。不给 = 只按老办法（本地主题匹配）。
+   */
+  route?: {
+    enabled: boolean;
+    /** 别的项目：id + 一句话线索（注册表里的主题/最近标题）。 */
+    projects: Array<{ id: string; hint: string }>;
+    topics: string[];
+  };
+  /** 按 id 打开别的项目库（调用方负责缓存与关闭）。跨项目引用/写入都走它。 */
+  openForeign?: (projectId: string) => OpenedDb | null;
 }
 
 export interface Recalled {
@@ -159,9 +177,10 @@ export interface CandidateDeps {
   session: SessionInfo;
   limit?: number;
   perSourceLimit?: number;
+  openForeign?: (projectId: string) => OpenedDb | null;
 }
 
-async function gather(query: string, deps: CandidateDeps): Promise<Map<string, Candidate>> {
+async function gather(query: string, deps: CandidateDeps, route: RouteHint = {}): Promise<Map<string, Candidate>> {
   const pool = new Map<string, Candidate>();
   const per = deps.perSourceLimit ?? PER_SOURCE_LIMIT;
 
@@ -194,6 +213,24 @@ async function gather(query: string, deps: CandidateDeps): Promise<Map<string, C
     }
   } catch {
     // 主题那一路只是加分项：查不到就少一路候选，不影响其他路
+  }
+
+  // 上层路由命中的主题（JEV 判的，比本地二字组匹配准）
+  if (route.topic) {
+    for (const m of memoriesByTopic(deps.projectDb, route.topic, per)) remember(pool, m, "topic");
+    for (const m of memoriesByTopic(deps.globalDb, route.topic, per)) remember(pool, m, "topic");
+  }
+
+  // 跨项目那一路（第七路）：只有在**引擎判定这次提问是关于那个项目**时才会打开它的库。
+  // 打开别人的库是「门禁」层面的事，所以这里的触发条件必须是显式的语义判断，
+  // 不能靠本地字符串猜。候选回来之后还要过 J14a 的适用性判断（见 judgeRelevance）。
+  if (route.projectId && deps.openForeign) {
+    try {
+      const foreign = deps.openForeign(route.projectId);
+      if (foreign) for (const m of listInScope(foreign, "project", route.projectId, per)) remember(pool, m, "cross");
+    } catch {
+      // 打不开就当没有这一路
+    }
   }
 
   // 路径那一路（第六路）：提问里出现文件路径（`login.ts`、`src/backend/auth`）时，
@@ -245,6 +282,7 @@ function preScore(c: Candidate, now: number, query: string): number {
     + 0.25 * lexical                            // 字面对得上：一堆近似记忆里唯一能分开它们的本地信号
     + 0.1 * (c.sources.has("keyword") ? 1 : 0)
     + 0.15 * (c.sources.has("topic") || c.sources.has("path") ? 1 : 0)   // 主题/路径命中：确定性的分组
+    + 0.1 * (c.sources.has("cross") ? 1 : 0)                             // 跨项目命中：引擎明确说了才可能有
     + 0.15 * c.memory.importance
     + 0.05 * recency(c.memory, now);
 }
@@ -285,7 +323,9 @@ export async function recallFlow(query: string, deps: RecallDeps): Promise<Recal
  * `query` 只用于算字面覆盖（粗筛里唯一对中文有效的本地信号）。
  */
 function rank(pool: Map<string, Candidate>, session: SessionInfo, limit: number, now: number, query: string): Candidate[] {
-  const all = [...pool.values()].filter((c) => inScope(c.memory, session));
+  // 门禁：默认只放当前作用域的。**例外**是「跨项目」那一路 —— 它的前提是引擎明确说了
+  // 「这次问的是那个项目」（§10.6），放进来之后还要过 J14a 的适用性判断，最后才可能注入。
+  const all = [...pool.values()].filter((c) => inScope(c.memory, session) || c.sources.has("cross"));
   const score = (c: Candidate) => preScore(c, now, query);
   const seen = new Set<string>();
   const picked: Candidate[] = [];
@@ -323,7 +363,30 @@ export async function recallCandidates(query: string, deps: CandidateDeps): Prom
 async function runRecall(query: string, deps: RecallDeps): Promise<RecallResult> {
   const now = Date.now();
   const limit = deps.limit ?? MAX_CANDIDATES;
-  const pool = await gather(query, deps);
+
+  // 上层路由（§10.6）：一次调用里同时问「提到哪个别的项目」「是哪个主题」。
+  // 只有它说了才去开别人的库、才按主题捞 —— 这两件事都算「门禁」层面，不能本地猜。
+  const route: RouteHint = {};
+  if (deps.route?.enabled) {
+    try {
+      const j = await deps.adapter.judgeRoute(query, {
+        projects: deps.route.projects,
+        topics: deps.route.topics,
+        currentProject: deps.session.projectId,
+      });
+      route.projectId = [...j.projects][0];
+      route.topic = [...j.topics][0];
+      addTrace(deps.projectDb, {
+        stage: "recall", gate: "J5-route", action: route.projectId || route.topic ? "keep" : "skip",
+        reason: `项目=${route.projectId ?? "当前"} 主题=${route.topic ?? "不限"}`,
+        status: j.meta.status, fallbackUsed: j.meta.fallbackUsed, latencyMs: j.meta.latencyMs,
+      });
+    } catch {
+      // 路由失败就当没路由（保守：只在当前项目、不限主题）
+    }
+  }
+
+  const pool = await gather(query, deps, route);
 
   // 已注入过的先删：这些 id 不重复判断也不重复付费（§8.3）
   for (const id of deps.session.injectedIds) pool.delete(id);
@@ -395,6 +458,6 @@ async function runRecall(query: string, deps: RecallDeps): Promise<RecallResult>
     injected: picked,
     status: worst(j7.meta.status, j8.meta.status),
     detail: j7.meta.detail ?? j8.meta.detail,
-    block: buildInjectionBlock(picked.map((r) => r.memory)),
+    block: buildInjectionBlock(picked.map((r) => r.memory), deps.session.projectId),
   };
 }

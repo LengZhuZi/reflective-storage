@@ -19,7 +19,8 @@ import { LlmClient } from "./llm.ts";
 import { createRuleAdapter, RULE_RELEVANCE_THRESHOLD } from "./rule-adapter.ts";
 import { ruleRelation, ruleRelevance, ruleScope, ruleType, ruleWorthKeeping, sameTopic } from "./rule.ts";
 import type {
-  CitationJudgment, InjectionJudgment, Judged, NoulResult, ProactiveJudgment, RecallJudgment, WriteJudgment,
+  CitationJudgment, InjectionJudgment, Judged, NoulResult, ProactiveJudgment, RecallJudgment, RouteJudgment,
+  WriteJudgment,
 } from "./types.ts";
 
 /**
@@ -68,9 +69,24 @@ export interface JevAdapter {
    */
   readonly relevanceThreshold: number;
   /** J1 + J2 + J3 + J4，一次调用。`topics` 是现有主题，引擎只能在里面选。 */
-  judgeWrite(content: string, context: string, candidates: MemoryNode[], topics?: readonly string[]): Promise<Judged<WriteJudgment>>;
+  judgeWrite(
+    content: string,
+    context: string,
+    candidates: MemoryNode[],
+    topics?: readonly string[],
+    /** 别的项目（id + 线索）。引擎可以判定「这条记忆属于那个项目」。 */
+    projects?: Array<{ id: string; hint: string }>,
+  ): Promise<Judged<WriteJudgment>>;
   /** J5。 */
   judgeRecallNeed(utterance: string, session: SessionInfo): Promise<Judged<NoulResult>>;
+  /**
+   * 记忆树的上层路由（§10.6）：这次提问提到哪个**别的项目**、哪个**主题**。
+   * 两个问题都在同一次调用里问（多问不涨价）。项目/主题都没有 → 只在当前项目、不限主题。
+   */
+  judgeRoute(
+    query: string,
+    options: { projects: Array<{ id: string; hint: string }>; topics: string[]; currentProject: string },
+  ): Promise<Judged<RouteJudgment>>;
   /** J7 + J14a（global 记忆在当前项目适不适用，边界才问）。`projectId` 给边界判断用。 */
   judgeRelevance(query: string, candidates: MemoryNode[], opts?: { projectId?: string }): Promise<Judged<RecallJudgment>>;
   /** J8。query 必须传进来 —— J8 问的是「这条记忆对**眼下这件事**有没有用」，
@@ -151,7 +167,7 @@ export function createJevAdapter(client: JudgeClient, opts: JudgeTimeouts = {}):
   return {
     relevanceThreshold: opts.relevanceThreshold ?? 0.7,
 
-    async judgeWrite(content, context, candidates, topics = []): Promise<Judged<WriteJudgment>> {
+    async judgeWrite(content, context, candidates, topics = [], projects = []): Promise<Judged<WriteJudgment>> {
       const t0 = Date.now();
       const state =
         `NEW CONTENT:\n${content}\n\n` +
@@ -202,6 +218,19 @@ export function createJevAdapter(client: JudgeClient, opts: JudgeTimeouts = {}):
           instructions: "If the NEW CONTENT extends, supersedes or contradicts an existing memory, which one",
           criteria: Object.fromEntries([["none", "No existing memory, or relation is none"], ...candidates.map((m) => [m.id, m.content.slice(0, 120)])]),
         },
+        // 跨项目：内容明显是在说**另一个项目**的事时，可以判到那个项目头上（写进它的库）。
+        ...(projects.length
+          ? {
+              owner_project: {
+                type: "choice" as const,
+                instructions: "Which project does the NEW CONTENT belong to",
+                criteria: Object.fromEntries([
+                  ["current", "The project this session is in"],
+                  ...projects.map((p) => [p.id, p.hint]),
+                ]),
+              },
+            }
+          : {}),
         // J4：只让引擎在**已有主题**里挑，不给它生成新词的权力（原则 1）。
         // 一个都不合适就选 none —— 之后由用户来起名（走待确认队列），系统不自己造。
         topic: {
@@ -223,6 +252,7 @@ export function createJevAdapter(client: JudgeClient, opts: JudgeTimeouts = {}):
         const relation = choiceOf(res.answers.relation, ["none", "extends", "supersedes", "contradicts"]) as Relation | null;
         const target = choiceOf(res.answers.target, ["none", ...candidates.map((m) => m.id)]);
         const topic = choiceOf(res.answers.topic, ["none", ...topics]);
+        const owner = projects.length ? choiceOf(res.answers.owner_project, ["current", ...projects.map((p) => p.id)]) : "current";
 
         return {
           worthKeeping: { noul: num(res.answers.worth_keeping, "noul") },
@@ -231,6 +261,7 @@ export function createJevAdapter(client: JudgeClient, opts: JudgeTimeouts = {}):
           relation: { choice: relation ?? "none", confidence: confidenceOf(res.answers.relation), probabilities: probabilitiesOf(res.answers.relation) },
           targetId: relation && relation !== "none" && target && target !== "none" ? target : null,
           topic: topic && topic !== "none" ? topic : null,
+          ownerProject: owner && owner !== "current" ? owner : null,
           meta: okMeta("J1+J2+J3", res, questions, t0),
         };
       } catch (e) {
@@ -240,7 +271,7 @@ export function createJevAdapter(client: JudgeClient, opts: JudgeTimeouts = {}):
         return {
           worthKeeping: ruleWorthKeeping(content),
           // 规则档不猜主题（它没有判断力）：留空，等用户起名。
-          type, scope, relation: ruleRelation(), targetId: null, topic: null,
+          type, scope, relation: ruleRelation(), targetId: null, topic: null, ownerProject: null,
           meta: degradation("J1+J2+J3", e, t0, "JEV 不可用，已按规则写入"),
         };
       }
@@ -302,7 +333,11 @@ export function createJevAdapter(client: JudgeClient, opts: JudgeTimeouts = {}):
       // J14a：只对 global 记忆问边界问题（§11.1 的三个例子之一）。项目的和本会话的
       // 记忆已经被 SQL 那层门禁管住了，不需要再问；而 global 是唯一「谁都能看见、
       // 但未必都适用」的那类。多问不涨价（§5.1），跟在 J7 同一次调用里。
-      const globals = capped.filter((m) => m.scope === "global");
+      // J14a 只问「可能不该用在这里」的那些：global（谁都能看见）和**别的项目**的
+      // （跨项目引用是引擎自己提出来的，但适用不适用还得再过一道，§11.3）。
+      const globals = capped.filter(
+        (m) => m.scope === "global" || (opts.projectId != null && m.scopeId != null && m.scopeId !== opts.projectId),
+      );
       const state =
         `CURRENT REQUEST:\n${query}\n\n` +
         (opts.projectId ? `CURRENT PROJECT: ${opts.projectId}\n\n` : "") +
@@ -348,6 +383,54 @@ export function createJevAdapter(client: JudgeClient, opts: JudgeTimeouts = {}):
         // §11.3 说的「JEV 挂了隔离不能跟着失效」靠的就是那层。
         for (const m of capped) relevance.set(m.id, ruleRelevance(query, m));
         return { relevance, blocked, meta: degradation("J7", e, t0, "JEV 不可用，已退回关键词打分") };
+      }
+    },
+
+    async judgeRoute(query, options): Promise<Judged<RouteJudgment>> {
+      const t0 = Date.now();
+      const projects = new Set<string>();
+      const topics = new Set<string>();
+      if (options.projects.length === 0 && options.topics.length === 0) {
+        return Object.assign({ projects, topics }, {
+          meta: { gate: "J5-route", fallbackUsed: "none" as const, status: "ok" as const, latencyMs: 0 },
+        });
+      }
+      const state =
+        `CURRENT PROJECT: ${options.currentProject}\n\n` +
+        `OTHER PROJECTS THE USER HAS MEMORIES FOR:\n` +
+        (options.projects.map((p) => `- ${p.id}: ${p.hint}`).join("\n") || "(none)") +
+        `\n\nTOPICS:\n` + (options.topics.join(", ") || "(none)") +
+        `\n\nCURRENT REQUEST:\n${query}`;
+      const questions: Questions = {
+        ...(options.projects.length
+          ? {
+              project: {
+                type: "choice" as const,
+                instructions: "The CURRENT REQUEST is about one of the OTHER PROJECTS listed (the user is asking about that project, not the current one)",
+                criteria: Object.fromEntries([["none", "No, only about the current project"], ...options.projects.map((p) => [p.id, p.hint])]),
+              },
+            }
+          : {}),
+        ...(options.topics.length
+          ? {
+              topic: {
+                type: "choice" as const,
+                instructions: "Which topic is the CURRENT REQUEST about",
+                criteria: Object.fromEntries([["none", "Not about any of these topics"], ...options.topics.map((t) => [t, t])]),
+              },
+            }
+          : {}),
+      };
+      try {
+        const res = await client.ask(state, questions, { timeoutMs: fast });
+        const proj = choiceOf(res.answers.project, ["none", ...options.projects.map((p) => p.id)]);
+        if (proj && proj !== "none") projects.add(proj);
+        const topic = choiceOf(res.answers.topic, ["none", ...options.topics]);
+        if (topic && topic !== "none") topics.add(topic);
+        return Object.assign({ projects, topics }, { meta: okMeta("J5-route", res, questions, t0) });
+      } catch (e) {
+        // 降级：不跨项目、不限主题（保守方向 —— 只在当前项目里找，宁少勿滥）
+        return Object.assign({ projects, topics }, { meta: degradation("J5-route", e, t0, "JEV 不可用，只在当前项目里找") });
       }
     },
 

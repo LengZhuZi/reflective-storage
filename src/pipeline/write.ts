@@ -83,6 +83,10 @@ export interface TurnInput {
   userTexts: string[];
   /** 本轮碰过的文件（来自 pi 的 tool call）。给记忆挂树路径用（tree.ts）。 */
   paths?: string[];
+  /** 别的项目（id + 线索），让引擎可以判定「这条属于那个项目」（跨项目写入）。 */
+  projects?: Array<{ id: string; hint: string }>;
+  /** 按 id 打开别的项目库（调用方缓存 + 收尾关闭）。返回 null 表示这次不跨项目写。 */
+  openForeign?: (projectId: string) => OpenedDb | null;
   /** 供 JEV 判断用的对话上下文（可以包含助手的话，但同样要洗凭据）。 */
   context: string;
 }
@@ -175,7 +179,9 @@ export async function writeFlow(
   // J3 需要候选：**跟这条内容最相关的**旧记忆，不是「最近入库的 20 条」。
   // 走召回那套多路召回（向量 + FTS5 + 作用域），并且带上 global 库 —— 用「最近 20 条」的话，
   // 一条很久以前的矛盾记忆永远进不了候选，冲突检测就是失灵的。
-  const candidates = await recallCandidates(content, { projectDb, globalDb, session, limit: MAX_CANDIDATES });
+  const candidates = await recallCandidates(content, {
+    projectDb, globalDb, session, limit: MAX_CANDIDATES, openForeign: input.openForeign,
+  });
 
   // 先查重再调 JEV：完全重复的一句话不该再花一次判断，也不该再占一条预算。
   // 已经在候选里的记忆比对，不额外查库。
@@ -192,7 +198,7 @@ export async function writeFlow(
   // J4：把**现有主题**给引擎，让它只在里面挑（它不许生成新词）。项目库和全局库的主题
   // 合起来给 —— 主题是跨库的分组，不是作用域。
   const topics = [...new Set([...distinctTopics(projectDb), ...distinctTopics(globalDb)])].slice(0, 30);
-  const j = await adapter.judgeWrite(content, redact(input.context), candidates, topics);
+  const j = await adapter.judgeWrite(content, redact(input.context), candidates, topics, input.projects ?? []);
 
   // §6.1 fail-open：引擎「不可用」时**不卡写入闸** —— 丢一条记忆的代价大于存一条噪声。
   // （原来的写法是先算 worth_keeping 再比阈值，于是引擎挂了、规则兜底给出 0.2，
@@ -215,13 +221,18 @@ export async function writeFlow(
   const resolved = resolveScope(j.scope.choice, j.scope.confidence, ruleScope(j.type.choice).choice);
 
   // 作用域决定落哪个库：偏好之类跨项目的进 global，其余进当前项目。
-  const target = resolved.scope === "global" ? globalDb : projectDb;
+  // 例外：引擎判定这条属于**别的项目**（跨项目写入）→ 写进那个项目的库，
+  // 并且两边留痕（用户指出过：在前端会话里发现后端问题就该能改，不能只读）。
+  const foreign = j.ownerProject ? input.openForeign?.(j.ownerProject) ?? null : null;
+  const target = foreign ?? (resolved.scope === "global" ? globalDb : projectDb);
   const insert: InsertMemory = {
     content,
     type: j.type.choice,
-    scope: resolved.scope,
+    scope: foreign ? "project" : resolved.scope,
     topic: j.topic,
-    scopeId: resolved.scope === "project" ? session.projectId : resolved.scope === "session" ? session.sessionId : null,
+    scopeId: foreign
+      ? j.ownerProject!
+      : resolved.scope === "project" ? session.projectId : resolved.scope === "session" ? session.sessionId : null,
     // 引擎不可用时照存，但压成低重要性（见上面 fail-open 的说明）
     importance: unavailable ? FAIL_OPEN_IMPORTANCE : j.worthKeeping.noul,
     source: session.sessionId,
@@ -298,6 +309,14 @@ export async function writeFlow(
     ...mergeAsk,
   ];
 
+  if (foreign) {
+    // 跨项目写入：两边的库里都留痕，谁在哪个项目里改的、因为什么，以后查得到。
+    addTrace(projectDb, {
+      memoryId: memory.id, stage: "governance", gate: "J17-scope", action: "cross_write",
+      reason: `写进了项目 ${j.ownerProject} 的库（本会话在 ${session.projectId}）`,
+      status: j.meta.status,
+    });
+  }
   addTrace(target, {
     memoryId: memory.id, stage: "write", gate: j.meta.gate, action: "keep",
     targetId: j.targetId, reason: `${j.type.choice}/${j.scope.choice} → ${resolved.scope}（${j.type.confidence.toFixed(2)}/${j.scope.confidence.toFixed(2)}，候选 ${candidates.length}）`,

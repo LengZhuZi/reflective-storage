@@ -54,6 +54,12 @@ export interface WriteJudgment {
    * 给记忆起名是生成，§15 原则 1 不让引擎干这件事。
    */
   topic: string | null;
+  /**
+   * 这条记忆属于**别的项目**时给它的 projectId（跨项目写入）。
+   * 写进那个项目的库，并在两边都留痕 —— 硬规则不是「不许跨项目写」，
+   * 而是「不许在原库里悄悄改」（用户明确指出：发现后端问题就得能改）。
+   */
+  ownerProject?: string | null;
   /** J3 选中的旧记忆 id（relation === "none" 时为空）。 */
   targetId: string | null;
 }

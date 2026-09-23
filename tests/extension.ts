@@ -57,9 +57,12 @@ const runCommand = (args: string) => commands.get("memory")!.handler(args, ctx);
 
 const realFetch = globalThis.fetch;
 let lastState = "";
+/** 上一句引擎看到的提问（用来诚实地回答「还是同一件事吗」）。 */
+let lastSeenPrompt = "";
 const jevFetch: typeof fetch = async (_url, init) => {
   const req = JSON.parse(String(init?.body)) as { questions: Record<string, { type: string }>; state?: string };
   lastState = String(req.state ?? "");
+  const asked = lastState.includes("NEW REQUEST:") ? lastState.split("NEW REQUEST:")[1]!.trim() : lastState.trim();
   const answers: Record<string, unknown> = {};
   for (const [key, q] of Object.entries(req.questions)) {
     if (key === "worth_keeping") answers[key] = { type: "noul", noul: 0.9 };
@@ -67,9 +70,14 @@ const jevFetch: typeof fetch = async (_url, init) => {
     else if (key === "memory_scope") answers[key] = { type: "choice", choice: "project", confidence: 0.9, probabilities: {} };
     else if (key === "relation") answers[key] = { type: "choice", choice: "none", confidence: 0.9, probabilities: {} };
     else if (key === "target") answers[key] = { type: "choice", choice: "none", confidence: 0.9, probabilities: {} };
+    // J5 现在每一句都问：太短的话它自己会说「不用查」（本地不再用长度规则兼职）；
+    // 「还是同一件事吗」按上一句如实回答。
+    else if (key === "need_recall") answers[key] = { type: "noul", noul: asked.replace(/\s+/g, "").length < 6 ? 0.2 : 0.9 };
+    else if (key === "new_topic") answers[key] = { type: "noul", noul: asked === lastSeenPrompt ? 0.1 : 0.9 };
     else if (q.type === "noul") answers[key] = { type: "noul", noul: 0.9 };
     else answers[key] = { type: "choice", choice: "inject", confidence: 0.9, probabilities: {} };
   }
+  if (req.questions.need_recall) lastSeenPrompt = asked;   // J5 每次都记下这一句，下次好答「还是同一件事吗」
   return new Response(JSON.stringify({ model: "jev-test", answers, usage: { input_tokens: 10, output_tokens: 5 } }), { status: 200 });
 };
 // 必须在 session_start 之前换掉：adapter 是在 session_start 里 new 出来的，
@@ -112,16 +120,15 @@ assert.ok(!first.message.content.includes("<system>"), "转义后不能留下可
 
 // 同一话题再问一遍不该重复插（上下文里已经有了），但「本会话不再注入」不是死条件
 assert.equal(await call("before_agent_start", { prompt: PROMPT }), undefined, "同一话题不重复注入");
-// 隔够轮数 + 换了话题 → 允许再注入一次（无感要求：聊到 X 时 X 的记忆恰好在）
-await call("before_agent_start", { prompt: "先看看别的" });
-await call("before_agent_start", { prompt: "再看看别的" });
-await call("before_agent_start", { prompt: "还是别的" });
+// 每一句都问 J5：同一话题它说「不用」（上下文里已经有了），换了话题它说「该查」
+await call("before_agent_start", { prompt: "先看看别的" });   // 新话题 → 注入
+assert.equal(await call("before_agent_start", { prompt: "先看看别的" }), undefined, "同一话题 J5 说不用，不重复插");
 const again = await call("before_agent_start", { prompt: "阴影的着色器参数怎么写" }) as { message: unknown } | undefined;
-assert.ok(again?.message, "隔了至少 3 轮又换了话题，该再注入一次");
+assert.ok(again?.message, "换了话题、J5 说该查 → 再注入一次（无感要求：聊到 X 时 X 的记忆恰好在）");
 notes.length = 0;
 await runCommand("");
-assert.match(notes.at(-1)!, /注入：.*2 次/, "/memory 要能看出本会话注入过几次、上限是多少");
-assert.match(notes.at(-1)!, /注入策略：每会话最多 3 次/, "策略本身也要看得见");
+assert.match(notes.at(-1)!, /注入：\d+ 条 \/ \d+ 次/, "/memory 要能看出本会话注入过几次");
+assert.match(notes.at(-1)!, /注入策略：每会话最多 5 次/, "策略本身也要看得见（默认上限 5，是为了保前缀缓存）");
 assert.match(notes.at(-1)!, /自动清理：关/, "自动清理开没开必须看得见（默认关，删除不可逆）");
 await call("session_compact");
 const afterCompact = await call("before_agent_start", { prompt: PROMPT }) as { message: unknown } | undefined;
@@ -130,7 +137,7 @@ console.log("✓ 每会话只注入一次，压缩后解锁（注入块带声明
 
 // ------------------------------------------------------------ 短输入不花钱
 await call("session_compact");
-assert.equal(await call("before_agent_start", { prompt: "继续" }), undefined, "短输入不花召回的钱");
+assert.equal(await call("before_agent_start", { prompt: "继续" }), undefined, "太短的话 J5 自己会说不用查（不再由本地长度规则兼职）");
 assert.ok((await call("before_agent_start", { prompt: PROMPT }) as { message: unknown } | undefined)?.message,
   "短输入只是跳过这一轮，不该把「本会话已注入」钉死");
 console.log("✓ 短输入跳过但不锁死会话");

@@ -83,7 +83,9 @@ console.log("✓ 每会话只注入一次 + 压缩后解锁");
 // 「是不是同一话题」归 J5，不在这里（见 tests/judge.ts）—— 内容判断不能让本地规则兼职。
 const { DEFAULT_INJECT_POLICY } = await import("../src/pipeline/inject.ts");
 const st = new InjectionState();
-const P = DEFAULT_INJECT_POLICY;
+// 默认 minTurnsBetween = 1：轮次不再是一道闸（「是不是同一话题」交给 J5 每句话判）。
+// 所以这些断言用一份显式策略来验机制本身。
+const P = { ...DEFAULT_INJECT_POLICY, minTurnsBetween: 3 };
 
 st.tick();
 const first = st.shouldInject(P);
@@ -118,7 +120,8 @@ st.reset();
 assert.equal(st.shouldInject(P).ok, true, "压缩后立刻解锁");
 assert.equal(st.shouldInject(P).first, true, "压缩后算重新开始");
 assert.equal(st.injectionCount, 0, "预算也要清（否则 /memory 会显示上限 3 却已注入 4 次）");
-assert.ok(P.maxPerSession >= 1 && P.minTurnsBetween >= 1);
+assert.ok(DEFAULT_INJECT_POLICY.maxPerSession >= 1 && DEFAULT_INJECT_POLICY.minTurnsBetween === 1,
+  "默认不再用轮次拦（该不该查由 J5 每句话判），只留注入次数上限保前缀缓存");
 console.log("✓ 注入策略只管机械约束：首轮必查、隔够轮数、上限到顶、压缩后解锁并重算计预算");
 
 console.log("\n全部通过");

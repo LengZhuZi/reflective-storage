@@ -66,6 +66,10 @@ export function fitBudget<T extends { memory: MemoryNode }>(
 /**
  * 注入策略：**只管机械约束**。
  *
+ * 默认 `maxPerSession = 5`、`minTurnsBetween = 1`（= 不额外拦）：**该不该查由 J5 每句话判**，
+ * 这里只挡一件引擎看不到的事 —— 前缀缓存的账（每次注入都会让 provider 重读整个上下文）。
+ * 想要更严就设 `maxPerSession = 1`（§8.3 的原始默认）。
+ *
  * 「这条记忆对眼下这件事有没有用」是 J8 的事，「这个提问和上次那个是不是同一个话题」是
  * J5 的事 —— 两个都是内容判断，不该由本地规则兼职。这里只管两件只有系统自己才知道的事：
  * 「本会话已经插过几次」（前缀缓存的预算）和「距上次插隔了几轮」。
@@ -79,7 +83,7 @@ export interface InjectPolicy {
   minTurnsBetween: number;
 }
 
-export const DEFAULT_INJECT_POLICY: InjectPolicy = { maxPerSession: 3, minTurnsBetween: 3 };
+export const DEFAULT_INJECT_POLICY: InjectPolicy = { maxPerSession: 5, minTurnsBetween: 1 };
 
 /**
  * 「每会话只注入一次」的状态。
@@ -113,8 +117,8 @@ export class InjectionState {
   }
 
   /**
-   * 机械约束过了吗？过了之后还要问 J5「该不该查」——
-   * 首轮不问（§10.4 第一条规则：首轮直接走完整召回）。
+   * 机械约束过了吗？（过了之后还要问 J5「该不该查」—— 那句话的判断归引擎。）
+   * `first` 仍然标出来，只为了让调用方/日志知道这是本会话第一次。
    */
   shouldInject(policy: InjectPolicy): { ok: boolean; first: boolean; reason?: string } {
     if (!this.injected) return { ok: true, first: true };

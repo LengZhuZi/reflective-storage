@@ -216,8 +216,8 @@ function resolveInject(raw: unknown): InjectConfig {
   const num = (v: unknown, fallback: number, min: number, max = Number.MAX_SAFE_INTEGER) =>
     typeof v === "number" && Number.isFinite(v) && v >= min && v <= max ? v : fallback;
   return {
-    maxPerSession: num(file.maxPerSession, 3, 1),
-    minTurnsBetween: num(file.minTurnsBetween, 3, 1),
+    maxPerSession: num(file.maxPerSession, 5, 1),
+    minTurnsBetween: num(file.minTurnsBetween, 1, 1),
   };
 }
 

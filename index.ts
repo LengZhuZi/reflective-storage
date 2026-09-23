@@ -359,44 +359,42 @@ export default function reflectiveStorage(pi: ExtensionAPI): void {
       r.error = errText(e);   // 纯后台的一层，不该影响召回
     }
 
-    const pre = worthRecalling(event.prompt ?? "");
-    if (!pre.ok) {
-      // 跳过不打「已注入」标记：这一轮不花那个钱，下一轮话够长还会查。
-      r.lastRecall = { status: "skipped", candidates: 0, injected: 0, detail: pre.reason, at: Date.now() };
+    // **每一句话都问引擎**（§10.4 的「要不要花这次钱」交给 J5，不由本地长度规则兼职）。
+    // 首轮也问：一句话就能判出「这句根本用不上记忆」，省下的是 J7+J8 两次调用。
+    const prompt = event.prompt ?? "";
+    const cap = r.state.shouldInject(r.inject);
+    if (!cap.ok) {
+      // 上限定死了，问也改不了结果 —— 这一层是机械约束（保前缀缓存），引擎看不到它。
+      r.lastRecall = { status: "skipped", candidates: 0, injected: 0, detail: cap.reason, at: Date.now() };
       return;
     }
-
-    // 机械约束（次数上限 / 隔几轮）过了之后，**该不该查由 J5 判** ——
-    // 「这个提问是不是已经在上下文里的那件事」是内容判断，不该让本地二字组规则兼职。
-    // 首轮不问 J5：§10.4 第一条规则就是「首轮直接走完整召回」。
-    const gate = r.state.shouldInject(r.inject);
-    if (!gate.ok) {
-      r.lastRecall = { status: "skipped", candidates: 0, injected: 0, detail: gate.reason, at: Date.now() };
-      return;
-    }
-    if (!gate.first) {
-      try {
-        const need = await r.adapter.judgeRecallNeed(event.prompt, {
-          ...r.session,
-          lastInjectedQuery: r.lastRecall?.query ?? null,
-        });
-        if (need.noul < NEED_RECALL_THRESHOLD) {
-          r.lastRecall = {
-            status: "skipped", candidates: 0, injected: 0, query: event.prompt,
-            detail: `J5 判断不必再查（${need.noul.toFixed(2)}${need.meta.detail ? `，${need.meta.detail}` : ""}）`,
-            at: Date.now(),
-          };
-          return;
-        }
-      } catch (e) {
-        // 问不动就不查：保守方向（少召回一条），比多插一块噪声好。
-        r.error = errText(e);
+    try {
+      const need = await r.adapter.judgeRecallNeed(prompt, {
+        ...r.session,
+        lastInjectedQuery: r.lastRecall?.query ?? null,
+      });
+      const gate = { ok: need.noul >= NEED_RECALL_THRESHOLD, why: need };
+      addTrace(r.projectDb, {
+        stage: "recall", gate: "J5", action: gate.ok ? "keep" : "skip",
+        reason: `需要召回 ${need.noul.toFixed(2)}${need.meta.detail ? `（${need.meta.detail}）` : ""}`,
+        status: need.meta.status, fallbackUsed: need.meta.fallbackUsed, latencyMs: need.meta.latencyMs,
+      });
+      if (!gate.ok) {
+        r.lastRecall = {
+          status: "skipped", candidates: 0, injected: 0, query: prompt,
+          detail: `J5 判断不必查（${need.noul.toFixed(2)}${need.meta.detail ? `，${need.meta.detail}` : ""}）`,
+          at: Date.now(),
+        };
         return;
       }
+    } catch (e) {
+      // 问不动就不查：保守方向（少召回一条），比多插一块噪声好。
+      r.error = errText(e);
+      return;
     }
 
     try {
-      const res = await recallFlow(event.prompt, {
+      const res = await recallFlow(prompt, {
         projectDb: r.projectDb,
         globalDb: r.globalDb,
         adapter: r.adapter,
@@ -406,7 +404,7 @@ export default function reflectiveStorage(pi: ExtensionAPI): void {
       });
       r.lastRecall = {
         status: res.status, candidates: res.candidates.length,
-        injected: res.injected.length, detail: res.detail, query: event.prompt, at: Date.now(),
+        injected: res.injected.length, detail: res.detail, query: prompt, at: Date.now(),
       };
       if (res.status === "unavailable") warnProxy(r, ctx);
       if (res.injected.length === 0) return;   // fail-closed：沉默优于噪声
@@ -476,6 +474,8 @@ export default function reflectiveStorage(pi: ExtensionAPI): void {
     if (!r || !r.proactive.enabled) return;
     if (r.proactiveCount >= r.proactive.maxPerSession) return;
     const said = lastUserText(ctx.sessionManager.getBranch());
+    // 这里保留本地那层预筛（召回路径已经去掉了）：主动提醒是额外的赠品、每会话只跑一次，
+    // 为「继续」这种话花一次调用不值当；真漏了也不影响主链路。
     if (!said || !worthRecalling(said).ok) return;
     r.proactiveCount++;   // 先占位：判失败也算用掉了这一轮，不许反复试
 

@@ -18,7 +18,7 @@ const {
 const mem = (id: string, content: string, type = "event") => ({
   id, content, summary: null, type, scope: "project", scopeId: "P", topic: null,
   importance: 0.5, decayScore: 1, state: "active", createdAt: 0, lastAccessed: null,
-  accessCount: 0, source: null, metadata: null,
+  accessCount: 0, source: null, origin: "user", trust: 1, metadata: null,
 });
 
 // ------------------------------------------------------------ 框架与声明
@@ -60,6 +60,19 @@ assert.deepEqual(fitBudget(many, 0), [], "预算为 0 就一条都不注入");
 assert.deepEqual(fitBudget(many, 5).map((x) => x.memory.id), ["m2"], "预算只够一条短的时不要硬塞长的");
 assert.ok(DEFAULT_MAX_TOKENS >= 200 && DEFAULT_MAX_TOKENS <= 4000, "默认预算要落在能放十来条记忆的区间");
 console.log("✓ 预算截断：装不下的跳过，预算不够时沉默不硬塞");
+
+// ------------------------------------------------------------ 没有提炼的原文（提炼后端没配时就这条路）
+// 助手侧现在整段入库，一条 2000 字原文直接进注入块 = 一个会话的预算被一条吃光。
+const raw = mem("r1", "原".repeat(2000));
+const rawLine = buildInjectionBlock([raw]);
+assert.ok(rawLine.length < 600, `长原文注入时要截断，实际 ${rawLine.length} 字`);
+assert.match(rawLine, /原会话原文 2000 字/, "行尾要标原会话原文的字数");
+assert.equal(fitBudget([{ memory: raw }], 400).length, 1, "预算要按**要注入的那段**算，按全文算会把这条白丢");
+// 「怎么取原文」写在框架 note 里（一次），不是每条重复 —— 模型得知道摘要背后还有原文。
+assert.match(MEMORY_OPEN, /提炼摘要/, "框架要说清给的是摘要");
+assert.match(MEMORY_OPEN, /memory_raw/, "框架要说清原文怎么取");
+assert.match(MEMORY_OPEN, /id/, "要说清取原文用的是行首那个 id");
+console.log("✓ 无提炼的长原文：注入截断 + 标原文字数 + 框架说明怎么取原文 + 预算按截断后算");
 
 // ------------------------------------------------------------ 每会话只注入一次
 const state = new InjectionState();

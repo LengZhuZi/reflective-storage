@@ -18,6 +18,29 @@ export type MemoryScope = "global" | "project" | "session";
 /** 生命周期状态，见 DESIGN.md §9.1。 */
 export type MemoryState = "active" | "cold" | "archived" | "superseded" | "deleted";
 
+/**
+ * 记忆的来源。
+ *
+ *   user  用户自己敲的话 —— 事实源，trust 1.0，永不降级。
+ *   agent 模型自己说的话 —— 可能是推断，也可能是被工具结果验证过的结论。
+ *
+ * 为什么要分开：模型写的错东西存进库，下个会话会作为「既有记忆」注入回来，
+ * 模型看见自己上次的话，更容易当既成事实再引一遍。来源标出来，这条环路才有断点。
+ */
+export type MemoryOrigin = "user" | "agent";
+
+/**
+ * trust 的上限。**不是 1.0** —— 这是刻意的。
+ *
+ * agent 来源的记忆靠「用户后来在同一个话题上说话又没推翻它」往上升，但永远升不到
+ * 用户原话那一档。理由不是「用户可能没说」：是 trust 高到一定程度，模型就不再回头
+ * 检查这条了，它变成公理。封顶是为了让复核这件事一直有理由发生。
+ */
+export const TRUST_CAP = 0.9;
+
+/** trust 低于它就在注入时带标记（见 pipeline/inject.ts）。 */
+export const TRUST_MARK_BELOW = 0.8;
+
 /** 记忆之间的语义关系，由 J3 判定。 */
 export type Relation = "none" | "extends" | "supersedes" | "contradicts" | "depends_on";
 
@@ -36,6 +59,16 @@ export interface MemoryNode {
   lastAccessed: number | null;
   accessCount: number;
   source: string | null;
+  /** 来源，见 MemoryOrigin。 */
+  origin: MemoryOrigin;
+  /**
+   * 可信度 0..1。跟 importance **正交**：importance 管衰减和排序，trust 管注入时怎么措辞。
+   *
+   * 为什么不拿它当召回过滤器：用户真问到那个话题时，低 trust 的记忆照样相关、照样该出现 ——
+   * 只不过要带着「这是推断，未经确认」的标记出现，让模型有理由不是无条件信它。
+   * 当过滤器用的话，恰恰在最需要它出现的时候把它藏了。
+   */
+  trust: number;
   metadata: string | null;
 }
 

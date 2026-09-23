@@ -14,7 +14,8 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { createRequire } from "node:module";
 import { randomUUID } from "node:crypto";
-import type { MemoryNode, MemoryScope, MemoryState, MemoryType } from "../core/types.ts";
+import type { MemoryNode, MemoryOrigin, MemoryScope, MemoryState, MemoryType } from "../core/types.ts";
+import { TRUST_CAP } from "../core/types.ts";
 import { userVisibleReason, type FallbackRoute } from "../core/governance.ts";
 import { EMBED_DIM, toVecBlob } from "../embed/encoder.ts";
 
@@ -37,6 +38,8 @@ CREATE TABLE IF NOT EXISTS memories (
   last_accessed   INTEGER,
   access_count    INTEGER DEFAULT 0,
   source          TEXT,
+  origin          TEXT DEFAULT 'user',
+  trust           REAL DEFAULT 1.0,
   metadata        TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_memories_scope ON memories(scope, scope_id, state);
@@ -137,6 +140,13 @@ export interface OpenedDb {
   close(): void;
 }
 
+/** 老库缺列就补上 —— SQLite 没有 ADD COLUMN IF NOT EXISTS。 */
+function ensureColumn(db: DatabaseSync, table: string, column: string, decl: string): void {
+  const cols = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name?: unknown }>;
+  if (cols.some((c) => c.name === column)) return;
+  db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${decl}`);
+}
+
 /** 最近一个 .git 祖先目录。 */
 function gitRoot(cwd: string): string {
   let dir = path.resolve(cwd);
@@ -187,6 +197,10 @@ export function openDb(file: string): OpenedDb {
   // 撞上对方正在写就直接 SQLITE_BUSY 报错；等一会儿基本都能过去。
   db.exec("PRAGMA busy_timeout = 3000");
   db.exec(SCHEMA);
+  // v0.3 之前入库的记忆都是用户原话（旧的写入路径只消化用户自己的话），
+  // 所以补列时给它们 user/1.0 —— 这是回溯正确，不是猜。
+  ensureColumn(db, "memories", "origin", "TEXT DEFAULT 'user'");
+  ensureColumn(db, "memories", "trust", "REAL DEFAULT 1.0");
 
   // 向量层可缺：缺了系统照样跑，只是召回少了语义那一路（原则 2：向量层可重建）。
   let vecEnabled = false;
@@ -237,6 +251,8 @@ function toNode(r: Row): MemoryNode {
     lastAccessed: r.last_accessed == null ? null : Number(r.last_accessed),
     accessCount: Number(r.access_count ?? 0),
     source: (r.source as string) ?? null,
+    origin: (r.origin as MemoryOrigin) ?? "user",
+    trust: r.trust == null ? 1 : Number(r.trust),
     metadata: (r.metadata as string) ?? null,
   };
 }
@@ -250,6 +266,8 @@ export interface InsertMemory {
   summary?: string | null;
   topic?: string | null;
   source?: string | null;
+  origin?: MemoryOrigin;
+  trust?: number;
 }
 
 export function insertMemory(o: OpenedDb, m: InsertMemory): MemoryNode {
@@ -268,18 +286,20 @@ export function insertMemory(o: OpenedDb, m: InsertMemory): MemoryNode {
     lastAccessed: null,
     accessCount: 0,
     source: m.source ?? null,
+    origin: m.origin ?? "user",
+    trust: m.trust ?? 1,
     metadata: null,
   };
   o.db
     .prepare(
       `INSERT INTO memories (id, content, summary, type, scope, scope_id, topic, importance,
-                             decay_score, state, created_at, last_accessed, access_count, source, metadata)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+                             decay_score, state, created_at, last_accessed, access_count, source, origin, trust, metadata)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
     )
     .run(
       node.id, node.content, node.summary, node.type, node.scope, node.scopeId, node.topic,
       node.importance, node.decayScore, node.state, node.createdAt, node.lastAccessed,
-      node.accessCount, node.source, node.metadata,
+      node.accessCount, node.source, node.origin, node.trust, node.metadata,
     );
   // FTS5 外部内容表需要手动同步
   o.db.prepare(`INSERT INTO memory_fts (rowid, content, summary) VALUES (
@@ -361,6 +381,26 @@ export function markAccessed(o: OpenedDb, ids: string[]): void {
 
 export function setState(o: OpenedDb, id: string, state: MemoryState): void {
   o.db.prepare(`UPDATE memories SET state = ? WHERE id = ?`).run(state, id);
+}
+
+/**
+ * 调 trust（clamp 到 [0, cap]）。引擎判不了「这条对不对」—— 它只能看到文本。
+ * 所以 trust 不靠引擎打分，靠两件可观测的事：用户后来在同一个话题上说话又没推翻它
+ * （升），或者撞上了反证（降）。返回新值，条不见了返回 null。
+ */
+export function adjustTrust(o: OpenedDb, id: string, delta: number, cap = TRUST_CAP): number | null {
+  const row = o.db.prepare(`SELECT trust FROM memories WHERE id = ?`).get(id) as Row | undefined;
+  if (!row) return null;
+  // 抹到两位小数：不抹的话 0.7+0.1 = 0.7999999999999999，跟 0.8 比大小会得到
+  // 「还没过标记线」，标记永远去不掉（实测撞到）。
+  const next = Math.round(Math.max(0, Math.min(cap, Number(row.trust ?? 1) + delta)) * 100) / 100;
+  setTrust(o, id, next);
+  return next;
+}
+
+/** 直接置 trust。不用 adjustTrust 是因为它的上限是 TRUST_CAP —— 合并时需要能拿到 1.0。 */
+export function setTrust(o: OpenedDb, id: string, value: number): void {
+  o.db.prepare(`UPDATE memories SET trust = ? WHERE id = ?`).run(Math.max(0, Math.min(1, value)), id);
 }
 
 export function hardDelete(o: OpenedDb, id: string): void {
@@ -664,9 +704,9 @@ export function refreshRegistry(registryDb: OpenedDb, projectDb: OpenedDb, proje
     .run(projectId, dir, JSON.stringify(topics), count, JSON.stringify(recent), Date.now());
 }
 
-export function listRegistry(o: OpenedDb): Array<{ projectId: string; dir: string; topics: string[]; count: number; recent: string[] }> {
+export function listRegistry(o: OpenedDb): Array<{ projectId: string; dir: string; topics: string[]; count: number; recent: string[]; updatedAt: number }> {
   const rows = o.db
-    .prepare(`SELECT project_id, dir, topics, memory_count, recent FROM project_registry ORDER BY project_id`)
+    .prepare(`SELECT project_id, dir, topics, memory_count, recent, updated_at FROM project_registry ORDER BY project_id`)
     .all() as Row[];
   return rows.map((r) => ({
     projectId: String(r.project_id),
@@ -674,6 +714,7 @@ export function listRegistry(o: OpenedDb): Array<{ projectId: string; dir: strin
     topics: JSON.parse(String(r.topics ?? "[]")) as string[],
     count: Number(r.memory_count ?? 0),
     recent: JSON.parse(String(r.recent ?? "[]")) as string[],
+    updatedAt: Number(r.updated_at ?? 0),
   }));
 }
 

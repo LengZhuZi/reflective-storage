@@ -17,7 +17,9 @@ import * as path from "node:path";
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "reflect-ui-"));
 process.env.REFLECTIVE_HOME = tmp;
 
+import * as fss from "node:fs";
 const { openDb, insertMemory, getMemory, countMemories, pendingReviews, enqueueReview } = await import("../src/storage/db.ts");
+void fss;
 const { startUi } = await import("../src/ui/server.ts");
 const { queueTopicNaming } = await import("../src/pipeline/review.ts");
 
@@ -40,9 +42,9 @@ const del = (p: string) => fetch(t + p, { method: "DELETE" });
 
 // ------------------------------------------------------------ 绑定与 token
 assert.match(base, /^http:\/\/127\.0\.0\.1:\d+\/t\/[0-9a-f]{32}\/$/, "只绑回环 + URL 带 token");
-const noToken = await fetch(`http://127.0.0.1:${new URL(base).port}/api/state`);
+const noToken = await fetch(`http://127.0.0.1:${new URL(base).port}/api/overview`);
 assert.equal(noToken.status, 403, "不带 token 一律 403（回环地址不是安全边界：别的进程/网页也能打 localhost）");
-const wrongToken = await fetch(`http://127.0.0.1:${new URL(base).port}/t/deadbeef/api/state`);
+const wrongToken = await fetch(`http://127.0.0.1:${new URL(base).port}/t/deadbeef/api/overview`);
 assert.equal(wrongToken.status, 403);
 console.log("✓ 只绑 127.0.0.1，URL 里的 token 是访问凭证，错了就 403");
 
@@ -67,14 +69,46 @@ assert.deepEqual(byTopic.items.map((m) => m.id), [attack.id]);
 const glist = await (await get("/api/memories?scope=global")).json() as { items: Array<{ scope: string }> };
 assert.equal(glist.items.length, 1);
 assert.equal(glist.items[0].scope, "global");
-const state = await (await get("/api/state")).json() as { project: number; global: number; pending: number; topics: string[] };
-assert.equal(state.project, 3);
-assert.equal(state.global, 1);
+const state = await (await get("/api/overview")).json() as { project: { count: number; topics: string[] }; global: { count: number }; pending: number };
+assert.equal(state.project.count, 3);
+assert.equal(state.global.count, 1);
 assert.equal(state.pending, 1);
-assert.ok(state.topics.includes("安全"));
+assert.ok(state.project.topics.includes("安全"));
 console.log("✓ 列表 / 状态 / 主题过滤都能用");
 
 // ------------------------------------------------------------ 轨迹与复核
+// 概览 / 图谱 / 设置这三块是这轮新加的
+const ov = await (await get("/api/overview")).json() as Record<string, any>;
+assert.equal(ov.project.count, 3);
+assert.equal(ov.project.byType.fact, 2);
+assert.equal(ov.pending, 1);
+assert.equal(ov.dupeCosine, 0.85);
+assert.ok(Array.isArray(ov.registry) && Array.isArray(ov.recalls) && Array.isArray(ov.traces));
+
+const graph = await (await get("/api/graph?scope=project")).json() as { nodes: Array<{ id: string }>; links: Array<{ source: string; target: string; kind: string }> };
+assert.ok(graph.nodes.length >= 3, "图谱要有节点");
+assert.ok(graph.nodes.every((n) => typeof n.id === "string"));
+
+const cfgGet = await (await get("/api/config")).json() as { path: string; raw: Record<string, any> };
+assert.equal(cfgGet.path, path.join(tmp, "config.json"));
+assert.ok(!JSON.stringify(cfgGet).match(/sk-[A-Za-z0-9]{8,}/), "配置回给页面时不许带 key 的值");
+fs.writeFileSync(path.join(tmp, "config.json"), JSON.stringify({ typesafe: { apiKey: "sk-abcdefgh12345", model: "jev-latest" } }), { mode: 0o600 });
+fs.chmodSync(path.join(tmp, "config.json"), 0o600);
+const masked = await (await get("/api/config")).json() as { raw: Record<string, any> };
+assert.equal(masked.raw.typesafe.apiKey, "", "key 抹成空串");
+assert.equal(masked.raw.typesafe.apiKeySet, 16, "只报长度");
+const saved = await (await post("/api/config", { inject: { maxPerSession: 2 }, typesafe: { apiKey: "sk-new-key-123456" } })).json() as { raw: Record<string, any> };
+assert.equal(saved.raw.typesafe.apiKey, "", "保存的响应也不回 key");
+const onDisk = JSON.parse(fs.readFileSync(path.join(tmp, "config.json"), "utf8")) as Record<string, any>;
+assert.equal(onDisk.typesafe.apiKey, "sk-new-key-123456", "key 要真的写进文件");
+assert.equal(onDisk.typesafe.model, "jev-latest", "没提到的字段不许被清掉");
+assert.equal(onDisk.inject.maxPerSession, 2);
+assert.equal(fs.statSync(path.join(tmp, "config.json")).mode & 0o777, 0o600, "写配置后权限必须是 600");
+await post("/api/config", { typesafe: { apiKey: "" } });
+assert.equal((JSON.parse(fs.readFileSync(path.join(tmp, "config.json"), "utf8")) as Record<string, any>).typesafe.apiKey, "sk-new-key-123456", "空值不覆盖已有配置");
+assert.match(html, /textContent/, "内容必须用 textContent 拼");
+console.log("✓ 概览 / 图谱 / 设置（key 只写不读、写回 600、空值不覆盖）");
+
 const traces = await (await get(`/api/traces?scope=project&id=${attack.id}`)).json() as { items: unknown[] };
 assert.equal(traces.items.length, 0, "手工插的没有轨迹");
 
@@ -91,6 +125,13 @@ await post(`/api/review/${String(topicItem.id)}`, { resolution: "发布流程" }
 const named = project.db.prepare(`SELECT topic FROM memories WHERE id = ?`).get(String(topicItem.memory_id)) as Record<string, unknown>;
 assert.equal(named.topic, "发布流程", "页面起名要真的写进 topic");
 console.log("✓ 复核与起名都能从页面走通");
+
+// ------------------------------------------------------------ 节点详情（图谱点击）
+const detail = await (await get(`/api/memory-detail?scope=project&id=${attack.id}`)).json() as { memory: { id: string }; paths: string[]; traces: unknown[] };
+assert.equal(detail.memory.id, attack.id);
+assert.ok(Array.isArray(detail.paths) && Array.isArray(detail.traces));
+assert.equal((await get("/api/memory-detail?scope=project&id=nope")).status, 404);
+console.log("✓ 节点详情：内容 + 路径 + 轨迹");
 
 // ------------------------------------------------------------ 近义堆 + 手动合并
 const { putEmbedding, getMemory: getM } = await import("../src/storage/db.ts");

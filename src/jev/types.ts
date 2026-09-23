@@ -62,6 +62,24 @@ export interface WriteJudgment {
 export interface RecallJudgment {
   /** J7：memoryId -> 相关性 0–1。 */
   relevance: Map<string, number>;
+  /**
+   * J14a：被边界判断挡下的 memoryId（§11.1）。现在是「global 记忆在当前项目不适用」
+   * 这一类。它是**屏蔽**而不是低分 —— 低分会走阈值，而阈值在降级时不生效
+   * （fail-degraded），那正好把该挡的放过来了。所以单独一条通道。
+   */
+  blocked: Set<string>;
+}
+
+/** J15：事后核对用引擎判「这条注入的记忆有没有被回复用上」。 */
+export interface CitationJudgment {
+  cited: Set<string>;
+}
+
+/** 注入闸（J8）的输出。 */
+
+/** J15：事后核对用引擎判「这条注入的记忆有没有被回复用上」。 */
+export interface CitationJudgment {
+  cited: Set<string>;
 }
 
 /** 注入闸（J8）的输出。 */

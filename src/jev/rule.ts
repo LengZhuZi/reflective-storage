@@ -76,6 +76,39 @@ export function ruleRelevance(query: string, memory: MemoryNode): number {
   return Math.min(1, ratio * 1.5 + memory.importance * 0.2);
 }
 
+/**
+ * 两个字符串之间最长的「连续二字组」片段长度（直觉上是最长公共子串，按二字组算）。
+ *
+ * 不能用 bigrams()：它返回 Set，去重后顺序就没了，最长片段会被截短
+ * （实测「一个模块一个提交」只剩 3）。所以这里用保留重复的序列版本。
+ */
+export function longestSharedRun(a: string, b: string): number {
+  const x = bigramSeq(a);
+  const y = bigramSeq(b);
+  if (x.length === 0 || y.length === 0) return 0;
+  let best = 0;
+  let prev = new Array<number>(y.length + 1).fill(0);
+  for (let i = 1; i <= x.length; i++) {
+    const cur = new Array<number>(y.length + 1).fill(0);
+    for (let j = 1; j <= y.length; j++) {
+      if (x[i - 1] === y[j - 1]) {
+        cur[j] = prev[j - 1] + 1;
+        if (cur[j] > best) best = cur[j];
+      }
+    }
+    prev = cur;
+  }
+  return best;
+}
+
+/** 二字组序列：保留重复和顺序（longestSharedRun 需要）。 */
+export function bigramSeq(s: string): string[] {
+  const clean = s.replace(/[\s\p{P}\p{S}]/gu, "");
+  const out: string[] = [];
+  for (let i = 0; i + 2 <= clean.length; i++) out.push(clean.slice(i, i + 2));
+  return out;
+}
+
 export function bigrams(s: string): Set<string> {
   const clean = s.replace(/[\s\p{P}]/gu, "");
   const out = new Set<string>();

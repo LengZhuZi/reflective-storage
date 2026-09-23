@@ -166,6 +166,68 @@ assert.equal(search.block, "", "不给预算就不产出注入块");
 assert.ok(search.candidates.length >= 2, "但候选还是要返回（工具要把命中摆出来）");
 console.log("✓ 不传预算 = memory_search 模式（只召回，不注入）");
 
+// ------------------------------------------------------------ J6：同主题那一路
+// 主题是人起的名，命中一次比关键词更值钱；而向量那 0.046 的区分度本来就弱，
+// 按主题捞是它的互补。走的是「提问里出现了主题名」这种确定性查表，不是语义判断。
+const { mentionsTopic } = await import("../src/pipeline/recall.ts");
+assert.equal(mentionsTopic("认证那套要不要动", "认证"), true, "提问里直接出现主题名");
+assert.equal(mentionsTopic("提交流程怎么走", "提交流程"), true, "二字组基本覆盖也算提到");
+assert.equal(mentionsTopic("影子太黑", "认证"), false);
+assert.equal(mentionsTopic("任何东西", ""), false, "空主题名不匹配一切");
+
+const { setTopic, memoriesByTopic } = await import("../src/storage/db.ts");
+const topicMem = insertMemory(project, { content: "认证走 OIDC，token 有效期 30 分钟", type: "fact", scope: "project", scopeId: "P" });
+setTopic(project, topicMem.id, "认证");
+assert.deepEqual(memoriesByTopic(project, "认证").map((m) => m.id), [topicMem.id]);
+
+// 让「同主题」那一路成为**唯一**能把它捞回来的路：灌 60 条更新的无关记忆把
+// 「作用域内最近 50 条」和「向量 top 50」的位置占满（下面这条还没有 embedding）。
+for (let i = 0; i < 60; i++) {
+  insertMemory(project, { content: `第 ${i} 条构建日志：esbuild 打包参数与缓存命中情况 -${i}`, type: "event", scope: "project", scopeId: "P" });
+}
+const topicSeen: string[] = [];
+const topicRes = await recallFlow("认证那块现在怎么做的？", {
+  projectDb: project, globalDb: global, session,
+  adapter: fakeAdapter({ relevance: { [topicMem.id]: 0.9 }, inject: { [topicMem.id]: "inject" }, seen: topicSeen }),
+  budget: { maxTokens: 800 },
+});
+assert.ok(topicSeen.includes(topicMem.id), "提到主题名就该把它下面的记忆捞进候选（其他三路都被挤掉了）");
+assert.deepEqual(topicRes.injected.map((r) => r.memory.id), [topicMem.id]);
+// 不相关的话题不该靠主题乱捞
+const seenOther: string[] = [];
+await recallFlow("影子太黑怎么调亮", {
+  projectDb: project, globalDb: global, session,
+  adapter: fakeAdapter({ relevance: { [topicMem.id]: 0.9 }, inject: {}, seen: seenOther }),
+  budget: { maxTokens: 800 },
+});
+assert.ok(!seenOther.includes(topicMem.id), "没提到的主题不许硬塞进来");
+console.log("✓ J6：同主题那一路参与召回（查表捞候选，相关性仍然 J7 说了算）");
+
+// ------------------------------------------------------------ J14a：边界屏蔽（不是低分）
+const gBlocked = insertMemory(global, { content: "用户喜欢用 vim，所有项目都一样", type: "preference", scope: "global", scopeId: null });
+const blockingAdapter = {
+  relevanceThreshold: 0.5,
+  async judgeRelevance(_q: string, c: Array<{ id: string }>) {
+    return {
+      relevance: new Map(c.map((x) => [x.id, 0.95])),
+      blocked: new Set(c.map((x) => x.id).filter((id) => id === gBlocked.id)),
+      meta: { gate: "J7", fallbackUsed: "none", status: "ok", latencyMs: 1 },
+    };
+  },
+  async judgeInjection(_q: string, c: Array<{ id: string }>) {
+    return { decisions: new Map(c.map((x) => [x.id, "inject" as const])), meta: { gate: "J8", fallbackUsed: "none", status: "ok", latencyMs: 1 } };
+  },
+} as never;
+const gRes = await recallFlow("编辑器用哪个", {
+  projectDb: project, globalDb: global, session, adapter: blockingAdapter, budget: { maxTokens: 800 },
+});
+assert.ok(!gRes.candidates.some((c) => c.memory.id === gBlocked.id), "被 J14a 屏蔽的即使相关性 0.95 也不许留");
+assert.ok(gRes.candidates.length > 0, "屏蔽只针对那一条，不许误伤别的候选");
+const blockTrace = project.db.prepare(`SELECT gate, action, reason FROM reflection_traces WHERE gate = 'J14a'`).get() as Record<string, unknown>;
+assert.equal(blockTrace.action, "block");
+assert.match(String(blockTrace.reason), /不适用于当前项目/);
+console.log("✓ J14a：屏蔽走独立通道（不是低分），且留痕");
+
 // ------------------------------------------------------------ 空库 + 留痕
 const empty = await recallFlow(QUERY, {
   projectDb: openDb(path.join(tmp, "empty.db")), globalDb: openDb(path.join(tmp, "empty-global.db")),

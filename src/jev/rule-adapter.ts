@@ -12,11 +12,14 @@
  */
 
 import type { TokenBudget } from "../core/types.ts";
-import { ruleRelevance, ruleRelation, ruleScope, ruleType, ruleWorthKeeping, sameTopic } from "./rule.ts";
+import { longestSharedRun, ruleRelevance, ruleRelation, ruleScope, ruleType, ruleWorthKeeping, sameTopic } from "./rule.ts";
 import type { JevAdapter } from "./adapter.ts";
 
 /** 规则分需要的阈值。JEV 的 0.7 是在 JEV 自己的分数尺度上标定的，移到规则上会全被卡掉。 */
 export const RULE_RELEVANCE_THRESHOLD = 0.5;
+
+/** J15 的字符串口径：连续命中的二字组个数下限（≈5 个字以上的原样片段）。 */
+export const CITED_RUN = 4;
 
 /** 这一档自己知道自己是规则，不是降级，所以 status 一律 ok（§6.1 的降级是给「失败」用的）。 */
 const meta = (gate: string) => ({
@@ -51,6 +54,13 @@ export function createRuleAdapter(relevanceThreshold: number = RULE_RELEVANCE_TH
 
     async judgeRelevance(query, candidates) {
       return { relevance: new Map(candidates.map((m) => [m.id, ruleRelevance(query, m)])), meta: meta("J7(rules)") };
+    },
+
+    async judgeCitations(reply, injected) {
+      // 规则档没有判断力，用「原样片段复用」当口径：连续 ≥4 个二字组（≈5 字以上）
+      // 的相同片段才算确凿用上。这也是引擎不可用时 feedback.ts 的兜底 —— 同一份口径。
+      const cited = new Set(injected.filter((m) => longestSharedRun(m.content, reply) >= CITED_RUN).map((m) => m.id));
+      return { cited, meta: meta("J15(rules)") };
     },
 
     async judgeInjection(query, candidates, budget: TokenBudget) {

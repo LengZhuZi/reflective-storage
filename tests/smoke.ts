@@ -71,6 +71,8 @@ const okFetch: typeof fetch = async (_url, init) => {
     else if (key === "need_recall") answers[key] = { type: "noul", noul: 0.9 };
     else if (key === "new_topic") answers[key] = { type: "noul", noul: 0.1 };
     else if (key.startsWith("rel_")) answers[key] = { type: "noul", noul: key === `rel_${a.id}` ? 0.85 : 0.03 };
+    else if (key.startsWith("applies_")) answers[key] = { type: "noul", noul: 0.9 };
+    else if (key.startsWith("used_")) answers[key] = { type: "noul", noul: key === `used_${a.id}` ? 0.8 : 0.1 };
     else if (key.startsWith("inj_")) answers[key] = { type: "choice", choice: key === `inj_${a.id}` ? "inject" : "skip", confidence: 0.8, probabilities: {} };
   }
   return new Response(JSON.stringify({ model: "jev-test", answers, usage: { input_tokens: 123, output_tokens: 45 } }), { status: 200 });
@@ -101,6 +103,33 @@ assert.equal(r.relevance.get(a.id), 0.85);
 assert.equal(r.relevance.get(b.id), 0.03);
 console.log("✓ J7 相关性，相关与无关分得开");
 
+// J14a：local 记忆不问边界问题；global 的被判不适用就要挡下来
+const rScope = await live.judgeRelevance("影子太黑", [getMemory(o, a.id)!, getMemory(o, b.id)!], { projectId: "World" });
+assert.equal(rScope.meta.status, "ok");
+assert.equal(rScope.blocked.size, 0, "这两条都是 project 作用域，不该走边界判断");
+const gNode = { ...getMemory(o, b.id)!, scope: "global" as const, scopeId: null };
+// 另造一个「判不适用」的假引擎：applies_* 给 0.1
+const blockFetch: typeof fetch = async (_url, init) => {
+  const req = JSON.parse(String(init?.body)) as { questions: Record<string, { type: string }> };
+  const answers: Record<string, unknown> = {};
+  for (const key of Object.keys(req.questions)) {
+    const v = key.startsWith("applies_") ? 0.1 : 0.9;
+    answers[key] = { type: "noul", noul: v };
+  }
+  return new Response(JSON.stringify({ model: "t", answers, usage: { input_tokens: 1, output_tokens: 1 } }), { status: 200 });
+};
+const blocker = createJevAdapter(new JevHttpClient({ apiKey: "test", fetchImpl: blockFetch }));
+const rGlobal = await blocker.judgeRelevance("影子太黑", [gNode], { projectId: "World" });
+assert.equal(rGlobal.blocked.has(gNode.id), true, "引擎判 global 记忆不适用当前项目时，要单独挡下来（不是给低分）");
+assert.equal(rGlobal.relevance.get(gNode.id), 0.9, "被屏蔽的那条仍然保留自己的相关性分数 —— 屏蔽和低分是两条通道");
+console.log("✓ J14a：边界判断只问 global 记忆，挡下的是「屏蔽」而不是低分");
+
+// J15：让引擎判「回复用上了哪几条注入的记忆」
+const citedRes = await live.judgeCitations("第一条我按影子强度改了", [getMemory(o, a.id)!, getMemory(o, b.id)!]);
+assert.equal(citedRes.meta.status, "ok");
+assert.deepEqual([...citedRes.cited], [a.id]);
+console.log("✓ J15：引擎判定「回复用上了哪几条」（可用性失败路径见下面的 dead 引擎）");
+
 const inj = await live.judgeInjection("影子太黑", [getMemory(o, a.id)!, getMemory(o, b.id)!], { maxTokens: 500 });
 assert.equal(inj.decisions.get(a.id), "inject");
 assert.equal(inj.decisions.get(b.id), "skip");
@@ -115,7 +144,10 @@ assert.equal(dw.meta.status, "unavailable");
 assert.equal(dw.meta.fallbackUsed, "rule");
 assert.ok(dw.worthKeeping.noul > 0.5, "fail-open：JEV 挂了也必须给出可写入的判断");
 assert.equal(dw.type.choice, "event");
-console.log("✓ 写入闸 fail-open（JEV 挂了照存）");
+const deadCited = await dead.judgeCitations("随便一段回复", [getMemory(o, a.id)!]);
+assert.equal(deadCited.meta.status, "unavailable", "引擎不可用要标降级，由调用方退回字符串比对");
+assert.equal(deadCited.cited.size, 0);
+console.log("✓ 写入闸 fail-open（JEV 挂了照存）；J15 判不了就标降级");
 
 const dr = await dead.judgeRelevance("影子太黑", [getMemory(o, a.id)!, getMemory(o, b.id)!]);
 assert.equal(dr.meta.status, "unavailable");

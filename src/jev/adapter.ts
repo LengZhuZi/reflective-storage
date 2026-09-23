@@ -18,7 +18,7 @@ import { JevHttpClient, JevUnavailableError, type AskOptions, type Answer, type 
 import { LlmClient } from "./llm.ts";
 import { createRuleAdapter, RULE_RELEVANCE_THRESHOLD } from "./rule-adapter.ts";
 import { ruleRelation, ruleRelevance, ruleScope, ruleType, ruleWorthKeeping, sameTopic } from "./rule.ts";
-import type { InjectionJudgment, Judged, NoulResult, RecallJudgment, WriteJudgment } from "./types.ts";
+import type { CitationJudgment, InjectionJudgment, Judged, NoulResult, RecallJudgment, WriteJudgment } from "./types.ts";
 
 /**
  * 判断引擎只需要这一个方法。JEV HTTP 和任何 OpenAI 兼容端点（见 llm.ts）都满足它，
@@ -34,6 +34,11 @@ export interface JudgeClient {
  * 所以多路召回的目标是压到 20 条以内，不是召回越多越好。
  */
 export const MAX_CANDIDATES = 20;
+
+/** J14a：global 记忆适用性低于这个就挡下（§6：<0.5 走保守策略）。 */
+export const SCOPE_BLOCK_BELOW = 0.5;
+/** J15：引擎判定「回复用上了这条记忆」的阈值。 */
+export const CITED_BELOW = 0.5;
 
 /** 交给 createJevAdapter 的时间预算。本地模型比 JEV 慢一个量级，所以这两个值可以调。 */
 export interface JudgeTimeouts {
@@ -55,12 +60,14 @@ export interface JevAdapter {
   judgeWrite(content: string, context: string, candidates: MemoryNode[], topics?: readonly string[]): Promise<Judged<WriteJudgment>>;
   /** J5。 */
   judgeRecallNeed(utterance: string, session: SessionInfo): Promise<Judged<NoulResult>>;
-  /** J7。 */
-  judgeRelevance(query: string, candidates: MemoryNode[]): Promise<Judged<RecallJudgment>>;
+  /** J7 + J14a（global 记忆在当前项目适不适用，边界才问）。`projectId` 给边界判断用。 */
+  judgeRelevance(query: string, candidates: MemoryNode[], opts?: { projectId?: string }): Promise<Judged<RecallJudgment>>;
   /** J8。query 必须传进来 —— J8 问的是「这条记忆对**眼下这件事**有没有用」，
    *  没有 query 的话 JEV 只能拿着一段孤立的候选列表瞎猜（实测：把�ype影那条判成了 skip，
    *  反而把不相关的小车点表判成 inject）。 */
   judgeInjection(query: string, candidates: MemoryNode[], budget: TokenBudget): Promise<Judged<InjectionJudgment>>;
+  /** J15：回复里到底用上了哪几条注入的记忆。没有引擎时退回字符串比对（见 feedback.ts）。 */
+  judgeCitations(reply: string, injected: MemoryNode[]): Promise<Judged<CitationJudgment>>;
 }
 
 const num = (a: Answer | undefined, key: "noul" | "score"): number =>
@@ -260,40 +267,96 @@ export function createJevAdapter(client: JudgeClient, opts: JudgeTimeouts = {}):
       }
     },
 
-    async judgeRelevance(query, candidates): Promise<Judged<RecallJudgment>> {
+    async judgeRelevance(query, candidates, opts = {}): Promise<Judged<RecallJudgment>> {
       const t0 = Date.now();
       const capped = candidates.slice(0, MAX_CANDIDATES);
       const relevance = new Map<string, number>();
+      const blocked = new Set<string>();
 
       if (capped.length === 0) {
-        return { relevance, meta: { gate: "J7", fallbackUsed: "none", status: "ok", latencyMs: 0 } };
+        return { relevance, blocked, meta: { gate: "J7", fallbackUsed: "none", status: "ok", latencyMs: 0 } };
       }
 
+      // J14a：只对 global 记忆问边界问题（§11.1 的三个例子之一）。项目的和本会话的
+      // 记忆已经被 SQL 那层门禁管住了，不需要再问；而 global 是唯一「谁都能看见、
+      // 但未必都适用」的那类。多问不涨价（§5.1），跟在 J7 同一次调用里。
+      const globals = capped.filter((m) => m.scope === "global");
       const state =
         `CURRENT REQUEST:\n${query}\n\n` +
+        (opts.projectId ? `CURRENT PROJECT: ${opts.projectId}\n\n` : "") +
         `CANDIDATE MEMORIES:\n${candidateBlock(capped)}`;
-      const questions: Questions = Object.fromEntries(
-        capped.map((m) => [
-          `rel_${m.id}`,
-          {
-            type: "noul" as const,
-            instructions: `Memory [${m.id}] is relevant and useful for answering the CURRENT REQUEST`,
-          },
-        ]),
-      );
+      const questions: Questions = {
+        ...Object.fromEntries(
+          capped.map((m) => [
+            `rel_${m.id}`,
+            {
+              type: "noul" as const,
+              instructions: `Memory [${m.id}] is relevant and useful for answering the CURRENT REQUEST`,
+            },
+          ]),
+        ),
+        ...Object.fromEntries(
+          globals.map((m) => [
+            `applies_${m.id}`,
+            {
+              type: "noul" as const,
+              instructions:
+                `Memory [${m.id}] is a global memory (it is about the user rather than one codebase). It still applies to the work being discussed in the CURRENT REQUEST`,
+            },
+          ]),
+        ),
+      };
 
       try {
         // 召回/注入在 before_agent_start 里，宁可不注入也不能拖住用户：短超时、不重试。
         const res = await client.ask(state, questions, { timeoutMs: fast });
         for (const m of capped) relevance.set(m.id, num(res.answers[`rel_${m.id}`], "noul"));
+        for (const m of globals) {
+          if (num(res.answers[`applies_${m.id}`], "noul") < SCOPE_BLOCK_BELOW) blocked.add(m.id);
+        }
+        const meta = okMeta("J7", res, questions, t0);
         return {
           relevance,
-          meta: okMeta("J7", res, questions, t0),
+          blocked,
+          meta: blocked.size ? { ...meta, detail: `${meta.detail ? `${meta.detail}；` : ""}J14a 挡下 ${blocked.size} 条 global` } : meta,
         };
       } catch (e) {
         // fail-degraded：少召回几条可以，一条都不召回不行。
+        // J14a 那一问判不了就**不挡**任何东西 —— 作用域门禁（SQL 层）还是会执行，
+        // §11.3 说的「JEV 挂了隔离不能跟着失效」靠的就是那层。
         for (const m of capped) relevance.set(m.id, ruleRelevance(query, m));
-        return { relevance, meta: degradation("J7", e, t0, "JEV 不可用，已退回关键词打分") };
+        return { relevance, blocked, meta: degradation("J7", e, t0, "JEV 不可用，已退回关键词打分") };
+      }
+    },
+
+    async judgeCitations(reply, injected): Promise<Judged<CitationJudgment>> {
+      const t0 = Date.now();
+      const cited = new Set<string>();
+      if (injected.length === 0) {
+        return { cited, meta: { gate: "J15", fallbackUsed: "none", status: "ok", latencyMs: 0 } };
+      }
+      const state =
+        `ASSISTANT REPLY (just written):\n${reply.slice(0, 3000)}\n\n` +
+        `INJECTED MEMORIES:\n${candidateBlock(injected)}`;
+      const questions: Questions = Object.fromEntries(
+        injected.map((m) => [
+          `used_${m.id}`,
+          {
+            type: "noul" as const,
+            instructions: `The ASSISTANT REPLY was written using the content of memory [${m.id}] (the same fact or wording appears, or the reply clearly follows it)`,
+          },
+        ]),
+      );
+      try {
+        const res = await client.ask(state, questions, { timeoutMs: fast });
+        for (const m of injected) {
+          if (num(res.answers[`used_${m.id}`], "noul") >= CITED_BELOW) cited.add(m.id);
+        }
+        return { cited, meta: okMeta("J15", res, questions, t0) };
+      } catch (e) {
+        // fail-degraded：判不了就标降级，由调用方退回字符串比对（feedback.ts 的兜底）。
+        // 不在这里自己退回 —— 那会让「引擎判的」和「字符串比的」混成一个结果。
+        return { cited, meta: degradation("J15", e, t0, "JEV 不可用，退回字符串比对") };
       }
     },
 

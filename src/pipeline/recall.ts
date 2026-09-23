@@ -23,8 +23,10 @@ import type { JudgeMeta } from "../jev/types.ts";
 import { DEFAULT_RELEVANCE_THRESHOLD } from "../jev/types.ts";
 import { embed } from "../embed/encoder.ts";
 import {
-  addTrace, listInScope, markAccessed, recordRecall, searchByKeyword, searchByVector, type OpenedDb,
+  addTrace, distinctTopics, listInScope, markAccessed, memoriesByTopic, recordRecall, searchByKeyword,
+  searchByVector, type OpenedDb,
 } from "../storage/db.ts";
+import { bigrams } from "../jev/rule.ts";
 import { buildInjectionBlock, fitBudget } from "./inject.ts";
 
 /** J7 之后的相关性阈值。每个引擎的分数尺度不同，所以实际用的是 adapter.relevanceThreshold。 */
@@ -42,7 +44,7 @@ const PER_SOURCE_LIMIT = 50;
  */
 const MIN_PROMPT = 6;
 
-export type Source = "vector" | "keyword" | "scope";
+export type Source = "vector" | "keyword" | "scope" | "topic";
 
 /** 候选池的一项：同一个 id 被多路召回时合并到一条。 */
 interface Candidate {
@@ -101,6 +103,23 @@ export function worthRecalling(prompt: string): { ok: boolean; reason?: string }
   return { ok: true };
 }
 
+/**
+ * 提问里提到这个主题了吗。纯查表，不是语义判断：
+ *   - 主题名本身出现在提问里（「认证那套」）；
+ *   - 或者提问的二字组有一大半落在主题名里（「提交流程怎么走」对上主题「提交流程」）。
+ * 命中就多捞一路候选，命中错了也不致命 —— J7 会筛。
+ */
+export function mentionsTopic(query: string, topic: string): boolean {
+  if (!topic) return false;
+  if (query.includes(topic)) return true;
+  const t = bigrams(topic);
+  if (t.size === 0) return false;
+  const q = bigrams(query);
+  let hit = 0;
+  for (const g of q) if (t.has(g)) hit++;
+  return hit / t.size >= 0.5;
+}
+
 /** sqlite-vec 的 vec0 默认是 L2 距离；向量已归一化，余弦 = 1 - d²/2。只用来排序。 */
 function similarity(dist: number): number {
   return Math.max(0, 1 - (dist * dist) / 2);
@@ -144,6 +163,20 @@ async function gather(query: string, deps: CandidateDeps): Promise<Map<string, C
   for (const m of searchByKeyword(deps.projectDb, query, PER_SOURCE_LIMIT)) remember(pool, m, "keyword");
   for (const m of searchByKeyword(deps.globalDb, query, PER_SOURCE_LIMIT)) remember(pool, m, "keyword");
 
+  // 同主题那一路上：**只有当提问里出现了某个已知主题的名字**（或它的二字组基本覆盖了
+  // 提问）才走。这不是语义判断，是查表 —— 判断谁是相关的仍然是 J7 的活，
+  // 这里只负责多捞一批候选（候选生成宁可多捞，排名才交给引擎）。
+  try {
+    const topics = [...distinctTopics(deps.projectDb), ...distinctTopics(deps.globalDb)];
+    const hitTopics = topics.filter((t) => mentionsTopic(query, t)).slice(0, 3);
+    for (const t of hitTopics) {
+      for (const m of memoriesByTopic(deps.projectDb, t, PER_SOURCE_LIMIT)) remember(pool, m, "topic");
+      for (const m of memoriesByTopic(deps.globalDb, t, PER_SOURCE_LIMIT)) remember(pool, m, "topic");
+    }
+  } catch {
+    // 主题那一路只是加分项：查不到就少一路候选，不影响其他路
+  }
+
   // 作用域内全部 + 近期：listInScope 就是 ORDER BY created_at DESC，
   // 所以「树遍历」和「时间过滤」是同一趟查询，不重复扫库（§10.1 的两路）。
   // session 作用域单独取一次，因为它的 scope_id 是会话而不是项目。
@@ -179,18 +212,20 @@ function recency(m: MemoryNode, now: number): number {
  * 关键词命中是 0/1，权重不能大：它只说明字面对上了，不代表语义相关。
  */
 function preScore(c: Candidate, now: number): number {
-  return 0.4 * c.vectorSim
-    + 0.2 * (c.sources.has("keyword") ? 1 : 0)
+  return 0.35 * c.vectorSim
+    + 0.15 * (c.sources.has("keyword") ? 1 : 0)
+    + 0.15 * (c.sources.has("topic") ? 1 : 0)   // 主题是人起的名，命中一次比关键词更值钱
     + 0.2 * c.memory.importance
-    + 0.2 * recency(c.memory, now);
+    + 0.15 * recency(c.memory, now);
 }
 
 /** §10.2 混合排序。0.6 给 JEV：它是唯一真的看过 query 的那一项。 */
 function finalScore(relevance: number, c: Candidate, now: number): number {
-  return 0.6 * relevance
+  return 0.55 * relevance
     + 0.15 * c.vectorSim
+    + 0.1 * (c.sources.has("topic") ? 1 : 0)
     + 0.15 * c.memory.importance
-    + 0.1 * recency(c.memory, now);
+    + 0.05 * recency(c.memory, now);
 }
 
 const STATUS_RANK = { ok: 0, degraded: 1, unavailable: 2 } as const;
@@ -247,8 +282,20 @@ async function runRecall(query: string, deps: RecallDeps): Promise<RecallResult>
     return { candidates: [], injected: [], status: "ok", detail: "库里没有命中" };
   }
 
-  const j7 = await deps.adapter.judgeRelevance(query, candidates.map((c) => c.memory));
+  const j7 = await deps.adapter.judgeRelevance(query, candidates.map((c) => c.memory), {
+    projectId: deps.session.projectId,
+  });
+  // J14a：被边界判断挡下的直接剔除（不是低分 —— 低分在降级时会被阈值放行，见 types.ts）。
+  const blocked = j7.blocked ?? new Set<string>();
+  if (blocked.size) {
+    addTrace(deps.projectDb, {
+      stage: "governance", gate: "J14a", action: "block",
+      reason: `${blocked.size} 条 global 记忆判定为不适用于当前项目（${deps.session.projectId}）`,
+      status: j7.meta.status,
+    });
+  }
   const scored = candidates
+    .filter((c) => !blocked.has(c.memory.id))
     .map((c) => {
       const relevance = j7.relevance.get(c.memory.id) ?? 0;
       return { memory: c.memory, relevance, score: finalScore(relevance, c, now) };
@@ -265,7 +312,7 @@ async function runRecall(query: string, deps: RecallDeps): Promise<RecallResult>
 
   addTrace(deps.projectDb, {
     stage: "recall", gate: "J7", action: passed.length ? "keep" : "skip",
-    reason: `合并去重 ${pool.size} → 候选 ${candidates.length} → 过阈值 ${passed.length}`,
+    reason: `合并去重 ${pool.size} → 候选 ${candidates.length}${blocked.size ? `（J14a 挡下 ${blocked.size}）` : ""} → 过阈值 ${passed.length}`,
     status: j7.meta.status, fallbackUsed: j7.meta.fallbackUsed, latencyMs: j7.meta.latencyMs,
   });
 

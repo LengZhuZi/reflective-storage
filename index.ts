@@ -56,7 +56,7 @@ interface Runtime {
   /** query 存着给 J5 用：下次它要判断「这个提问还是上次那件事吗」。 */
   lastRecall?: { status: JudgeMeta["status"] | "skipped"; candidates: number; injected: number; detail?: string; query?: string; at: number };
   lastWrite?: { action: string; reason?: string; at: number };
-  lastFeedback?: { injected: number; cited: number; score: number | null; at: number };
+  lastFeedback?: { injected: number; cited: number; score: number | null; by: string; at: number };
   error?: string;
 }
 
@@ -189,7 +189,8 @@ function statusText(r: Runtime): string {
   const pending = countPendingReviews(r.projectDb);
   if (pending > 0) lines.push(`待确认：${pending} 条（/memory review 过一遍）`);
   if (r.lastFeedback) {
-    lines.push(`上次注入效果：注入 ${r.lastFeedback.injected} 条，确凿用上 ${r.lastFeedback.cited} 条${r.lastFeedback.score === null ? "" : `（命中率 ${(r.lastFeedback.score * 100).toFixed(0)}%）`}`);
+    const how = r.lastFeedback.by === "engine" ? "引擎判定" : "字符串比对（下限）";
+    lines.push(`上次注入效果：注入 ${r.lastFeedback.injected} 条，确凿用上 ${r.lastFeedback.cited} 条${r.lastFeedback.score === null ? "" : `（${how}，命中率 ${(r.lastFeedback.score * 100).toFixed(0)}%）`}`);
   }
   // J15：最近几次召回的事实（没注入的时候最需要看到这个）
   const recalls = recentRecalls(r.projectDb, 3);
@@ -399,12 +400,16 @@ export default function reflectiveStorage(pi: ExtensionAPI): void {
     // 没有助手回复的轮次（重试/中断）**不核对**：拿一段不含回复的上下文去算，
     // 只会把上一轮「确凿用上」的结论覆盖成 0，等于报假账。
     if (replyText.trim()) {
-      try {
-        const fb = closeFeedbackLoop(r.projectDb, r.session.sessionId, replyText);
-        if (fb.injected > 0) r.lastFeedback = { injected: fb.injected, cited: fb.cited.length, score: fb.effectScore, at: Date.now() };
-      } catch (e) {
-        r.error = errText(e);
-      }
+      // 进后台队列：J15 现在会**调一次引擎**问「这条用上了没」（cited 拿钱换精度），
+      // 不能在 agent_end 里同步等它，否则每轮结束都多一段等待。
+      r.pending = r.pending
+        .then(async () => {
+          const fb = await closeFeedbackLoop(r.projectDb, r.session.sessionId, replyText, r.adapter);
+          if (fb.injected > 0) {
+            r.lastFeedback = { injected: fb.injected, cited: fb.cited.length, score: fb.effectScore, by: fb.by, at: Date.now() };
+          }
+        })
+        .catch((e) => { r.error = errText(e); });
     }
     if (texts.length === 0) return;
     // 写入 fail-open 且不该拖住用户：排队后台跑，session_shutdown 冲刷。

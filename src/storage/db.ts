@@ -440,6 +440,25 @@ export function distinctTopics(o: OpenedDb, limit = 30): string[] {
   return rows.map((r) => String(r.topic));
 }
 
+/**
+ * 某个主题下的记忆（J6 的「同主题」那一路召回）。
+ *
+ * 主题是**人起的名字**（引擎只能从已有主题里选，见 review.ts），所以按主题捞是一次
+ * 确定性的分组查询 —— 它跟向量那 0.046 的弱区分度正好互补：说「auth 那套要不要动」
+ * 时，挂在「认证」主题下的记忆可能向量检索漏掉，但按主题一捞就全在。
+ * 捞多了不怕：J7 会按相关性再筛一遍，候选生成本来就该宁可多捞。
+ */
+export function memoriesByTopic(o: OpenedDb, topic: string, limit = 30): MemoryNode[] {
+  const rows = o.db
+    .prepare(
+      `SELECT * FROM memories
+        WHERE topic = ? AND state IN ('active','cold')
+        ORDER BY COALESCE(last_accessed, created_at) DESC LIMIT ?`,
+    )
+    .all(topic, limit) as Row[];
+  return rows.map(toNode);
+}
+
 // ---------------------------------------------------------------- 待确认队列（§6 / §9.3）
 
 export interface ReviewRow extends Row {

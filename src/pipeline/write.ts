@@ -12,7 +12,8 @@
  *     否则分不清「没记」和「系统死了」。
  */
 
-import type { MemoryNode, SessionInfo } from "../core/types.ts";
+import type { MemoryNode, MemoryOrigin, SessionInfo } from "../core/types.ts";
+import { TRUST_CAP } from "../core/types.ts";
 import { resolveScope } from "../core/governance.ts";
 import type { JevAdapter } from "../jev/adapter.ts";
 import { MAX_CANDIDATES, MERGE_ASK_ABOVE, MERGE_AUTO_ABOVE } from "../jev/adapter.ts";
@@ -20,13 +21,13 @@ import { RELATION_AUTO_BELOW } from "./review.ts";
 import { longestSharedRun, ruleScope } from "../jev/rule.ts";
 import { cosine, embed } from "../embed/encoder.ts";
 import {
-  addRelation, addTrace, distinctTopics, getEmbedding, insertMemory, putEmbedding, setState,
-  type InsertMemory, type OpenedDb,
+  addRelation, addTrace, adjustTrust, distinctTopics, getEmbedding, insertMemory, putEmbedding, setState,
+  setTopic, type InsertMemory, type OpenedDb,
 } from "../storage/db.ts";
 import { recallCandidates } from "./recall.ts";
 import { attachPaths } from "./tree.ts";
 import { SAME_THING_RUN } from "./review.ts";
-import { mergeMemories, queueAfterWrite, queueMerge, queueScopeWidening, queueTopicNaming, type ReviewItem } from "./review.ts";
+import { mergeMemories, queueAfterWrite, queueMerge, queueScopeWidening, type ReviewItem } from "./review.ts";
 
 /** 低于这个概率就不写。实测 §4.1：明确要求记住的给出 0.86–0.89，无关内容 0.2。 */
 export const KEEP_THRESHOLD = 0.5;
@@ -36,6 +37,20 @@ export const MERGE_TRIGGER_COSINE = 0.85;
 
 /** 引擎不可用时照存的那条记忆给多少重要性 —— 低到会先被衰减/归档，高到还能被召回。 */
 export const FAIL_OPEN_IMPORTANCE = 0.3;
+
+/**
+ * trust 的三个出厂值。只按**来源**定，不按引擎打分定。
+ *
+ * 为什么不让 JEV 给一句「这条对不对」的分数：它的输入是文本，输出是数字，没有仓库、
+ * 没跑过测试。给它「已有记忆 + 会话上下文」，它做的是一致性检查 —— 而模型自己上次写
+ * 错的东西是自洽的，这次照样打高分。真假的证据不在判断链里，在工具结果里（见下面的
+ * `agentVerified`）。
+ */
+export const TRUST_USER = 1;
+/** 模型写的，但这一轮有工具跑成功过 —— 「改了 X，测试通过」这种有外部验证的结论。 */
+export const TRUST_AGENT_VERIFIED = 0.7;
+/** 模型写的，没有任何外部验证 —— 纯推断。 */
+export const TRUST_AGENT_BARE = 0.4;
 
 /** 短于这个长度的用户输入不值得评估（"继续"、"好"、"嗯"）。 */
 const MIN_LENGTH = 8;
@@ -89,6 +104,15 @@ export function normalizeForDedup(s: string): string {
 export interface TurnInput {
   /** 本轮用户说过的话，按时间顺序。 */
   userTexts: string[];
+  /**
+   * 这些话是谁说的。默认 user。
+   *
+   * 拆句、脱敏、J1 写入闸、查重、合并、冲突检测 —— 两条来源走**完全同一套**，
+   * 唯一的差别就是落库时的 origin/trust 和以后的注入措辞。判断链一个字不改。
+   */
+  origin?: MemoryOrigin;
+  /** origin=agent 时：这一轮有没有工具跑成功过。有就给高一点的 trust（0.7 vs 0.4）。 */
+  agentVerified?: boolean;
   /** 本轮碰过的文件（来自 pi 的 tool call）。给记忆挂树路径用（tree.ts）。 */
   paths?: string[];
   /** 别的项目（id + 线索），让引擎可以判定「这条属于那个项目」（跨项目写入）。 */
@@ -97,6 +121,17 @@ export interface TurnInput {
   openForeign?: (projectId: string) => OpenedDb | null;
   /** 供 JEV 判断用的对话上下文（可以包含助手的话，但同样要洗凭据）。 */
   context: string;
+  /**
+   * 提炼层的结果（可选）。这是**生成**不是判断：`summary` 存进 summary 字段（原文照旧进
+   * content，一行不改），`topic` 只是提议。没配提炼后端就没这个字段，行为跟以前一样。
+   */
+  refinement?: { summary?: string | null; topic?: string | null };
+  /**
+   * 主题兜底提议（可选）：引擎在已有主题里挑不出来、又没有 `refinement` 时调它一次，
+   * 只取主题名。用户自己说的话走这条路（那条路没有 summary 可提炼）。
+   * 返回 null = 这次拿不到名字，主题就留空。抛错按拿不到处理（fail-open）。
+   */
+  topicProposer?: (content: string) => Promise<string | null>;
 }
 
 export interface WriteResult {
@@ -129,11 +164,12 @@ function sentences(text: string): string[] {
  * 本地预筛：决定这份内容值不值得花一次 JEV 调用。
  * 它只负责省钱，不负责判断内容好坏 —— 那是 J1 的活。
  */
-export function worthEvaluating(text: string): { ok: boolean; reason?: string } {
+export function worthEvaluating(text: string, opts: { allowQuestion?: boolean } = {}): { ok: boolean; reason?: string } {
   const t = text.trim();
   if (t.length < MIN_LENGTH) return { ok: false, reason: `太短（${t.length} < ${MIN_LENGTH}）` };
   if (NOISE.test(t)) return { ok: false, reason: "纯确认/催促" };
-  if (isPureQuestion(t)) {
+  // 助手侧跳过问句过滤：一整篇分析里夹个问号就整篇不要了，那不是“判断”，是丢数据。
+  if (!opts.allowQuestion && isPureQuestion(t)) {
     return { ok: false, reason: "疑问句，不是记忆" };
   }
   return { ok: true };
@@ -161,14 +197,28 @@ export function splitForWrite(userTexts: readonly string[]): string[] {
   return [...parts.slice(0, MAX_WRITES_PER_TURN - 1), parts.slice(MAX_WRITES_PER_TURN - 1).join(" ")];
 }
 
-/** 把本轮的候选内容拼成一段交给 J1。多条用户消息合在一起判断，省调用。
- *  纯提问的句子（哪怕夹在陈述中间）先剔掉：它们不是记忆，还会把噪声带进注入块。 */
+/**
+ * 把本轮的候选内容拼成一段交给 J1。
+ *
+ * **用户侧和助手侧走两条路**（实测踩过：同一条路会吃掉助手的长段落）：
+ *   - 用户侧是一句一句说的话：拆句 + 剔掉纯提问（「这个怎么拆？」不是记忆，还会把噪声
+ *     带进注入块）+ 把行内空白压成一个空格。
+ *   - 助手侧是一整篇 markdown（标题、列表、代码块）：**原样保留**。既不拆句、也不过滤
+ *     问句、也不折叠空白 —— 这三个都是为短句写的规则，套在长文上就是数据损失：
+ *       · 一段代码块里没有句号，末尾一个 `？` 就让 `isPureQuestion` 把整段判成提问丢掉
+ *         （实测 325 字的「模块地图」只剩 1 个字）；
+ *       · `[^\S\n]+ → " "` 会把缩进和逐列表对齐全压平（实测一块 776 → 399 字）。
+ *     助手侧的文本已经是被切好的逐字片段，这里的活只剩脱敏和去空行。
+ */
 export function buildCandidate(input: TurnInput): string {
-  return input.userTexts
-    .flatMap((t) => sentences(t))
-    .map((s) => redact(s.replace(/\s+/g, " ")))
-    .filter((s) => s.length > 0 && !isPureQuestion(s))
-    .join("\n");
+  const agent = input.origin === "agent";
+  const pieces = agent
+    ? input.userTexts.map((t) => t.replace(/[ \t]+$/gm, "").trim())
+    : input.userTexts.flatMap((t) => sentences(t)).map((s) => s.replace(/[^\S\n]+/g, " "));
+  return pieces
+    .map((s) => redact(s))
+    .filter((s) => s.length > 0 && (agent || !isPureQuestion(s)))
+    .join(agent ? "\n\n" : "\n");
 }
 
 export async function writeFlow(
@@ -179,7 +229,7 @@ export async function writeFlow(
   input: TurnInput,
 ): Promise<WriteResult> {
   const content = buildCandidate(input);
-  const pre = worthEvaluating(content);
+  const pre = worthEvaluating(content, { allowQuestion: input.origin === "agent" });
   if (!pre.ok) {
     return { action: "noise", reason: pre.reason };
   }
@@ -233,8 +283,13 @@ export async function writeFlow(
   // 并且两边留痕（用户指出过：在前端会话里发现后端问题就该能改，不能只读）。
   const foreign = j.ownerProject ? input.openForeign?.(j.ownerProject) ?? null : null;
   const target = foreign ?? (resolved.scope === "global" ? globalDb : projectDb);
+  const origin: MemoryOrigin = input.origin ?? "user";
+  const trust = origin === "agent" ? (input.agentVerified ? TRUST_AGENT_VERIFIED : TRUST_AGENT_BARE) : TRUST_USER;
   const insert: InsertMemory = {
     content,
+    // 提炼只填 summary：**content 永远是原文**（真相不许被压缩掉，提炼错了也只是多几行
+    // 上下文，不是永久丢信息）。显示和注入默认用 summary，需要细节时用 memory_raw 取原文。
+    summary: input.refinement?.summary ?? undefined,
     type: j.type.choice,
     scope: foreign ? "project" : resolved.scope,
     topic: j.topic,
@@ -244,6 +299,8 @@ export async function writeFlow(
     // 引擎不可用时照存，但压成低重要性（见上面 fail-open 的说明）
     importance: unavailable ? FAIL_OPEN_IMPORTANCE : j.worthKeeping.noul,
     source: session.sessionId,
+    origin,
+    trust,
   };
   const memory = insertMemory(target, insert);
 
@@ -278,7 +335,12 @@ export async function writeFlow(
         for (const c of mergeCandidates) {
           const same = scores.get(c.id) ?? 0;
           if (same >= MERGE_AUTO_ABOVE) {
-            mergeMemories(target, memory.id, c.id, `引擎判定是同一件事（${same.toFixed(2)}）`);
+            // 保留用户原话：把一条模型转述的并进用户的话里，不该反过来 —— 否则存活下来
+            // 的是模型的重述，用户的原话反而被标成已取代（保下来的文字就不对了）。
+            const keepUser = memory.origin === "agent" && c.origin === "user";
+            const keepId = keepUser ? c.id : memory.id;
+            const dropId = keepUser ? memory.id : c.id;
+            mergeMemories(target, keepId, dropId, `引擎判定是同一件事（${same.toFixed(2)}）`);
             merged++;
           } else if (same >= MERGE_ASK_ABOVE) {
             // 中间档问用户（不自动合并）。返回的项要带出去，否则调用方不知道要弹这一条。
@@ -293,11 +355,31 @@ export async function writeFlow(
 
   if (j.relation.choice !== "none" && j.targetId) {
     addRelation(target, memory.id, j.targetId, j.relation.choice, j.relation.confidence);
+    // 被比的那条在哪个库：作用域硬过滤是按库拆的，调 trust 得调对库。
+    const old = candidates.find((c) => c.id === j.targetId);
+    const oldDb = old?.scope === "global" ? globalDb : projectDb;
+
+    // trust 的涨跌就靠这两件**可观测**的事，不靠引擎打分：
+    //   extends     用户后来在同一个话题上说话，又没推翻它  = 默许 → 升 0.1，封顶 TRUST_CAP
+    //   contradicts 撞上反证                              = 降 0.2
+    // 只对 agent 来源的记忆动 —— 用户自己的话 trust 本来就是 1.0，没什么可升的。
+    // 注意 contradicts 这里**只降不删**：哪条对得人来判（下面那个分支把它排进待确认队列）。
+    if (old?.origin === "agent") {
+      const delta = j.relation.choice === "extends" ? 0.1 : j.relation.choice === "contradicts" ? -0.2 : 0;
+      const next = delta ? adjustTrust(oldDb, j.targetId, delta, TRUST_CAP) : null;
+      if (next !== null) {
+        addTrace(oldDb, {
+          memoryId: j.targetId, stage: "governance", gate: "J3-trust", action: "trust",
+          targetId: memory.id, reason: `${j.relation.choice}：trust ${delta > 0 ? "+" : ""}${delta} → ${next.toFixed(2)}`,
+          confidence: j.relation.confidence, status: j.meta.status,
+        });
+      }
+    }
+
     // §6 的「>0.8 直接执行」：**取代**够确信就把旧那条标掉，否则两条并存的记忆
     // 会同时在库里，召回给哪条看运气（贪吃蛇 demo 验出来的：音效「不做」和「加上」
     // 一度并存）。冲突（contradicts）不自动执行 —— 哪条对得人来判。
     if (j.relation.choice === "supersedes" && j.relation.confidence >= RELATION_AUTO_BELOW) {
-      const oldDb = candidates.find((c) => c.id === j.targetId)?.scope === "global" ? globalDb : projectDb;
       setState(oldDb, j.targetId, "superseded");
       addTrace(oldDb, {
         memoryId: j.targetId, stage: "governance", gate: "J3", action: "superseded",
@@ -307,11 +389,33 @@ export async function writeFlow(
     }
   }
 
+  // 主题一律由**提炼层那个模型**定（它在生成 summary 的同一次调用里给名字，提示词里带了项目名 +
+  // 已有主题，并要求优先复用）。引擎的 J4 降为兜底：它只能在已有主题里挑，不是生成。
+  // 两者都直接落库，不问用户；碎出来的同义词由「近义堆」兜底合并（一键合、可回滚）。
+  let effectiveTopic = input.refinement?.topic ?? j.topic ?? null;
+  // 两条路都没名字时，让提炼层现场生成一个（用户侧的记忆只能走这条：引擎不许造词，
+  // 而 J4 又只能在**已有**主题里挑）。拿不到就留空，不影响这条记忆落库。
+  if (!effectiveTopic && input.topicProposer) {
+    try {
+      effectiveTopic = await input.topicProposer(memory.content);
+    } catch {
+      /* 提议失败不影响写入 */
+    }
+    if (effectiveTopic) {
+      addTrace(target, {
+        memoryId: memory.id, stage: "write", gate: "refine", action: "topic",
+        reason: `主题由提炼层现场生成：「${effectiveTopic}」`, status: "ok",
+      });
+    }
+  }
+  if (effectiveTopic) setTopic(target, memory.id, effectiveTopic);
+  // 返回值也要反映刚落下去的主题，否则调用方（/memory、轨迹）看到的是「没主题」。
+  if (effectiveTopic) memory.topic = effectiveTopic;
+
   // 引擎不确定的事（§6 的 <0.5 档）和「看着是同一件事」（§9.3 合并）排进待确认队列。
   // 这里只提议、不动数据 —— 判不了就交给用户，别让污染记忆自己沉淀下去。
   const review = [
     ...queueAfterWrite(target, memory, candidates, j.relation, j.targetId, j.meta.status !== "ok"),
-    ...queueTopicNaming(target, memory, topics),
     // J14b：引擎说 global 但我们收窄了 → 问用户要不要放宽（本地版不做 LLM 复核，就问用户）
     ...queueScopeWidening(target, memory, j.scope.choice),
     ...mergeAsk,

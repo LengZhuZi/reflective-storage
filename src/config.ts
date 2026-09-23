@@ -64,14 +64,51 @@ export interface LoadedConfig {
   recall: RecallConfig;
   proactive: ProactiveConfig;
   ui: UiConfig;
+  refine: RefineConfig;
   /** 读取时发现的问题。降级时必须把这些说出去，不能静默（§6.2）。 */
   problems: string[];
 }
 
-/** 本地网页面板（`/memory ui`）。`port` 省略或 0 = 让系统挑空闲端口。 */
+/**
+ * 本地网页面板（`/memory ui`）。面板是常驻进程（第一个会话把它 detached 起，之后所有会话
+ * 共用同一份），所以端口默认固定：URL 能收藏，别的会话也能靠它找到已经在跑的面板。
+ * `port: 0` 仍然有效 —— 让系统挑，实际端口写进 `ui.json` 供其他会话发现。
+ */
 export interface UiConfig {
   port: number;
 }
+
+/** 面板默认端口。改这里或 config.json 的 `ui.port`。 */
+export const DEFAULT_UI_PORT = 4319;
+
+/**
+ * 提炼层（可选）。干的活是**生成**：把长回复压成一条记忆 + 给个主题名。
+ * 判断还是 JEV 的，这里不做判断。不配就是关的（默认零外部依赖）。
+ *
+ * 只要能说 OpenAI 的 `/chat/completions`，云端和本机就是同一份代码，
+ * 所以这里只有一张 provider 表，没有每个厂商一套实现。
+ */
+export interface RefineConfig {
+  /** "off" = 不提炼，存原文。其他值见 REFINE_PROVIDERS，没登记的就当自定义端点。 */
+  provider: string;
+  apiKey?: string;
+  baseUrl?: string;
+  model?: string;
+  /** 写入在后台队列里跑，可以给宽一点。 */
+  timeoutMs: number;
+  /** 提炼后的记忆上限（字）。长了截断，不丢整条。 */
+  maxSummaryChars: number;
+  problems: string[];
+}
+
+/** 常见端点。ollama / llama.cpp / vLLM 都是本机，keyless。 */
+export const REFINE_PROVIDERS: Record<string, { baseUrl: string; model: string; keyless?: boolean }> = {
+  hunyuan: { baseUrl: "https://api.hunyuan.cloud.tencent.com/v1", model: "hunyuan-lite" },
+  zhipu: { baseUrl: "https://open.bigmodel.cn/api/paas/v4", model: "glm-4-flash" },
+  deepseek: { baseUrl: "https://api.deepseek.com/v1", model: "deepseek-chat" },
+  openai: { baseUrl: "https://api.openai.com/v1", model: "gpt-4o-mini" },
+  ollama: { baseUrl: "http://127.0.0.1:11434/v1", model: "qwen2.5:7b", keyless: true },
+};
 
 /**
  * J16 主动召回（§4）。默认**开**，但每会话最多一次 —— 主动打扰的频率必须先保证不烦人。
@@ -172,15 +209,59 @@ export function loadConfig(): LoadedConfig {
     recall: resolveRecall(file?.recall),
     proactive: resolveProactive(file?.proactive),
     ui: resolveUi(file?.ui),
+    refine: resolveRefine(file?.refine),
     problems,
   };
 }
 
-/** 本地 UI 的端口。默认 0（系统挑），端口被占也不至于起不来。 */
+/** 本地 UI 的端口。默认固定（见 DEFAULT_UI_PORT）；显示写 `port: 0` 才是「系统挑」。 */
 function resolveUi(raw: unknown): UiConfig {
   const file = (raw ?? {}) as Record<string, unknown>;
   const p = file.port;
-  return { port: typeof p === "number" && Number.isInteger(p) && p >= 0 && p < 65536 ? p : 0 };
+  return { port: typeof p === "number" && Number.isInteger(p) && p >= 0 && p < 65536 ? p : DEFAULT_UI_PORT };
+}
+
+/**
+ * 提炼层。没配 provider（或 provider=off）就是关的 —— 默认不调任何外部模型。
+ * 环境变量优先于配置文件，和 typesafe 那边一套规矩。
+ */
+function resolveRefine(raw: unknown): RefineConfig {
+  const file = (raw ?? {}) as Record<string, unknown>;
+  const problems: string[] = [];
+  const env = (k: string) => str(process.env[k]);
+  const provider = (env("REFLECTIVE_REFINE_PROVIDER") ?? str(file.provider) ?? "off").toLowerCase();
+  const preset = REFINE_PROVIDERS[provider];
+  const baseUrl = env("REFLECTIVE_REFINE_BASE_URL") ?? str(file.baseUrl) ?? preset?.baseUrl;
+  const model = env("REFLECTIVE_REFINE_MODEL") ?? str(file.model) ?? preset?.model;
+  const apiKey = env("REFLECTIVE_REFINE_API_KEY") ?? str(file.apiKey);
+  // **默认不超时**（0）：摘要是必须的，慢也得等。
+  //
+  // 原来是 8s，而提炼的输入现在是回复全文（实测 6465 字 ≈ 3.5k 输入 token，glm-4-flash
+  // 要 11.2s）—— 8s 会让长回复的提炼**全部静默超时**，表现像“提炼得真烂”，
+  // 真相是根本没提炼（fail-open 存原文，只有轨迹里看得见）。
+  // 想设上限仍然可以（`refine.timeoutMs: 20000`），但别为了省等待把摘要丢掉。
+  // 代价：写入队列在 `session_shutdown` 会被等，端点挂着不回就是退出时等（无上限）。
+  const timeout = typeof file.timeoutMs === "number" && file.timeoutMs > 0 ? file.timeoutMs : 0;
+  // 默认 600：提炼要的是**要点**（文件名/路径/版本号/结论），不是一句话总结。
+  // 原来 120 字只能容纳一句抽象结论，下个会话问细节就只能看到“质量集中在某目录”这种。
+  const maxChars = typeof file.maxSummaryChars === "number" && file.maxSummaryChars > 0 ? file.maxSummaryChars : 600;
+
+  const off = provider === "off" || provider === "none" || provider === "";
+  if (!off) {
+    if (!baseUrl) problems.push(`提炼后端 ${provider} 没有端点：填 refine.baseUrl，或换成登记过的 provider（${Object.keys(REFINE_PROVIDERS).join(" / ")}）`);
+    if (!model) problems.push(`提炼后端 ${provider} 没有模型名：填 refine.model`);
+    if (!apiKey && !preset?.keyless) problems.push("提炼后端没有 key：填 refine.apiKey 或设 REFLECTIVE_REFINE_API_KEY");
+  }
+
+  return {
+    provider: off ? "off" : provider,
+    apiKey,
+    baseUrl,
+    model,
+    timeoutMs: timeout > 0 ? Math.max(500, Math.floor(timeout)) : 0,
+    maxSummaryChars: Math.max(24, Math.floor(maxChars)),
+    problems,
+  };
 }
 
 /** J16 开关。默认开、每会话 1 次。 */

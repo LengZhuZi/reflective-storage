@@ -19,7 +19,7 @@
 import type { MemoryNode } from "../core/types.ts";
 import {
   addRelation, addTrace, enqueueReview, getMemory, insertMemory, pendingReviews, resolveReview,
-  setState, type ReviewRow,
+  setState, setTrust, type ReviewRow,
 } from "../storage/db.ts";
 import { longestSharedRun } from "./feedback.ts";
 
@@ -68,6 +68,8 @@ export function widenScopeToGlobal(projectDb: OpenedDb, globalDb: OpenedDb, memo
   const moved = insertMemory(globalDb, {
     content: m.content, type: m.type, scope: "global", scopeId: null,
     importance: m.importance, summary: m.summary, topic: m.topic, source: m.source,
+    // 放宽作用域不该顺手把可信度洗成 1.0 —— 模型推断的仍然是模型推断的。
+    origin: m.origin, trust: m.trust,
   });
   setState(projectDb, m.id, "superseded");
   addTrace(globalDb, { memoryId: moved.id, stage: "governance", gate: "J14b", action: "widen", reason: "用户确认放宽到全局" });
@@ -144,24 +146,13 @@ export function queueAfterWrite(
 }
 
 /**
- * J4 的起名环节：引擎在**已有主题**里挑不出合适的（topic=null）时，问用户要不要起一个。
+ * 主题名由**模型**定（提取层提议 + 引擎在已有主题里选），不再问用户。
  *
- * 为什么是用户起名而不是引擎生成：给记忆起名是**生成文本**，§15 原则 1 明确不让引擎干。
- * 而主题树的价值只在「同一个人会反复用到同一批主题」时才成立 —— 用户起的名字天然稳定，
- * 引擎每次生成的名字会碎成一地同义词（"数据迁移"/"数据库迁移"/"DB 迁移"）。
+ * 之前是“全新的名字落复核队列，用户点一下”，代价是主题这一类占满了整个队列（实测 33/37）
+ * 而用户永远不点。现在同义词碎片交给「近义堆」那个视图——它本来就是批量合并、可回滚的。
  *
- * 只在够重要的记忆上问（importance 偏低的多半是一次性事件，不值得占用户一次输入）。
+ * `kind="topic"` 在 `ReviewKind` 里保留：旧库里排着的历史条目还要能解（server.ts 认它）。
  */
-export const TOPIC_ASK_IMPORTANCE = 0.7;
-
-export function queueTopicNaming(o: OpenedDb, memory: MemoryNode, existingTopics: readonly string[]): ReviewItem[] {
-  if (memory.topic) return [];
-  if (memory.importance < TOPIC_ASK_IMPORTANCE) return [];
-  const options = [...existingTopics.slice(0, 6), "先不起主题"];
-  const question = `要不要给这条记忆起个主题？（方便以后按主题找回）\n${clip(memory.content, 80)}`;
-  const id = enqueueReview(o, { kind: "topic", memoryId: memory.id, otherId: null, question, options });
-  return id ? [{ id, kind: "topic", memoryId: memory.id, otherId: null, question, options }] : [];
-}
 
 /**
  * 真合并：新的留着，旧的标 `superseded`，**旧原文存进新的 `metadata`**（可查、可回滚），
@@ -177,6 +168,9 @@ export function mergeMemories(o: OpenedDb, keepId: string, dropId: string, reaso
   const mergedFrom = Array.isArray(meta.mergedFrom) ? (meta.mergedFrom as unknown[]) : [];
   mergedFrom.push({ id: drop.id, content: drop.content, at: Date.now(), reason });
   o.db.prepare(`UPDATE memories SET metadata = ? WHERE id = ?`).run(JSON.stringify({ ...meta, mergedFrom }), keep.id);
+  // 合并时要保留**高的**那一档可信度：把一条用户原话并进一条模型推断里，不该连用户的
+  // 权威一起丢掉（反之也不该升：并进来的低 trust 不该把保留的那条拉低）。
+  if (drop.trust > keep.trust) setTrust(o, keep.id, drop.trust);
   setState(o, drop.id, "superseded");
   addRelation(o, keep.id, drop.id, "supersedes", 1);
   addTrace(o, { memoryId: keep.id, stage: "governance", gate: "J11", action: "merge", targetId: drop.id, reason, status: "ok" });

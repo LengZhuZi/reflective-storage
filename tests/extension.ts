@@ -95,7 +95,7 @@ globalThis.fetch = jevFetch;
 for (const hook of ["session_start", "before_agent_start", "agent_end", "session_compact", "session_before_switch", "session_shutdown"]) {
   assert.ok(handlers.has(hook), `hook ${hook} 必须挂上`);
 }
-assert.deepEqual([...tools.keys()].sort(), ["memory_add", "memory_forget", "memory_search"]);
+assert.deepEqual([...tools.keys()].sort(), ["memory_add", "memory_forget", "memory_raw", "memory_search"]);
 assert.ok(commands.has("memory"));
 for (const t of tools.values()) {
   assert.ok(
@@ -103,7 +103,7 @@ for (const t of tools.values()) {
     `${t.name} 的 promptGuidelines 必须点名自己的工具名（pi 把 guideline 平铺，不写清工具名模型分不出「这个工具」指谁）`,
   );
 }
-console.log("✓ 六个 hook + 三个工具 + /memory 命令都挂上，guideline 点名了工具");
+console.log("✓ 六个 hook + 四个工具 + /memory 命令都挂上，guideline 点名了工具");
 
 // ------------------------------------------------------------ 会话开始
 const dbFile = path.join(tmp, "projects", `${projectIdFor(tmp)}.db`);
@@ -286,6 +286,12 @@ enqueueReview(seed, {
   kind: "merge", memoryId: anyMemory, otherId: anyMemory, question: "测试用提议：这两条要合并吗？",
   options: ["保留两条（并存）", "用新的取代旧的", "保留旧的，把新的标为已取代"],
 });
+// 主题条目是**历史遗留**：现在主题由模型直接落库（write.ts），不再产生队列项；
+// 但旧库里排着的那批还得能解，所以这里手工造一条来验证文本框那条路没断。
+enqueueReview(seed, {
+  kind: "topic", memoryId: anyMemory, otherId: null, question: "要不要给这条记忆起个主题？",
+  options: ["先不起主题"],
+});
 assert.ok(countPendingReviews(seed) >= 1);
 const pendingBefore = countPendingReviews(seed);
 selects.length = 0;
@@ -294,7 +300,7 @@ await runCommand("review");
 assert.equal(countPendingReviews(seed), 0, `/memory review 要把队列过完（原本 ${pendingBefore} 条）`);
 assert.ok(selects.length >= 1, "合并/冲突用 pi 的 1/2/3 选择框");
 assert.equal(selects.find(([t]) => /测试用提议/.test(t))![1].length, 3, "三个选项：并存 / 用新的取代旧的 / 保留旧的");
-assert.ok(inputs.length >= 1, "J4 的起名用文本框（select 只能选不能输入）");
+assert.ok(inputs.length >= 1, "历史遗留的主题条目用文本框（select 只能选不能输入）");
 assert.match(inputs[0], /起个主题/);
 const { distinctTopics } = await import("../src/storage/db.ts");
 assert.deepEqual(distinctTopics(seed), ["提交流程"], "用户起的名字要真的写进记忆的 topic");
@@ -344,6 +350,103 @@ branch.length = 0;
 console.log("✓ 写入排队 + 拆句口径一致：并发不重复、整轮原话不落库");
 await runCommand("review");   // 上面几条排的队过完，不影响后面「队列不越攒越多」的断言
 
+// ------------------------------------------------------------ 助手侧写入：只在有工具验证时
+// 引擎判不了真假 —— 它只能看到文本，而模型自己上次写错的东西是自洽的。所以助手侧的门
+// 开在**工具结果**上：这一轮有工具跑成功过才算有证据，而且只取回复尾部。三道门都钉住。
+assert.ok(handlers.has("tool_result"), "tool_result 必须挂上：这是全系统唯一的真假证据来源");
+
+// 门一：没跑过工具 → 回复里那句「结论」不许入库
+await call("session_compact");
+await call("before_agent_start", { prompt: "缓存策略是怎么写的？" });   // 每轮开头清 toolOk
+const beforeAgent = countMemories(seed);
+await call("agent_end", {
+  messages: [
+    { role: "user", content: "缓存策略是怎么写的？" },   // 带疑问形状 → 本地预筛先挡掉，这一轮只剩助手侧要判
+    { role: "assistant", content: [{ type: "text", text: "这个项目的缓存统一走本机 SQLite，配置在 config.json 里。" }] },
+  ],
+});
+await new Promise((r) => setTimeout(r, 80));
+assert.equal(countMemories(seed), beforeAgent, "没有工具验证的模型结论不许入库（会被下个会话当既成事实引回来）");
+
+// 门一（续）：工具报错也不算验证
+await call("tool_result", { toolName: "bash", isError: true });
+await call("agent_end", {
+  messages: [
+    { role: "user", content: "缓存策略是怎么写的？" },
+    { role: "assistant", content: [{ type: "text", text: "缓存层走的是本机 SQLite，没有 Redis 这一层。" }] },
+  ],
+});
+await new Promise((r) => setTimeout(r, 80));
+assert.equal(countMemories(seed), beforeAgent, "工具报错不能当验证");
+
+// 门一开着：工具跑成功过 → 结论入库，而且来源标成 agent、trust 是 0.7 那一档
+await call("tool_result", { toolName: "bash", isError: false });
+await call("agent_end", {
+  messages: [
+    { role: "user", content: "缓存策略是怎么写的？" },
+    { role: "assistant", content: [{ type: "text", text: "查完了：这个项目的缓存统一走本机 SQLite，没有 Redis。" }] },
+  ],
+});
+let agentRow: { id: string; origin: string; trust: number } | undefined;
+for (let i = 0; i < 100 && !agentRow; i++) {
+  agentRow = seed.db.prepare(`SELECT id, origin, trust FROM memories WHERE origin = 'agent'`).get() as typeof agentRow;
+  if (!agentRow) await new Promise((r) => setTimeout(r, 50));
+}
+assert.ok(agentRow, "有工具验证的结论要入库");
+assert.equal(agentRow.trust, 0.7, "有验证 = 0.7（比纯推断高，还是低于用户原话）");
+
+// 门二：每一轮开头 toolOk 要清零，否则「上一轮跑过工具」会无限给后面每一轮背书
+await call("before_agent_start", { prompt: "那别的怎么办？" });
+const afterReset = countMemories(seed);
+await call("agent_end", {
+  messages: [
+    { role: "user", content: "那别的怎么办？" },
+    { role: "assistant", content: [{ type: "text", text: "这次没跑任何工具，只是随便说了句结论。" }] },
+  ],
+});
+await new Promise((r) => setTimeout(r, 80));
+assert.equal(countMemories(seed), afterReset, "上一轮的工具验证不能给这一轮背书（toolOk 每轮清零）");
+
+// 门三：助手侧一轮只写一条（不拆句）。一段多句的分析拆开就是几条互不相干的碎片，
+// 实测拆出过 `.close()` + \`projectDb.close()\`。 这种碎片过了长度门就进库了。
+await call("session_compact");
+await call("tool_result", { toolName: "bash", isError: false });
+const beforeOneShot = Number((seed.db.prepare(`SELECT count(*) n FROM memories WHERE origin = 'agent'`).get() as { n: number }).n);
+await call("agent_end", {
+  messages: [
+    { role: "user", content: "把迁移方案说清楚。" },
+    { role: "assistant", content: [{ type: "text", text: "迁移分三步。第一步先建新表。第二步双写一段时间。第三步切读并回滚旧表。另外索引要重建。备份必须提前做。" }] },
+  ],
+});
+const agentCount = () => Number((seed.db.prepare(`SELECT count(*) n FROM memories WHERE origin = 'agent'`).get() as { n: number }).n);
+for (let i = 0; i < 100 && agentCount() === beforeOneShot; i++) await new Promise((r) => setTimeout(r, 50));
+assert.equal(agentCount() - beforeOneShot, 1, "助手侧一轮最多一条（拆句会把一段分析拆成碎片）");
+const oneShot = seed.db.prepare(`SELECT content FROM memories WHERE origin = 'agent' ORDER BY created_at DESC LIMIT 1`).get() as { content: string };
+assert.match(oneShot.content, /备份必须提前做/, "一条里要盖住整段回复，不是只留第一句");
+
+// memory_add 的另一半：用户这轮说的话过不了拆句（只是提问）时，才存模型自己给的文本 ——
+// 而且按 agent 来源写（低 trust + 注入带标记）。用户话能用时仍然存用户的话（上面已钉）。
+branch.length = 0;
+branch.push({ type: "message", message: { role: "user", content: "那个表的主键是什么？" } });
+const agentAdded = await tools.get("memory_add")!.execute(undefined, { content: "该表用的是复合主键（租户 id + 业务 id）" }, undefined, undefined, ctx) as { content: Array<{ text: string }> };
+assert.match(agentAdded.content[0].text, /模型推断/, `模型自己那条要标明来源，实际：${agentAdded.content[0].text}`);
+const addedRow = seed.db.prepare(`SELECT origin, trust FROM memories WHERE content LIKE '%复合主键%'`).get() as { origin: string; trust: number } | undefined;
+assert.equal(addedRow?.origin, "agent", "用户只是在提问 → 存模型的话，但要标来源");
+assert.ok((addedRow?.trust ?? 1) < 0.8, "标来源还不够：trust 要低到注入时会带标记");
+branch.length = 0;
+await runCommand("review");   // 上面排的队过完，不影响后面的断言
+console.log("✓ 助手侧写入的两道门：工具验证 + 每轮清零；一轮只写一条；memory_add 在用户话不可用时才存模型的话");
+
+// ------------------------------------------------------------ 原文回读接口
+// 提炼过的记忆默认只给精炼版，所以「取原文」这条路必须在（不然细节就找不回来了）。
+await call("session_compact");
+const rawLine = (await tools.get("memory_raw")!.execute(undefined, { id: agentRow!.id }, undefined, undefined, ctx)) as { content: Array<{ text: string }> };
+assert.match(rawLine.content[0]!.text, /查完了：这个项目的缓存统一走本机 SQLite/, "memory_raw 要回原文");
+assert.match(rawLine.content[0]!.text, /原文 \d+ 字/);
+const missingRaw = (await tools.get("memory_raw")!.execute(undefined, { id: "nope" }, undefined, undefined, ctx)) as { content: Array<{ text: string }> };
+assert.match(missingRaw.content[0]!.text, /没有 id 为 nope/, "找不到就说找不到，不当报错");
+console.log("✓ memory_raw 回原文（提炼过的记忆还有这条路拿细节）");
+
 // ------------------------------------------------------------ /memory ui：告诉用户去哪个地址
 notes.length = 0;
 await runCommand("ui");
@@ -354,7 +457,8 @@ assert.match(uiNote, /设账号密码/, "要说明首次访问会要求设账号
 // 再敲一次不该起第二个服务（端口不会变）
 notes.length = 0;
 await runCommand("ui");
-assert.equal(notes.at(-1), uiNote, "重复 /memory ui 复用同一个页面地址");
+assert.match(notes.at(-1)!, /已经在跑/, "第二次要说明复用已经在跑的那个");
+assert.equal(notes.at(-1)!.match(/http:\/\/127\.0\.0\.1:\d+\//)?.[0], uiNote.match(/http:\/\/127\.0\.0\.1:\d+\//)?.[0], "重复 /memory ui 复用同一个页面地址");
 console.log("✓ /memory ui 给出本机页面地址，重复执行复用同一个");
 
 // ------------------------------------------------------------ J16 主动召回
@@ -424,5 +528,8 @@ assert.match(proxyNotes[0], /HTTP_PROXY|NODE_USE_ENV_PROXY/);
 delete process.env.REFLECTIVE_JUDGE_PROVIDER;
 console.log("✓ 引擎连不上时 fail-closed，「降级」可见，代理提示只报一次");
 
+// 面板是常驻进程（不跟着会话退），测试自己收尾 —— 不然它握着端口活到下次跑测试。
+const { stopUi } = await import("../src/ui/server.ts");
+assert.equal(await stopUi(), true, "/memory ui stop 要能停掉常驻面板");
 fs.rmSync(tmp, { recursive: true, force: true });
 console.log("\n全部通过");

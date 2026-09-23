@@ -267,13 +267,47 @@ await writeFlow(project, global, fakeAdapter(0.9, { topic: "提交与发布", se
   userTexts: ["发布前的检查清单必须先跑一遍"], context: "",
 });
 assert.ok(secondTopics.includes("提交与发布"), "之后写的时候，已有主题要出现在给引擎的选项里");
-// 引擎挑不出主题（none）且足够重要 → 排一条「要不要起个主题」给用户
+// 引擎挑不出主题（none）时，提炼层提议的名字**直接落库**（模型定名，不再问用户）
 const naming = await writeFlow(project, global, fakeAdapter(0.95, { importance: 0.95, topic: null }), session, {
   userTexts: ["灰度发布的比例以后都按 5% 起步"], context: "",
+  refinement: { summary: "灰度发布从 5% 起步", topic: "发布流程" },
 });
-assert.ok(JSON.stringify(naming.review ?? []).includes("起个主题"), "没主题又重要的记忆，要问用户起名（引擎不许造词）");
-console.log("✓ J4 主题：引擎在已有主题里挑、落库、不重复问用户");
+assert.equal(naming.memory?.topic, "发布流程", "提炼层提议的主题要直接落库");
+assert.ok(
+  !(naming.review ?? []).some((r) => r.kind === "topic"),
+  "主题不再进复核队列（模型自己定）",
+);
+// 提炼层没给主题时就留空，也不排队
+const noTopic = await writeFlow(project, global, fakeAdapter(0.95, { importance: 0.95, topic: null }), session, {
+  userTexts: ["这段回复不值得起主题"], context: "",
+  refinement: { summary: "没主题" },
+});
+assert.equal(noTopic.memory?.topic, null);
+assert.ok(!(noTopic.review ?? []).some((r) => r.kind === "topic"));
+console.log("✓ J4 主题：引擎在已有主题里挑、提炼层的提议直接落库、不问用户");
 
+
+// ------------------------------------------------------------ 助手侧的长文不许被「短句规则」吃掉
+// 实测踩过：一段 325 字的代码块（模块地图）末尾带个问号，被 isPureQuestion 整段判成提问丢掉，
+// 只剩 1 个字；`[^\S\n]+ → " "` 又把缩进和列对齐全压平（一块 776 → 399 字）。
+const modMap = [
+  "## 模块地图",
+  "```",
+  "tobacco-common           常量/启动器/缓存名/工具（极薄）",
+  "tobacco-service/",
+  "  ├ datadistribution  :9001  采集 PLC 实时数据",
+  "```",
+  "还有个 frontend 是 Vue2（老仓库里的，没合进来？）",
+].join("\n");
+const agentBuilt = buildCandidate({ userTexts: [modMap], context: "", origin: "agent", agentVerified: true });
+assert.equal(agentBuilt, modMap, "助手侧原样保留：不拆句、不滤问句、不折叠空白");
+assert.ok(agentBuilt.includes("  ├ datadistribution"), "代码块缩进要留住");
+assert.equal(worthEvaluating(agentBuilt, { allowQuestion: true }).ok, true, "助手侧带问号的长文照样值得判断");
+assert.equal(worthEvaluating("数据库迁移工具是怎么定的？").ok, false, "用户侧还是把纯提问挡在门外（省钱那条规则不能废）");
+const userBuilt = buildCandidate({ userTexts: ["这个怎么拆？另外提交要一个模块一个。", "继续"], context: "" });
+assert.ok(!userBuilt.includes("怎么拆"), "用户侧问句仍然被剔掉");
+assert.ok(userBuilt.includes("一个模块一个"), "用户侧的陈述留着");
+console.log("✓ 长文入库：助手侧不过短句过滤器（问句/空白折叠只作用于用户侧）");
 
 // ------------------------------------------------------------ 断言常量
 assert.ok(KEEP_THRESHOLD > 0.2 && KEEP_THRESHOLD < 0.86, "阈值必须落在实测的无关(0.2)和明确要求(0.86)之间");

@@ -17,6 +17,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { Type } from "typebox";
 import type { JudgeMeta } from "./src/jev/types.ts";
 import type { MemoryNode, SessionInfo } from "./src/core/types.ts";
+import { TRUST_MARK_BELOW } from "./src/core/types.ts";
 import { createJudgeAdapter, type JevAdapter } from "./src/jev/adapter.ts";
 import { loadConfig, proxyHint, type InjectConfig, type RecallWeights } from "./src/config.ts";
 import {
@@ -25,10 +26,12 @@ import {
   resolveReview, setTopic, tracesFor, type OpenedDb,
 } from "./src/storage/db.ts";
 import { splitForWrite, writeFlow } from "./src/pipeline/write.ts";
+import { TRUST_AGENT_BARE, TRUST_AGENT_VERIFIED } from "./src/pipeline/write.ts";
 import { recallFlow, worthRecalling } from "./src/pipeline/recall.ts";
 import { resurrectFor, runLifecycle } from "./src/pipeline/lifecycle.ts";
 import { closeFeedbackLoop } from "./src/pipeline/feedback.ts";
-import { startUi, type UiHandles } from "./src/ui/server.ts";
+import { ensureUi, stopUi } from "./src/ui/server.ts";
+import { createRefiner, labelAll, splitSections, type LabelItem, type Refiner } from "./src/refine/refine.ts";
 import { openDb, projectDbFile } from "./src/storage/db.ts";
 import {
   RESOLUTION_LABELS, SCOPE_WIDEN, applyResolution, labelToResolution, pendingItems, widenScopeToGlobal,
@@ -48,6 +51,14 @@ interface Runtime {
   digested: Set<string>;
   /** 本会话碰过的文件（来自 tool call）—— 给记忆挂树路径用。 */
   touched: Set<string>;
+  /**
+   * 这一轮有没有工具跑成功过（来自 tool_result）。
+   *
+   * 这是全系统里**唯一**的真假证据来源：判断引擎只能看到文本，而测试跑没跑过、命令
+   * 退出码几，只有工具结果知道。只记这个布尔值，不碰工具输出本身 —— 那里面有凭据和
+   * 几百行日志（agent_end 的 userTexts 也是为这个才过滤它的）。
+   */
+  toolOk: boolean;
   /** 本会话的注入策略（config.inject）。 */
   inject: InjectConfig;
   /** §10.2 的混合排序权重。 */
@@ -58,12 +69,18 @@ interface Runtime {
   proactive: { enabled: boolean; maxPerSession: number };
   /** 本会话已经主动提醒过几次。 */
   proactiveCount: number;
-  /** 本地页面的端口（0 = 系统挑）。 */
+  /** 本地页面的端口（0 = 系统挑；实际端口记在 ui.json，别的会话靠它发现面板）。 */
   uiPort: number;
   /** 配置读取时发现的问题（文件缺失 / 权限不对 / 解析失败），/memory 要能看见。 */
   configProblems: string[];
   /** 本会话用哪个判断引擎（rules / jev / openai），/memory 要能看见。 */
   engine: string;
+  /** 提炼层（可选）。没配就是 available=false，长回复原样存。 */
+  refine: Refiner;
+  /** 提炼后的记忆上限（字），来自配置。 */
+  refineMaxChars: number;
+  /** 上次提炼的结果，/memory 要能看见（提炼是有损的，看不见就不敢信）。 */
+  lastRefine?: { summary: string | null; topic: string | null; status: string; reason: string; at: number };
   /** 代理没生效时的提示文本（配了代理但启动时没开 NODE_USE_ENV_PROXY）。只在真失败时提示一次。 */
   proxyHint: string | null;
   proxyWarned?: boolean;
@@ -133,7 +150,9 @@ export function assistantText(messages: readonly unknown[]): string {
     const text = textOf(msg.content);
     if (text.trim()) parts.push(text);
   }
-  return parts.join("\n").slice(-2000);
+  // 不截断：**回答全文**是 content 的真相（§8.7 条 1），压缩是提炼层的活。
+  // 这里截一刀的话，库里存下来的“原文”就成了半句起的尾巴，memory_raw 也取不回全文。
+  return parts.join("\n");
 }
 
 /**
@@ -198,12 +217,14 @@ function statusText(r: Runtime): string {
     `本会话注入：${r.state.doneThisSession ? `${r.state.injectedIds.size} 条 / ${r.state.injectionCount} 次` : "未注入"}`,
     `注入策略：每会话最多 ${r.inject.maxPerSession} 次，间隔 ≥${r.inject.minTurnsBetween} 轮，换话题才再注入`,
     `判断引擎：${r.engine}`,
+    `提炼：${r.refine.available ? `${r.refine.model}（长回复压成一条记忆；主题名由它生成）` : "未配置（存原文、用户侧就没有主题）"}`,
     `主动召回：${r.proactive.enabled ? `开（每会话最多 ${r.proactive.maxPerSession} 次）` : "关"}`,
     `自动清理：${r.cleanup.autoCleanup ? `开（session 记忆 ${r.cleanup.sessionTtlDays} 天没命中就销毁）` : "关（session 记忆只归档不销毁）"}`,
   ];
   const lr = r.lastRecall;
   if (lr) lines.push(`上次召回：${label(lr.status)}，候选 ${lr.candidates} → 注入 ${lr.injected}${lr.detail ? `（${lr.detail}）` : ""}`);
   if (r.lastWrite) lines.push(`上次写入：${r.lastWrite.action}${r.lastWrite.reason ? `（${r.lastWrite.reason}）` : ""}`);
+  if (r.lastRefine) lines.push(`上次提炼：${r.lastRefine.reason}`);
   const pending = countPendingReviews(r.projectDb);
   if (pending > 0) lines.push(`待确认：${pending} 条（/memory review 过一遍）`);
   if (r.lastProactive) lines.push(`上次主动提醒：${r.lastProactive.content.slice(0, 40)}`);
@@ -225,7 +246,13 @@ function statusText(r: Runtime): string {
 }
 
 function foundLine(r: { memory: MemoryNode; relevance: number }): string {
-  return `[${r.memory.id}] (${r.memory.type}/${r.memory.scope}) ${r.relevance.toFixed(2)} ${r.memory.content}`;
+  // 低 trust 的标一个 `?`：/memory search 是用户核对我干了什么的窗口，来源得看得见。
+  const mark = r.memory.trust >= TRUST_MARK_BELOW ? "" : "? ";
+  // 默认给提炼版（summary），原文用 memory_raw / 「看原文」取 —— 提炼是有损的，
+  // 所以 id 一定要跟着走，否则模型和用户都没有找回细节的路。
+  const shown = r.memory.summary ?? r.memory.content;
+  const raw = r.memory.summary ? `（摘要；原会话原文 ${r.memory.content.length} 字，要细节用 memory_raw 取）` : "";
+  return `[${r.memory.id}] (${r.memory.type}/${r.memory.scope}) ${r.relevance.toFixed(2)} ${mark}${shown}${raw}`;
 }
 
 /**
@@ -283,10 +310,32 @@ async function askReview(o: OpenedDb, ctx: ExtensionContext, reviewId: string): 
 
 export default function reflectiveStorage(pi: ExtensionAPI): void {
   let rt: Runtime | null = null;
-  /** 本地页面面板。按需启动（/memory ui），session_shutdown 关掉 —— 工厂里不起长驻资源（§8.2）。 */
-  let ui: UiHandles | null = null;
   /** 跨项目引用时打开的别人的库（按 id 缓存，收尾统一关）。 */
   const foreignDbs = new Map<string, OpenedDb>();
+
+/**
+ * 收尾一个运行时：等后台写入落地 → 关跨项目库 → 刷注册表 → 关本会话两个库。
+ *
+ * 抽出来是因为有**两个**地方要收尾：`session_shutdown`（退出/`/reload`/切会话）和
+ * `session_start` 的开头（老句柄没收干净就又被叫起来 —— `/reload` 正是这条路径）。
+ * 幂等：传 null 直接返回。
+ */
+async function closeRuntime(r: Runtime | null): Promise<void> {
+  if (!r) return;
+  await r.pending;                       // 待写队列必须落地，失败已经记在 r.error 里
+  for (const db of foreignDbs.values()) db.close();
+  foreignDbs.clear();
+  // 注册表再刷一次：会话开始时刷的是**进来时**的样子，这一轮写进来的记忆还没算上。
+  // 派生数据、不花钱，所以两头都刷（否则第一次进一个项目时注册表永远是空的）。
+  try {
+    refreshRegistry(r.globalDb, r.projectDb, r.session.projectId, r.session.cwd);
+  } catch (e) {
+    r.error = errText(e);
+  }
+  r.projectDb.close();
+  r.globalDb.close();
+}
+
   const openForeign = (projectId: string): OpenedDb | null => {
     if (!projectId || projectId === rt?.session.projectId) return null;
     const cached = foreignDbs.get(projectId);
@@ -319,6 +368,11 @@ export default function reflectiveStorage(pi: ExtensionAPI): void {
   };
 
   pi.on("session_start", async (_event, ctx) => {
+    // `/reload` 会先发 session_shutdown 再发 session_start；同一份模块实例还可能因为
+    // 会话切换被重入。老句柄不关就开新的，同一个库文件会被开两遍（WAL 会锁、写会打架），
+    // 所以这里先收尾再开。
+    await closeRuntime(rt);
+    rt = null;
     const projectDb = openProjectDb(ctx.cwd);
     const globalDb = openGlobalDb();
     const loaded = loadConfig();
@@ -354,6 +408,8 @@ export default function reflectiveStorage(pi: ExtensionAPI): void {
       globalDb,
       adapter: createJudgeAdapter(judge),
       engine: judge.provider,
+      refine: createRefiner(loaded.refine),
+      refineMaxChars: loaded.refine.maxSummaryChars,
       weights: loaded.recall.weights,
       perSourceLimit: loaded.recall.perSourceLimit,
       proactive: loaded.proactive,
@@ -371,7 +427,8 @@ export default function reflectiveStorage(pi: ExtensionAPI): void {
       pending: Promise.resolve(),
       digested: new Set<string>(),
       touched: new Set<string>(),
-      configProblems: [...loaded.problems, ...judge.problems],
+      toolOk: false,
+      configProblems: [...loaded.problems, ...judge.problems, ...loaded.refine.problems],
       cleanup: loaded.lifecycle,
     };
 
@@ -411,6 +468,8 @@ export default function reflectiveStorage(pi: ExtensionAPI): void {
     const r = rt;
     if (!r) return;
     r.state.tick();
+    // toolOk 是「这一轮」的量，所以在这里清零（上一轮的结论在 agent_end 里已经花掉了）。
+    r.toolOk = false;
 
     // J13 复活要先跑，而且必须在预判之前：它是纯本地二字组比对（不吃 token、不调引擎），
     // 而预判可能因为「输入太短」直接返回 —— 实测就是这样漏掉一次本该发生的复活。
@@ -495,6 +554,8 @@ export default function reflectiveStorage(pi: ExtensionAPI): void {
     for (const t of texts) r.digested.add(t);
     const replyText = assistantText(event.messages);
     const context = conversationContext(ctx.sessionManager.getBranch(), texts, replyText);
+    // 助手侧要不要写，在这里一次定下来：有工具跑成功过 + 有回复。
+    const agentWrite = r.toolOk && replyText.trim().length > 0;
     // J15 事后核对：这一轮助手的回复到底用上了哪几条注入过的记忆。纯本地、不联网，
     // 所以直接同步算（写库也在这儿），不走后台队列。
     // 没有助手回复的轮次（重试/中断）**不核对**：拿一段不含回复的上下文去算，
@@ -511,10 +572,27 @@ export default function reflectiveStorage(pi: ExtensionAPI): void {
         })
         .catch((e) => { r.error = errText(e); });
     }
-    if (texts.length === 0) return;
+    if (texts.length === 0 && !agentWrite) return;
     // 写入 fail-open 且不该拖住用户：排队后台跑，session_shutdown 冲刷。
     r.pending = r.pending
       .then(async () => {
+        /** 提炼时能看到的已有主题：项目库 + 全局库，最多 30 个（喂多了提示词会糊）。 */
+        const existingTopicsForRefine = () =>
+          [...new Set([...distinctTopics(r.projectDb), ...distinctTopics(r.globalDb)])].slice(0, 30);
+        /**
+         * 用户侧的记忆也要主题：那条路没有 summary 可提炼，所以只让提炼层给一个名字。
+         * 只在引擎挑不出来时才会被调到（writeFlow 里判），所以不额外花钱。
+         */
+        const topicProposer = r.refine.available
+          ? async (content: string) => {
+              const rf = await r.refine.refine(content, {
+                project: r.session.projectId,
+                existingTopics: existingTopicsForRefine(),
+                maxChars: r.refineMaxChars,
+              });
+              return rf.topic;
+            }
+          : undefined;
         // 一句一条记忆（见 splitForWrite 的说明）：整段写会把项目约定和用户偏好挤进
         // 同一条，类型和作用域只能选一个 —— 用户偏好被锁进单个项目就再也跟不走了。
         const pieces = splitForWrite(texts);
@@ -524,17 +602,96 @@ export default function reflectiveStorage(pi: ExtensionAPI): void {
         for (const piece of pieces) {
           const res = await writeFlow(r.projectDb, r.globalDb, r.adapter, r.session, {
             userTexts: [piece], context, paths: touched,
-            projects: routeInputs().projects, openForeign,
+            projects: routeInputs().projects, openForeign, topicProposer,
           });
           r.lastWrite = { action: res.action, reason: res.reason, at: Date.now() };
           if (res.status === "unavailable") warnProxy(r, ctx);
           firstReviewId ??= res.review?.[0]?.id ?? null;
+        }
+        // 助手侧（§15 原则 1 的例外，只在这一种情况开）：这一轮有工具跑成功过。
+        // 两道门各有理由：
+        //   1. 引擎判不了真假 —— 它只能看到文本。没工具验证的结论就是自说自话，
+        //      存进去下个会话被当成既有事实引回来。工具跑成功过才算证据。
+        //   2. **一轮只写一条**（不拆句）。拆开写会把一段分析拆成几条互不相干的碎片：
+        //      实测拆出过 `.close()` + \`projectDb.close()\`。 这种长度过了 MIN_LENGTH=8
+        //      就进了库，还带着「模型所记」标记。长回复是一个整体，要细粒度也是提炼
+        //      那一层的事，不是拿标点切。
+        // 全文入库（不再取尾部 1500 字）：JEV 按**次**收费，一轮一条时长度只影响那一次调用的
+        // 输入 token，而截断的代价是永久丢掉半篇回复（库里那条“原文”从句子中间开始）。
+        // 长文进注入块的问题在 inject.ts 用截断 + 「原文 N 字」兜住，不靠这里丢信息。
+        if (agentWrite) {
+          // 提炼层（可选）：长回复**先切分再提炼**，短回复还是老路（一条记忆 + 一个摘要）。
+          // 切分给的是**逐字片段**：一段 20–30K 的分析里往往有好几件事，压成一条的话，检索
+          // 层面它们共用一个向量/主题/类型 —— 要么召不回，要么一次召回一整块，而你要的只是其中一句。
+          // 切成几条之后每条自己落库、自己提炼、自己一个向量、自己一个主题，各条之间还能各挂路径。
+          // planParts 会校验（逐字/条数/覆盖），不过关就退回「整段一条」——宁可少拆，不可拆丢。
+          // 提炼在**前**是因为主题提议要跟着同一次写入落库（writeFlow 里用），
+          // 而它是背景队列里的活，多跑几次调用不挡用户。没配后端就整块跳过。
+          const full = replyText;
+          const scope = {
+            project: r.session.projectId,
+            existingTopics: existingTopicsForRefine(),
+            maxChars: r.refineMaxChars,
+          };
+          // **先切分再提炼**：一段 20–30K 的回复里往往有好几件事，压成一条的话检索层面它们
+          // 共用一个向量/主题/类型 —— 要么召不回，要么一次召回一整块，而你要的只是其中一句。
+          // 切分由**程序**做（markdown 标题 → 空行段落 → 句子边界，见 splitSections）：逐字原文、
+          // 零改写风险。实测 glm-4-flash 让它自己切只会回一条，而且两万字它逐字回显不出来。
+          // 模型只负责给每段写一句提炼 + 一个主题（一次调用，输出很短）。
+          const blocks = splitSections(full);
+          let labels: LabelItem[] = [];
+          if (r.refine.available) {
+            if (blocks.length > 1) {
+              // 模型会漏段：labelAll 会补问（只把缺的那几段再问一次，还缺就一段一段问）。
+              const lb = await labelAll(r.refine, blocks, scope);
+              labels = lb.items;
+              r.lastRefine = { summary: null, topic: null, status: lb.status, reason: lb.reason, at: Date.now() };
+            } else {
+              const rf = await r.refine.refine(full, scope);
+              labels = [{ summary: rf.summary, topic: rf.topic }];
+              r.lastRefine = { summary: rf.summary, topic: rf.topic, status: rf.status, reason: rf.reason, at: Date.now() };
+            }
+          }
+          // 一段一条：每段各自过 J1–J4，各挂各的路径、各起各的主题、各算各的向量。
+          let written: { id: string; scope: string } | null = null;
+          let degraded = false;
+          for (const [i, text] of blocks.entries()) {
+            const label = labels[i];
+            const res = await writeFlow(r.projectDb, r.globalDb, r.adapter, r.session, {
+              userTexts: [text], context, paths: touched,
+              projects: routeInputs().projects, openForeign,
+              origin: "agent", agentVerified: true,
+              refinement: label ? { summary: label.summary, topic: label.topic } : undefined,
+            });
+            if (res.memory && !written) written = { id: res.memory.id, scope: res.memory.scope };
+            if (res.action === "stored") r.lastWrite = { action: "agent:stored", reason: res.reason, at: Date.now() };
+            if (res.status === "unavailable") degraded = true;
+            firstReviewId ??= res.review?.[0]?.id ?? null;
+          }
+          // 提炼本身也留痕：以后看「这条怎么变成现在这样」能看见切了几段、提炼成什么样。
+          if (written && r.lastRefine) {
+            addTrace(written.scope === "global" ? r.globalDb : r.projectDb, {
+              memoryId: written.id, stage: "write", gate: "refine",
+              action: blocks.length > 1 ? "split" : r.lastRefine.summary ? "summarize" : "skip",
+              reason: blocks.length > 1 ? `${r.lastRefine.reason}；按结构切成 ${blocks.length} 段各存一条` : r.lastRefine.reason,
+              status: r.lastRefine.status,
+            });
+          }
+          if (degraded) warnProxy(r, ctx);
         }
         // 写入排队问用户的事项：一轮最多问一条，别刷屏（剩下的 /memory review 随时能过）。
         // hasUI 为假（print 模式）就只排队，不问。
         if (firstReviewId && ctx.hasUI) await askReview(r.projectDb, ctx, firstReviewId);
       })
       .catch((e) => { r.error = errText(e); });
+  });
+
+  // 工具跑成功过 = 这一轮的结论有外部验证（见 Runtime.toolOk）。
+  pi.on("tool_result", async (event) => {
+    const r = rt;
+    if (!r) return;
+    if (!(event as { isError?: boolean }).isError) r.toolOk = true;
+    return;
   });
 
   // 碰过的文件 = 树路径的来源（pi 的 tool call 自带路径，零生成、零追问）
@@ -608,21 +765,7 @@ export default function reflectiveStorage(pi: ExtensionAPI): void {
   pi.on("session_shutdown", async () => {
     const r = rt;
     rt = null;
-    if (!r) return;
-    ui?.close();
-    ui = null;
-    await r.pending;
-    for (const db of foreignDbs.values()) db.close();
-    foreignDbs.clear();   // 待写队列必须落地，失败已经记在 r.error 里
-    // 注册表再刷一次：会话开始时刷的是**进来时**的样子，这一轮写进来的记忆还没算上。
-    // 派生数据、不花钱，所以两头都刷（否则第一次进一个项目时注册表永远是空的）。
-    try {
-      refreshRegistry(r.globalDb, r.projectDb, r.session.projectId, r.session.cwd);
-    } catch (e) {
-      r.error = errText(e);
-    }
-    r.projectDb.close();
-    r.globalDb.close();
+    await closeRuntime(r);
   });
 
   pi.registerTool({
@@ -659,6 +802,33 @@ export default function reflectiveStorage(pi: ExtensionAPI): void {
   });
 
   pi.registerTool({
+    name: "memory_raw",
+    label: "Memory Raw",
+    description: "读一条记忆的原文。库里的记忆可能是提炼过的（列表和注入块默认给提炼版），要核对细节、引用原话时用这个取原文。",
+    promptSnippet: "Read the original text of a memory when its distilled version looks incomplete",
+    promptGuidelines: [
+      "memory_search returns distilled text for long memories (marked 「原文 N 字」). If a distilled memory looks too vague to rely on, call memory_raw with its id before using or quoting it.",
+      "Do not use memory_raw to browse the library — it takes one id and returns that one memory's original text.",
+    ],
+    parameters: Type.Object({
+      id: Type.String({ description: "memory_search 返回的记忆 id" }),
+    }),
+    async execute(_id, params) {
+      const r = rt;
+      if (!r) throw new Error("记忆库未打开（没有活动会话）");
+      const inProject = getMemory(r.projectDb, params.id);
+      const m = inProject ?? getMemory(r.globalDb, params.id);
+      if (!m) return { content: [{ type: "text", text: `没有 id 为 ${params.id} 的记忆` }], details: { found: false } };
+      const head = `[${m.id}] (${m.type}/${m.scope}${m.topic ? `/${m.topic}` : ""}) 原文 ${m.content.length} 字`;
+      const distilled = m.summary ? `提炼版：${m.summary}\n原文：` : "";
+      return {
+        content: [{ type: "text", text: `${head}\n${distilled}${m.content}` }],
+        details: { found: true, distilled: Boolean(m.summary), chars: m.content.length },
+      };
+    },
+  });
+
+  pi.registerTool({
     name: "memory_add",
     label: "Memory Add",
     description: "主动往长期记忆里写入一条。仍然会走类型/作用域判断和写入闸，JEV 认为不值得存就不会落库。",
@@ -680,7 +850,13 @@ export default function reflectiveStorage(pi: ExtensionAPI): void {
       // 对不上，一轮存两遍（实测：整轮原话一条 + 分句三条并存）。拆句口径一致后，
       // agent_end 那条会直接命中查重并回 duplicate。
       const said = lastUserText(ctx.sessionManager.getBranch());
-      const pieces = splitForWrite(said ? [said] : [params.content]);
+      // 用户原话能过拆句就存用户的话；拆出来是空（用户这轮只是在提问 / 催prompt）才存
+      // 模型自己给的文本，并且按 agent 来源写：低 trust + 注入时带标记。
+      // 为什么不无条件下用模型的 content：那会跟 agent_end 自动存的原话对不上，精确查重
+      // 拦不住，同一个约定存两行（实测撞过）。用户话能在的时候，它才是唯一原文。
+      const userPieces = said ? splitForWrite([said]) : [];
+      const fromAgent = userPieces.length === 0;
+      const pieces = fromAgent ? splitForWrite([params.content]) : userPieces;
       if (pieces.length === 0) {
         return { content: [{ type: "text", text: "没有写入（内容被本地预筛挡下：太短或只是确认）" }], details: { action: "noise" } };
       }
@@ -692,6 +868,7 @@ export default function reflectiveStorage(pi: ExtensionAPI): void {
           const res = await writeFlow(r.projectDb, r.globalDb, r.adapter, r.session, {
             userTexts: [piece],
             context: `memory_add 工具：模型判断这条值得记（${ctx.sessionManager.getSessionId() ?? "?"}）`,
+            ...(fromAgent ? { origin: "agent" as const, agentVerified: r.toolOk } : {}),
           });
           r.lastWrite = { action: res.action, reason: res.reason, at: Date.now() };
           out.push({ action: res.action, id: res.memory?.id, reason: res.reason });
@@ -711,8 +888,11 @@ export default function reflectiveStorage(pi: ExtensionAPI): void {
       }
       const stored = out.filter((o) => o.action === "stored");
       const dup = out.filter((o) => o.action === "duplicate");
+      const how = fromAgent
+        ? `已记住（模型推断，trust ${r.toolOk ? TRUST_AGENT_VERIFIED : TRUST_AGENT_BARE}）`
+        : "已记住";
       const text = stored.length
-        ? `已记住 ${stored.map((o) => `[${o.id}]`).join(" ")}：${pieces.map((p) => p.slice(0, 60)).join(" ｜ ")}${dup.length ? `（另有 ${dup.length} 条已存在）` : ""}`
+        ? `${how} ${stored.map((o) => `[${o.id}]`).join(" ")}：${pieces.map((p) => p.slice(0, 60)).join(" ｜ ")}${dup.length ? `（另有 ${dup.length} 条已存在）` : ""}`
         : dup.length
           ? `已经有这几条了（${dup[0]?.reason ?? ""}），没有重复写入`
           : `没有写入（${out[0]?.action ?? "skip"}：${out[0]?.reason ?? "写入闸没放行"}）`;
@@ -766,7 +946,7 @@ export default function reflectiveStorage(pi: ExtensionAPI): void {
   });
 
   pi.registerCommand("memory", {
-    description: "长期记忆 /memory：状态、search <词>、why <id>、review（待确认）、topic <名>、topics、projects（项目注册表）、ui（网页面板）、forget <id>",
+    description: "长期记忆 /memory：状态、search <词>、why <id>、review（待确认）、topic <名>、topics、projects（项目注册表）、ui [stop]（常驻网页面板）、forget <id>",
     handler: async (args: string, ctx: ExtensionContext) => {
       const r = rt;
       if (!r) {
@@ -799,7 +979,8 @@ export default function reflectiveStorage(pi: ExtensionAPI): void {
         }
         const traces = tracesFor(m.scope === "global" ? r.globalDb : r.projectDb, m.id);
         ctx.ui.notify([
-          `[${m.id}] (${m.type}/${m.scope}) ${m.content}`,
+          `[${m.id}] (${m.type}/${m.scope}) ${m.summary ?? m.content}`,
+          ...(m.summary ? [`原文（${m.content.length} 字）：${m.content}`] : []),
           `importance ${m.importance.toFixed(2)} · 访问 ${m.accessCount} 次 · 状态 ${m.state}`,
           ...(traces.length
             ? traces.map((t) => `${t.user_visible ?? ""}\n    ${t.gate} ${t.action} ${t.reason ?? ""} [${t.status ?? "?"}/${t.fallback_used ?? "?"}]${t.judgment ? ` 路由=${t.judgment}` : ""}`)
@@ -827,11 +1008,14 @@ export default function reflectiveStorage(pi: ExtensionAPI): void {
 
       if (sub === "ui") {
         try {
-          ui ??= await startUi({
-            projectDb: r.projectDb, globalDb: r.globalDb, projectId: r.session.projectId,
-            port: r.uiPort,
-          });
-          const msg = `记忆库页面：${ui.url}\n（只绑 127.0.0.1；首次访问会让你设账号密码，之后登录用；关掉 pi 就停）`;
+          if (tail === "stop") {
+            const stopped = await stopUi();
+            ctx.ui.notify(stopped ? "面板已停。" : "面板没在跑。", "info");
+            return;
+          }
+          // 面板是常驻进程：第一个会话把它拉起来，之后所有会话共用同一份（跨项目的合并视图）。
+          const s = await ensureUi({ port: r.uiPort });
+          const msg = `记忆库页面：${s.url}\n（${s.started ? "刚拉起来，常驻进程，会话退了也还在" : "已经在跑，直接开"}；只绑 127.0.0.1；首次访问会让你设账号密码。停：/memory ui stop）`;
           // print / json 模式没有 UI（notify 是空操作），所以那边退到 stderr —— 不然
           // 用户敲了 /memory ui 却什么也看不到。
           if (ctx.hasUI) ctx.ui.notify(msg, "info");

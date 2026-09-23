@@ -67,25 +67,17 @@ queueAfterWrite(o, dupB, [dupA], { choice: "none", confidence: 0.9 });
 assert.equal(countPendingReviews(o), before, "同一个 (kind, 新, 旧) 不重复排队");
 console.log("✓ 合并提议：只提议、去重、一次只提一个");
 
-// ------------------------------------------------------------ J4：主题起名
-const {
-  queueTopicNaming, TOPIC_ASK_IMPORTANCE,
-} = await import("../src/pipeline/review.ts");
+// ------------------------------------------------------------ 主题：模型定名，用户不再被问
+// 主题的落库路径在 tests/write.ts 里测（提炼层提议 → 直接落库）。
+// 这里只确认「起名之后主题能查到、能按主题捞回来」。
 const { setTopic, distinctTopics, getMemory: get2 } = await import("../src/storage/db.ts");
-const important = insertMemory(o, { content: "上线灰度按 5% → 20% → 100% 走", type: "procedure", scope: "project", scopeId: "P", importance: 0.9 });
-assert.equal(queueTopicNaming(o, important, []).length, 1, "够重要的记忆该问一句要不要起主题");
-const trivial = insertMemory(o, { content: "随手记一句", type: "event", scope: "project", scopeId: "P", importance: 0.3 });
-assert.equal(queueTopicNaming(o, trivial, []).length, 0, "一次性小事不值得占用户一次输入");
-const already = insertMemory(o, { content: "已有主题的记忆", type: "fact", scope: "project", scopeId: "P", importance: 0.9, topic: "提交流程" });
-assert.equal(queueTopicNaming(o, already, ["提交流程"]).length, 0, "已经有主题就不问");
-assert.ok(TOPIC_ASK_IMPORTANCE > 0.5 && TOPIC_ASK_IMPORTANCE < 0.95);
-
-// 用户起名之后：主题能查到，也能按主题捞回来
-setTopic(o, important.id, "发布流程");
+const named = insertMemory(o, { content: "上线灰度按 5% → 20% → 100% 走", type: "procedure", scope: "project", scopeId: "P", importance: 0.9 });
+setTopic(o, named.id, "发布流程");
 assert.ok(distinctTopics(o).includes("发布流程"), "起过名的主题要出现在主题表里");
-assert.equal(get2(o, important.id)!.topic, "发布流程");
+assert.equal(get2(o, named.id)!.topic, "发布流程");
 const inTopic = o.db.prepare(`SELECT id FROM memories WHERE topic = ?`).all("发布流程") as Array<{ id: string }>;
-assert.deepEqual(inTopic.map((r) => r.id), [important.id]);
+assert.deepEqual(inTopic.map((r) => r.id), [named.id]);
+assert.ok(!pendingReviews(o, 20).some((r) => r.kind === "topic"), "主题不再进复核队列");
 
 // ------------------------------------- 0.5–0.8 的冲突也要问用户（贪吃蛇 demo 验出来的）
 // 用户先说「不做音效」，后一句「音效还是加上吧」被判成 contradicts 0.54 —— 落在 0.5–0.8，
@@ -127,7 +119,8 @@ console.log("✓ J14b：作用域不确定就问用户；放宽是跨库搬迁�
 // ------------------------------------------------------------ 处置
 const items = pendingItems(o, 20);
 const kinds = items.map((it) => String(it.kind));
-assert.ok(kinds.includes("conflict") && kinds.includes("merge") && kinds.includes("topic"), `三种提议都要能排队，实际 ${kinds.join(",")}`);
+assert.ok(kinds.includes("conflict") && kinds.includes("merge") && kinds.includes("scope"), `引擎拿不准的都要能排队，实际 ${kinds.join(",")}`);
+assert.ok(!kinds.includes("topic"), "主题不再进队列（模型直接定）");
 for (const it of items) assert.ok(JSON.parse(String(it.options)).length >= 1);
 const pendingBeforeResolve = countPendingReviews(o);
 

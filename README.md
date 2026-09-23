@@ -40,6 +40,7 @@ src/pipeline/inject.ts  注入块组装与「每会话只注入一次」的状�
 src/pipeline/lifecycle.ts 生命周期：J10 衰减 / J9 巩固 / J12 归档 / J13 复活（纯后台）
 src/pipeline/feedback.ts  J15 事后核对：注入的记忆有没有真被用上（纯本地字符串比对）
 src/pipeline/review.ts    待确认队列：低置信冲突 + 合并提议，问用户来拍（pi 的 1/2/3 选择）
+src/ui/server.ts          本地网页面板（/memory ui）：列记忆、看轨迹、复核、删除
 ```
 
 ## 判断引擎（三档，都是正式档位）
@@ -75,6 +76,7 @@ node tests/governance.ts  # J14b 置信度分级（作用域只许收窄）+ J14
 node tests/lifecycle.ts   # J10 衰减公式、J9 巩固、J12 归档（高 importance 不动）、J13 复活、fail-silent
 node tests/feedback.ts    # J15 事后核对：确凿用上的判定、换了说法的盲区、空回复不覆盖
 node tests/review.ts      # 待确认队列：只提议不动数据、三种处置、被取代的不再召回
+node tests/ui.ts          # 本地页面：token 403、转义不 innerHTML、过滤、复核、删除
 node tests/write.ts       # 写入流程：预筛、脱敏、作用域分流、fail-open
 node tests/recall.ts      # 召回流程：门禁、阈值、fail-degraded、fail-closed、预算
 node tests/inject.ts      # 注入块：声明、转义、预算截断、状态机
@@ -118,7 +120,7 @@ sqlite3 $D/projects/*.db "select content,type,scope from memories; select gate,a
 | `REFLECTIVE_JUDGE_TIMEOUT_MS` / `_WRITE_TIMEOUT_MS` | 交互路径 / 写入路径超时，缺省 2500 / 8000。本地模型要调大 |
 | `REFLECTIVE_JUDGE_THRESHOLD` | 相关性阈值，缺省 0.7。本地小模型分数普遍偏低时调小 |
 
-行为开关只放配置文件（环境变量留给凭据和端点）：`proactive.enabled`（缺省 `true`）、`proactive.maxPerSession`（缺省 1，主动提醒每会话最多几次）、`lifecycle.autoCleanup`（缺省 `false`）、`lifecycle.sessionTtlDays`（缺省 90）、`inject.maxPerSession`（缺省 3，设 1 = 每会话只注入一次）、`inject.minTurnsBetween`（缺省 3）、`recall.weights`（混合排序权重，缺省 `0.55/0.15/0.1/0.15/0.05`，偏向 JEV 判断）。后两个只管机械约束；「这个提问是不是刚才那件事」由 J5 判断（引擎说了算，不让本地规则兼职）。
+行为开关只放配置文件（环境变量留给凭据和端点）：`ui.port`（缺省 0 = 系统挑端口）、`proactive.enabled`（缺省 `true`）、`proactive.maxPerSession`（缺省 1，主动提醒每会话最多几次）、`lifecycle.autoCleanup`（缺省 `false`）、`lifecycle.sessionTtlDays`（缺省 90）、`inject.maxPerSession`（缺省 3，设 1 = 每会话只注入一次）、`inject.minTurnsBetween`（缺省 3）、`recall.weights`（混合排序权重，缺省 `0.55/0.15/0.1/0.15/0.05`，偏向 JEV 判断）。后两个只管机械约束；「这个提问是不是刚才那件事」由 J5 判断（引擎说了算，不让本地规则兼职）。
 
 `lifecycle.autoCleanup` 打开之后：`scope='session'` 且超过 `sessionTtlDays` 天没被召回命中过的记忆**直接销毁**（不是归档）。删除不可逆，所以默认关；`/memory` 里能看到它开没开。
 | `REFLECTIVE_PROXY` | 代理地址，等价于配置文件里的 `proxy.http` |
@@ -164,6 +166,17 @@ sqlite3 $D/projects/*.db "select content,type,scope from memories; select gate,a
 ```json
 { "proactive": { "enabled": false } }
 ```
+
+## 看它记住了什么（本地页面）
+
+```
+/memory ui
+# 记忆库页面：http://127.0.0.1:34567/t/<token>/
+```
+
+只绑 `127.0.0.1`，URL 里的 token 是访问凭证（回环地址不是安全边界：别的进程和网页也能打
+localhost）。页面上能按状态/主题过滤、展开「为什么记住」看判断轨迹、处置待确认、删一条。
+关掉 pi 就停。
 
 ## 会问你的两种情况
 

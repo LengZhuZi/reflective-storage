@@ -58,8 +58,14 @@ export interface LoadedConfig {
   lifecycle: LifecycleConfig;
   recall: RecallConfig;
   proactive: ProactiveConfig;
+  ui: UiConfig;
   /** 读取时发现的问题。降级时必须把这些说出去，不能静默（§6.2）。 */
   problems: string[];
+}
+
+/** 本地网页面板（`/memory ui`）。`port` 省略或 0 = 让系统挑空闲端口。 */
+export interface UiConfig {
+  port: number;
 }
 
 /**
@@ -158,8 +164,16 @@ export function loadConfig(): LoadedConfig {
     lifecycle: resolveLifecycle(file?.lifecycle),
     recall: resolveRecall(file?.recall),
     proactive: resolveProactive(file?.proactive),
+    ui: resolveUi(file?.ui),
     problems,
   };
+}
+
+/** 本地 UI 的端口。默认 0（系统挑），端口被占也不至于起不来。 */
+function resolveUi(raw: unknown): UiConfig {
+  const file = (raw ?? {}) as Record<string, unknown>;
+  const p = file.port;
+  return { port: typeof p === "number" && Number.isInteger(p) && p >= 0 && p < 65536 ? p : 0 };
 }
 
 /** J16 开关。默认开、每会话 1 次。 */

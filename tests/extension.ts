@@ -267,6 +267,18 @@ assert.equal(selects.length, 0);
 assert.match(notes.at(-1)!, /没有待确认/);
 console.log("✓ 待确认队列：/memory review 逐条问用户，问完出队列");
 
+// ------------------------------------------------------------ /memory ui：告诉用户去哪个地址
+notes.length = 0;
+await runCommand("ui");
+const uiNote = notes.at(-1)!;
+assert.match(uiNote, /记忆库页面：http:\/\/127\.0\.0\.1:\d+\/t\/[0-9a-f]{32}\//, "/memory ui 要给出可以点开的地址");
+assert.match(uiNote, /只绑 127\.0\.0\.1/, "要说明它只在本机");
+// 再敲一次不该起第二个服务（端口不会变）
+notes.length = 0;
+await runCommand("ui");
+assert.equal(notes.at(-1), uiNote, "重复 /memory ui 复用同一个页面地址");
+console.log("✓ /memory ui 给出本机页面地址，重复执行复用同一个");
+
 // ------------------------------------------------------------ J16 主动召回
 // 用户没问、库里有一条他现在就该知道的 → agent_settled 之后提醒一句（只给用户看，不塞上下文）
 await call("session_compact");   // 解锁注入判定，避免状态互相干扰

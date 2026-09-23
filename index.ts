@@ -28,6 +28,7 @@ import { splitForWrite, writeFlow } from "./src/pipeline/write.ts";
 import { recallFlow, worthRecalling } from "./src/pipeline/recall.ts";
 import { resurrectFor, runLifecycle } from "./src/pipeline/lifecycle.ts";
 import { closeFeedbackLoop } from "./src/pipeline/feedback.ts";
+import { startUi, type UiHandles } from "./src/ui/server.ts";
 import {
   RESOLUTION_LABELS, SCOPE_WIDEN, applyResolution, labelToResolution, pendingItems, widenScopeToGlobal,
 } from "./src/pipeline/review.ts";
@@ -52,6 +53,8 @@ interface Runtime {
   proactive: { enabled: boolean; maxPerSession: number };
   /** 本会话已经主动提醒过几次。 */
   proactiveCount: number;
+  /** 本地页面的端口（0 = 系统挑）。 */
+  uiPort: number;
   /** 配置读取时发现的问题（文件缺失 / 权限不对 / 解析失败），/memory 要能看见。 */
   configProblems: string[];
   /** 本会话用哪个判断引擎（rules / jev / openai），/memory 要能看见。 */
@@ -275,6 +278,8 @@ async function askReview(o: OpenedDb, ctx: ExtensionContext, reviewId: string): 
 
 export default function reflectiveStorage(pi: ExtensionAPI): void {
   let rt: Runtime | null = null;
+  /** 本地页面面板。按需启动（/memory ui），session_shutdown 关掉 —— 工厂里不起长驻资源（§8.2）。 */
+  let ui: UiHandles | null = null;
 
   pi.on("session_start", async (_event, ctx) => {
     const projectDb = openProjectDb(ctx.cwd);
@@ -300,6 +305,7 @@ export default function reflectiveStorage(pi: ExtensionAPI): void {
       weights: loaded.recall.weights,
       proactive: loaded.proactive,
       proactiveCount: 0,
+      uiPort: loaded.ui.port,
       proxyHint: hint,
       inject: loaded.inject,
       session: {
@@ -511,6 +517,8 @@ export default function reflectiveStorage(pi: ExtensionAPI): void {
     const r = rt;
     rt = null;
     if (!r) return;
+    ui?.close();
+    ui = null;
     await r.pending;   // 待写队列必须落地，失败已经记在 r.error 里
     r.projectDb.close();
     r.globalDb.close();
@@ -628,7 +636,7 @@ export default function reflectiveStorage(pi: ExtensionAPI): void {
   });
 
   pi.registerCommand("memory", {
-    description: "长期记忆 /memory：状态、search <词>、why <id>、review（待确认）、topic <名>、topics、forget <id>",
+    description: "长期记忆 /memory：状态、search <词>、why <id>、review（待确认）、topic <名>、topics、ui（网页面板）、forget <id>",
     handler: async (args: string, ctx: ExtensionContext) => {
       const r = rt;
       if (!r) {
@@ -684,6 +692,19 @@ export default function reflectiveStorage(pi: ExtensionAPI): void {
           return;
         }
         for (const item of items) await askReview(r.projectDb, ctx, String(item.id));
+        return;
+      }
+
+      if (sub === "ui") {
+        try {
+          ui ??= await startUi({
+            projectDb: r.projectDb, globalDb: r.globalDb, projectId: r.session.projectId,
+            port: r.uiPort,
+          });
+          ctx.ui.notify(`记忆库页面：${ui.url}\n（只绑 127.0.0.1，URL 里的 token 是访问凭证；关掉 pi 就停）`, "info");
+        } catch (e) {
+          ctx.ui.notify(`页面起不来：${errText(e)}`, "error");
+        }
         return;
       }
 

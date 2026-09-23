@@ -553,6 +553,30 @@ export function staleSessionMemories(o: OpenedDb, days: number, now: number): st
   return rows.map((r) => String(r.id));
 }
 
+/** 本地 UI 用：按条件列记忆（条件都可选）。排序用 rowid 兜底，避免同毫秒不确定。 */
+export function queryMemories(
+  o: OpenedDb,
+  opts: { states?: MemoryState[]; scope?: MemoryScope; topic?: string; limit?: number } = {},
+): MemoryNode[] {
+  const where: string[] = [];
+  const args: unknown[] = [];
+  if (opts.states?.length) {
+    where.push(`state IN (${opts.states.map(() => "?").join(",")})`);
+    args.push(...opts.states);
+  }
+  if (opts.scope) {
+    where.push(`scope = ?`);
+    args.push(opts.scope);
+  }
+  if (opts.topic) {
+    where.push(`topic = ?`);
+    args.push(opts.topic);
+  }
+  const sql = `SELECT * FROM memories ${where.length ? `WHERE ${where.join(" AND ")}` : ""}
+    ORDER BY created_at DESC, rowid DESC LIMIT ?`;
+  return (o.db.prepare(sql).all(...args, opts.limit ?? 300) as Row[]).map(toNode);
+}
+
 /** 生命周期只改这三个字段，单独开一个写入口，免得 SQL 散在各个 pipeline 里。 */
 export function updateLifecycle(
   o: OpenedDb,

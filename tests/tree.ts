@@ -127,6 +127,8 @@ console.log("✓ 目录改名后的孤儿路径保留（不做自动迁移）");
   const {
     insertMemory: ins, putEmbedding: put, refreshRegistry: refresh, getMemory: getM,
   } = await import("../src/storage/db.ts");
+  const { attachPaths: attach } = await import("../src/pipeline/tree.ts");
+  void attach;
   const foreign = openDb(path.join(tmp, "foreign.db"));
   const qMem = ins(foreign, { content: "后端的按钮逻辑走 rule-engine，别在接口层里写 if", type: "fact", scope: "project", scopeId: "Q" });
   put(foreign, qMem.id, await embed(qMem.content));
@@ -209,6 +211,52 @@ console.log("✓ 目录改名后的孤儿路径保留（不做自动迁移）");
   assert.match(String(crossTrace.reason), /写进了项目 Q 的库/, "跨项目写入要在**发起方**的库里留痕");
   const ownerTrace = foreign.db.prepare(`SELECT gate FROM reflection_traces WHERE memory_id = ?`).get(written.memory!.id) as Record<string, unknown>;
   assert.equal(ownerTrace.gate, "J1+J2+J3", "被写的那边照常留写入轨迹");
+  // 逐层下钻：先问顶层代码区域，命中后**再问一层**子区域 —— 每层候选都很小
+  {
+    const deep = insertMemory(project, { content: "登录接口的参数校验放在 handler 前一层做", type: "fact", scope: "project", scopeId: "P" });
+    const deeper = insertMemory(project, { content: "支付回调必须验签，别省这一步", type: "fact", scope: "project", scopeId: "P" });
+    attachPaths(project, deep.id, ["src/backend/auth/login.ts"], CWD);
+    attachPaths(project, deeper.id, ["src/backend/pay/callback.ts"], CWD);
+    const front = insertMemory(project, { content: "前端按钮的圆角是 8px", type: "fact", scope: "project", scopeId: "P" });
+    attachPaths(project, front.id, ["src/frontend/components/Button.tsx"], CWD);
+    const asked: string[] = [];
+    const seen: string[] = [];
+    const layered = {
+      relevanceThreshold: 0.5,
+      async judgeRelevance(_q: string, c: Array<{ id: string }>) {
+        seen.push(...c.map((x) => x.id));
+        return { relevance: new Map(c.map((x) => [x.id, 0.9])), blocked: new Set(), meta: { gate: "J7", fallbackUsed: "none", status: "ok", latencyMs: 0 } };
+      },
+      async judgeInjection(_q: string, c: Array<{ id: string }>) {
+        return { decisions: new Map(c.map((x) => [x.id, x.id === deep.id ? ("inject" as const) : ("skip" as const)])), meta: { gate: "J8", fallbackUsed: "none", status: "ok", latencyMs: 0 } };
+      },
+      async judgeRoute(_q: string, o: { topics: string[]; topicsLabel?: string }) {
+        asked.push(`${o.topicsLabel ?? "topic"}=${o.topics.join("|")}`);
+        // 第一层（顶层区域）选 /src；第二层（子区域）选 /src/backend
+        const pick = (o.topicsLabel ?? "").includes("sub-area") ? "/src/backend" : o.topics.includes("/src") ? "/src" : "";
+        return Object.assign(
+          { projects: new Set<string>(), topics: new Set(pick ? [pick] : []) },
+          { meta: { gate: "J5-route", fallbackUsed: "none", status: "ok", latencyMs: 1 } },
+        );
+      },
+    } as never;
+    const out = await recallFlow("登录那边参数校验放哪一层", {
+      projectDb: project, globalDb, adapter: layered, session,
+      route: {
+        enabled: true, projects: [], topics: [],
+        paths: ["/src/backend/auth/login", "/src/backend/pay/callback", "/src/frontend/components/Button"],
+      },
+      budget: { maxTokens: 800 },
+    });
+    const areaCalls = asked.filter((a) => /codebase|sub-area/.test(a));
+    assert.equal(areaCalls.length, 2, `要下钻两层（顶层区域 → 子区域），实际问了几次 ${areaCalls.length}`);
+    assert.match(areaCalls[0]!, /codebase/);
+    assert.match(areaCalls[1]!, /sub-area of \/src/);
+    assert.ok(seen.includes(deep.id), "下钻到 /src/backend 后，那个子树下的记忆要进候选");
+    assert.equal(out.injected[0]?.memory.id, deep.id);
+    console.log("✓ 逐层下钻：顶层区域 → 子区域（每层候选都很小）");
+  }
+
   console.log("✓ §10.6 上层路由 + 跨项目引用（第七路）/ 跨项目写入（两边留痕）");
   foreign.close();
 }

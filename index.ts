@@ -21,8 +21,8 @@ import { createJudgeAdapter, type JevAdapter } from "./src/jev/adapter.ts";
 import { loadConfig, proxyHint, type InjectConfig, type RecallWeights } from "./src/config.ts";
 import {
   addTrace, countMemories, countPendingReviews, distinctTopics, getMemory, hardDelete, listInScope,
-  listRegistry, openGlobalDb, openProjectDb, projectIdFor, recentRecalls, refreshRegistry, resolveReview,
-  setTopic, tracesFor, type OpenedDb,
+  allTreePaths, listRegistry, openGlobalDb, openProjectDb, projectIdFor, recentRecalls, refreshRegistry,
+  resolveReview, setTopic, tracesFor, type OpenedDb,
 } from "./src/storage/db.ts";
 import { splitForWrite, writeFlow } from "./src/pipeline/write.ts";
 import { recallFlow, worthRecalling } from "./src/pipeline/recall.ts";
@@ -449,7 +449,13 @@ export default function reflectiveStorage(pi: ExtensionAPI): void {
         budget: { maxTokens: DEFAULT_MAX_TOKENS },
         weights: r.weights,
         perSourceLimit: r.perSourceLimit,
-        route: { enabled: true, ...routeInputs() },
+        route: {
+          enabled: true,
+          ...routeInputs(),
+          paths: (() => {
+            try { return allTreePaths(r.projectDb, 60); } catch { return []; }
+          })(),
+        },
         openForeign,
       });
       r.lastRecall = {

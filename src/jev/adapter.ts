@@ -85,7 +85,13 @@ export interface JevAdapter {
    */
   judgeRoute(
     query: string,
-    options: { projects: Array<{ id: string; hint: string }>; topics: string[]; currentProject: string },
+    options: {
+      projects: Array<{ id: string; hint: string }>;
+      topics: string[];
+      currentProject: string;
+      /** 这一问在问什么（默认「哪个主题」）。逐层下钻时换成「哪个代码区域」等。 */
+      topicsLabel?: string;
+    },
   ): Promise<Judged<RouteJudgment>>;
   /** J7 + J14a（global 记忆在当前项目适不适用，边界才问）。`projectId` 给边界判断用。 */
   judgeRelevance(query: string, candidates: MemoryNode[], opts?: { projectId?: string }): Promise<Judged<RecallJudgment>>;
@@ -395,6 +401,7 @@ export function createJevAdapter(client: JudgeClient, opts: JudgeTimeouts = {}):
           meta: { gate: "J5-route", fallbackUsed: "none" as const, status: "ok" as const, latencyMs: 0 },
         });
       }
+      const topicsLabel = options.topicsLabel ?? "Which topic is the CURRENT REQUEST about";
       const state =
         `CURRENT PROJECT: ${options.currentProject}\n\n` +
         `OTHER PROJECTS THE USER HAS MEMORIES FOR:\n` +
@@ -415,8 +422,8 @@ export function createJevAdapter(client: JudgeClient, opts: JudgeTimeouts = {}):
           ? {
               topic: {
                 type: "choice" as const,
-                instructions: "Which topic is the CURRENT REQUEST about",
-                criteria: Object.fromEntries([["none", "Not about any of these topics"], ...options.topics.map((t) => [t, t])]),
+                instructions: topicsLabel,
+                criteria: Object.fromEntries([["none", "None of these apply"], ...options.topics.map((t) => [t, t])]),
               },
             }
           : {}),

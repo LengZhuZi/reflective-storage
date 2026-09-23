@@ -24,8 +24,8 @@ import type { JudgeMeta } from "../jev/types.ts";
 import { DEFAULT_RELEVANCE_THRESHOLD } from "../jev/types.ts";
 import { embed } from "../embed/encoder.ts";
 import {
-  addTrace, allTreePaths, distinctTopics, listInScope, markAccessed, memoriesByTopic, recordRecall,
-  searchByKeyword, searchByVector, type OpenedDb,
+  addTrace, allTreePaths, childPaths, distinctTopics, listInScope, markAccessed, memoriesByTopic,
+  memoriesUnderPath, recordRecall, searchByKeyword, searchByVector, topLevelPaths, type OpenedDb,
 } from "../storage/db.ts";
 import { pathCandidates } from "./tree.ts";
 import { bigramCoverage, bigrams } from "../jev/rule.ts";
@@ -71,6 +71,8 @@ interface Candidate {
 export interface RouteHint {
   projectId?: string;
   topic?: string;
+  /** 逐层下钻后定下来的代码区域（树路径前缀），例如 /src/backend/auth。 */
+  path?: string;
 }
 
 export interface RecallDeps {
@@ -98,6 +100,8 @@ export interface RecallDeps {
     /** 别的项目：id + 一句话线索（注册表里的主题/最近标题）。 */
     projects: Array<{ id: string; hint: string }>;
     topics: string[];
+    /** 库里现有的树路径（逐层下钻用）。 */
+    paths?: string[];
   };
   /** 按 id 打开别的项目库（调用方负责缓存与关闭）。跨项目引用/写入都走它。 */
   openForeign?: (projectId: string) => OpenedDb | null;
@@ -213,6 +217,12 @@ async function gather(query: string, deps: CandidateDeps, route: RouteHint = {})
     }
   } catch {
     // 主题那一路只是加分项：查不到就少一路候选，不影响其他路
+  }
+
+  // 逐层下钻定下来的代码区域：只捞那棵子树下的记忆（第七路之外的又一路）。
+  if (route.path) {
+    for (const m of memoriesUnderPath(deps.projectDb, route.path, per)) remember(pool, m, "path");
+    for (const m of memoriesUnderPath(deps.globalDb, route.path, per)) remember(pool, m, "path");
   }
 
   // 上层路由命中的主题（JEV 判的，比本地二字组匹配准）
@@ -383,6 +393,43 @@ async function runRecall(query: string, deps: RecallDeps): Promise<RecallResult>
       });
     } catch {
       // 路由失败就当没路由（保守：只在当前项目、不限主题）
+    }
+  }
+
+  // 逐层下钻（§10.6 的第二层）：先问「哪个代码区域」（顶层路径），命中之后
+  // **再问一层**它的直接子区域。每一层的候选都很小（几个节点），所以问得起；
+  // 一次问完两层比一次塞 60 个路径准得多（后者又会糊）。
+  if (deps.route?.enabled && (deps.route.paths?.length ?? 0) > 0) {
+    try {
+      const tops = topLevelPaths(deps.route.paths!);
+      const j1 = await deps.adapter.judgeRoute(query, {
+        projects: [],
+        topics: tops,
+        currentProject: deps.session.projectId,
+        topicsLabel: "Which area of the codebase (by file path) is the CURRENT REQUEST about",
+      });
+      const area = [...j1.topics][0];
+      if (area) {
+        route.path = area;
+        const children = childPaths(deps.route.paths!, area);
+        if (children.length >= 2) {
+          const j2 = await deps.adapter.judgeRoute(query, {
+            projects: [],
+            topics: children,
+            currentProject: deps.session.projectId,
+            topicsLabel: `Which sub-area of ${area} is the CURRENT REQUEST about`,
+          });
+          const deeper = [...j2.topics][0];
+          if (deeper) route.path = deeper;
+        }
+        addTrace(deps.projectDb, {
+          stage: "recall", gate: "J5-route", action: "keep",
+          reason: `代码区域=${route.path}${children.length >= 2 ? "（下钻了两层）" : ""}`,
+          status: j1.meta.status, fallbackUsed: j1.meta.fallbackUsed, latencyMs: j1.meta.latencyMs,
+        });
+      }
+    } catch {
+      // 下钻失败就当没定区域（回到本地匹配那一路）
     }
   }
 

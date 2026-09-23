@@ -599,10 +599,10 @@ export function memoriesUnderPath(o: OpenedDb, prefix: string, limit = 30): Memo
   const rows = o.db
     .prepare(
       `SELECT m.* FROM memory_tree_links l JOIN memories m ON m.id = l.memory_id
-        WHERE l.tree_name = 'path' AND l.path LIKE ? AND m.state IN ('active','cold')
+        WHERE l.tree_name = 'path' AND (l.path = ? OR l.path LIKE ?) AND m.state IN ('active','cold')
         ORDER BY COALESCE(m.last_accessed, m.created_at) DESC, m.rowid DESC LIMIT ?`,
     )
-    .all(`${prefix}%`, limit) as Row[];
+    .all(prefix === "/" ? "/%" : prefix, `${prefix === "/" ? "" : prefix}/%`, limit) as Row[];
   return rows.map(toNode);
 }
 
@@ -612,6 +612,28 @@ export function allTreePaths(o: OpenedDb, limit = 200): string[] {
     .prepare(`SELECT DISTINCT path FROM memory_tree_links WHERE tree_name = 'path' ORDER BY length(path) ASC LIMIT ?`)
     .all(limit) as Row[];
   return rows.map((r) => String(r.path));
+}
+
+/** 顶层树节点（`/src/a/b` → `/src`）—— 逐层下钻的第一层。 */
+export function topLevelPaths(paths: readonly string[]): string[] {
+  return [...new Set(paths.map((p) => "/" + p.split("/").filter(Boolean)[0]).filter((x) => x !== "/"))].sort();
+}
+
+/**
+ * 某个节点的**直接子节点**。注意子节点是**从更深的路径里切出来的**：
+ * 中间层往往没有记忆（没有行），所以 `/src` 的子节点是 `/src/backend`、`/src/frontend`，
+ * 哪怕库里根本没有 `/src/backend` 这条路径。
+ */
+export function childPaths(paths: readonly string[], parent: string): string[] {
+  const prefix = parent === "/" ? "/" : `${parent}/`;
+  const depth = parent.split("/").filter(Boolean).length + 1;
+  const out = new Set<string>();
+  for (const p of paths) {
+    if (!p.startsWith(prefix)) continue;
+    const segs = p.split("/").filter(Boolean).slice(0, depth);
+    if (segs.length === depth) out.add("/" + segs.join("/"));
+  }
+  return [...out].sort();
 }
 
 export function pathsFor(o: OpenedDb, memoryId: string): string[] {

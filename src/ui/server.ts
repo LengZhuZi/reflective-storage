@@ -15,6 +15,7 @@
 import * as http from "node:http";
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
+import * as path from "node:path";
 import { CONFIG_PATH } from "../config.ts";
 import type { MemoryNode } from "../core/types.ts";
 import { cosine } from "../embed/encoder.ts";
@@ -25,6 +26,74 @@ import {
 } from "../storage/db.ts";
 import { RESOLUTION_LABELS, applyResolution, mergeMemories, SCOPE_WIDEN, widenScopeToGlobal } from "../pipeline/review.ts";
 import { loadConfig } from "../config.ts";
+
+/**
+ * 账号密码 + 会话 cookie。页面不再靠 URL 里的 token —— token 会留在浏览器历史和日志里，
+ * 而账号密码可以改、可以退出登录。
+ *
+ * 首次访问没有账号文件 → 强制先设账号密码（不预设固定默认密码：固定默认值等于把
+ * 一台机器上的已知凭据交给所有本地进程）。之后走登录页。
+ */
+const AUTH_FILE = path.join(path.dirname(CONFIG_PATH), "ui-auth.json");
+const SESSION_TTL_MS = 12 * 3600 * 1000;
+
+interface AuthRecord { username: string; salt: string; hash: string }
+
+function readAuth(): AuthRecord | null {
+  try {
+    const r = JSON.parse(fs.readFileSync(AUTH_FILE, "utf8")) as AuthRecord;
+    return r && r.username && r.salt && r.hash ? r : null;
+  } catch {
+    return null;
+  }
+}
+
+function hashPassword(password: string, salt: string): string {
+  return crypto.scryptSync(password, salt, 64).toString("hex");
+}
+
+function writeAuth(username: string, password: string): void {
+  const salt = crypto.randomBytes(16).toString("hex");
+  fs.writeFileSync(AUTH_FILE, `${JSON.stringify({ username, salt, hash: hashPassword(password, salt) }, null, 2)}\n`, { mode: 0o600 });
+  fs.chmodSync(AUTH_FILE, 0o600);
+}
+
+function checkAuth(rec: AuthRecord, username: string, password: string): boolean {
+  if (username !== rec.username) return false;
+  const a = Buffer.from(hashPassword(password, rec.salt), "hex");
+  const b = Buffer.from(rec.hash, "hex");
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+
+function form(body: string): Record<string, string> {
+  try {
+    return JSON.parse(body) as Record<string, string>;
+  } catch {
+    return Object.fromEntries(new URLSearchParams(body)) as Record<string, string>;
+  }
+}
+
+function authPage(mode: "setup" | "login", error = ""): string {
+  const title = mode === "setup" ? "设置账号密码" : "登录";
+  return `<!doctype html><html lang="zh"><head><meta charset="utf-8"><title>${title}</title>
+<style>body{margin:0;min-height:100vh;display:grid;place-items:center;background:#0b0f0d;color:#d6e5dc;
+font:14px/1.6 ui-sans-serif,system-ui,"PingFang SC",sans-serif}
+form{width:320px;border:1px solid #22312b;border-radius:12px;padding:22px}
+h1{font-size:15px;margin:0 0 4px}p{color:#7d9188;font-size:12.5px;margin:0 0 16px}
+label{display:block;font-size:12.5px;color:#7d9188;margin:12px 0 4px}
+input{width:100%;box-sizing:border-box;background:transparent;border:1px solid #22312b;border-radius:8px;padding:8px 10px;color:inherit;font:inherit}
+button{margin-top:16px;width:100%;padding:9px;border:1px solid #39ff88;background:none;color:#39ff88;border-radius:8px;cursor:pointer;font:inherit}
+.err{color:#ff5577;font-size:12.5px;margin-top:10px;min-height:1em}</style></head><body>
+<form method="post" action="/api/${mode}">
+  <h1>反思存储</h1>
+  <p>${mode === "setup" ? "首次使用：设一个账号密码。只绑 127.0.0.1，凭据存在本机（600）。" : "本机记忆库面板"}</p>
+  <label>账号</label><input name="username" autocomplete="username" autofocus>
+  <label>密码</label><input name="password" type="password" autocomplete="${mode === "setup" ? "new-password" : "current-password"}">
+  ${mode === "setup" ? '<label>再输一次</label><input name="password2" type="password" autocomplete="new-password">' : ""}
+  <button type="submit">${mode === "setup" ? "创建并进入" : "登录"}</button>
+  <div class="err">${error}</div>
+</form></body></html>`;
+}
 
 export interface UiHandles {
   url: string;
@@ -167,7 +236,7 @@ function buildGraph(projectDb: OpenedDb, globalDb: OpenedDb, scope: "project" | 
   };
 }
 
-const page = (token: string): string => `<!doctype html>
+const page = (username: string): string => `<!doctype html>
 <html lang="zh"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>反思存储</title>
@@ -212,7 +281,7 @@ legend{font-size:12.5px;color:var(--dim);padding:0 6px}
 code{font-size:12px;color:var(--dim)}
 </style></head>
 <body>
-<header><h1>反思存储</h1><span class="dim" id="summary"></span></header>
+<header><h1>反思存储</h1><span class="dim" id="summary"></span><span style="flex:1"></span><span class="dim" id="who"></span><form method="post" action="/api/logout" style="display:inline"><button type="submit" class="dim">退出</button></form></header>
 <nav>
   <button data-tab="overview" class="on">概览</button>
   <button data-tab="graph">图谱</button>
@@ -257,8 +326,12 @@ code{font-size:12px;color:var(--dim)}
 </main>
 <div id="side"></div>
 <script>
-const TOKEN = ${JSON.stringify(token)};
-const api = (p, opt) => fetch('/t/' + TOKEN + p, opt).then(r => r.ok ? r.json() : r.text().then(t => { throw new Error(t); }));
+const USER = ${JSON.stringify(username)};
+const MUT = { headers: { 'x-csrf': '1' } };
+const api = (p, opt) => {
+  const o = opt && (opt.method === 'POST' || opt.method === 'DELETE') ? { ...opt, ...MUT } : (opt || {});
+  return fetch(p, o).then(r => r.ok ? r.json() : r.text().then(t => { throw new Error(t); }));
+};
 const el = (tag, cls, text) => { const n = document.createElement(tag); if (cls) n.className = cls; if (text != null) n.textContent = text; return n; };
 const pct = (n) => (n * 100).toFixed(0) + '%';
 const time = (ms) => new Date(Number(ms)).toLocaleString();
@@ -544,6 +617,24 @@ async function loadSettings() {
     form.appendChild(fs_);
   }
   form.appendChild(el('div','dim','文件：' + c.path + '（权限 600，写入时自动设）'));
+
+  const acc = el('fieldset'); acc.appendChild(el('legend', null, '账号'));
+  for (const [name, label, type] of [['username','账号（留空 = 不改）','text'],['current','当前密码','password'],['password','新密码（至少 8 位）','password']]) {
+    const w = el('label', null, label); const i = document.createElement('input');
+    i.type = type; i.dataset.acc = name; i.value = name === 'username' ? USER : '';
+    w.appendChild(i); acc.appendChild(w);
+  }
+  const btn = el('button','primary','改账号密码'); btn.type = 'button';
+  btn.onclick = async () => {
+    const body = {};
+    for (const i of acc.querySelectorAll('input')) body[i.dataset.acc] = i.value;
+    try {
+      await fetch('/api/account', { method: 'POST', headers: { 'x-csrf': '1' }, body: JSON.stringify(body) });
+      location.reload();
+    } catch (e) { alert(String(e)); }
+  };
+  acc.appendChild(btn);
+  form.appendChild(acc);
 }
 
 document.getElementById('save').onclick = async () => {
@@ -578,21 +669,103 @@ refresh(); loadSettings(); loadGraph();
 </body></html>`;
 
 export function startUi(deps: UiDeps): Promise<UiHandles> {
-  const token = crypto.randomUUID().replace(/-/g, "");
+  const sessions = new Map<string, { user: string; exp: number }>();
   const dbFor = (scope: string): OpenedDb => (scope === "global" ? deps.globalDb : deps.projectDb);
+
+  const cookieOf = (req: http.IncomingMessage): string | null => {
+    const raw = req.headers.cookie ?? "";
+    const m = raw.match(/(?:^|;\s*)rs_ui=([^;]+)/);
+    return m ? m[1]! : null;
+  };
+  const sessionOf = (req: http.IncomingMessage): { user: string } | null => {
+    const id = cookieOf(req);
+    if (!id) return null;
+    const sess = sessions.get(id);
+    if (!sess) return null;
+    if (sess.exp < Date.now()) { sessions.delete(id); return null; }
+    return { user: sess.user };
+  };
+  const setSession = (res: http.ServerResponse, user: string): void => {
+    const id = crypto.randomUUID();
+    sessions.set(id, { user, exp: Date.now() + SESSION_TTL_MS });
+    res.setHeader("set-cookie", `rs_ui=${id}; HttpOnly; SameSite=Strict; Path=/`);
+  };
 
   const server = http.createServer((req, res) => {
     void (async () => {
       try {
         const url = new URL(req.url ?? "/", "http://127.0.0.1");
-        const prefix = `/t/${token}`;
-        if (!url.pathname.startsWith(prefix)) return json(res, 403, { error: "forbidden" });
-        const path = url.pathname.slice(prefix.length);
+        const path = url.pathname;
         const scopeParam = url.searchParams.get("scope") === "global" ? "global" : "project";
         const db = dbFor(scopeParam);
+        const wantsHtml = (req.headers.accept ?? "").includes("text/html");
+        const back = (res2: http.ServerResponse, dest: string, error = "") => {
+          res2.writeHead(303, { location: error ? `${dest}?e=${encodeURIComponent(error)}` : dest });
+          res2.end();
+        };
+
+        // 首次设置 / 登录
+        if (!readAuth()) {
+          if (req.method === "GET" && wantsHtml) {
+            res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+            return res.end(authPage("setup", url.searchParams.get("e") ?? ""));
+          }
+          if (req.method === "POST" && path === "/api/setup") {
+            const f = form(await readBody(req));
+            const username = (f.username ?? "").trim();
+            const password = f.password ?? "";
+            if (username.length < 2 || password.length < 8) return back(res, "/", "账号至少 2 位、密码至少 8 位");
+            if (password !== (f.password2 ?? password)) return back(res, "/", "两次输入的密码不一样");
+            writeAuth(username, password);
+            setSession(res, username);
+            return back(res, "/");
+          }
+          return json(res, 401, { error: "先设置账号密码" });
+        }
+
+        if (path === "/api/login" && req.method === "POST") {
+          const f = form(await readBody(req));
+          const rec = readAuth()!;
+          if (!checkAuth(rec, (f.username ?? "").trim(), f.password ?? "")) return back(res, "/", "账号或密码不对");
+          setSession(res, rec.username);
+          return back(res, "/");
+        }
+        if (path === "/api/logout" && req.method === "POST") {
+          const id = cookieOf(req);
+          if (id) sessions.delete(id);
+          res.setHeader("set-cookie", "rs_ui=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0");
+          return back(res, "/");
+        }
+
+        const session = sessionOf(req);
+        if (!session) {
+          if (req.method === "GET" && wantsHtml) {
+            res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+            return res.end(authPage("login", url.searchParams.get("e") ?? ""));
+          }
+          return json(res, 401, { error: "未登录" });
+        }
+
+        // 改账号密码
+        if (path === "/api/account" && req.method === "POST") {
+          const f = form(await readBody(req));
+          const rec = readAuth()!;
+          if (!checkAuth(rec, rec.username, f.current ?? "")) return json(res, 403, { error: "当前密码不对" });
+          const username = (f.username ?? "").trim() || rec.username;
+          if ((f.password ?? "").length < 8) return json(res, 400, { error: "新密码至少 8 位" });
+          writeAuth(username, f.password!);
+          setSession(res, username);
+          return json(res, 200, { ok: true, username });
+        }
+
+        // 改状态的请求要带自定义头：Cookie 会让跨站表单能打过来，而自定义头过不去
+        // （跨源发它要 CORS 预检，我们不放开 CORS）。读接口不需要。
+        if (req.method !== "GET" && req.headers["x-csrf"] !== "1") {
+          return json(res, 403, { error: "missing x-csrf" });
+        }
 
         if (req.method === "GET" && (path === "/" || path === "")) {
-          const html = page(token);
+          const html = page(session.user);
           res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
           return res.end(html);
         }
@@ -754,7 +927,7 @@ export function startUi(deps: UiDeps): Promise<UiHandles> {
     server.listen(deps.port ?? 0, "127.0.0.1", () => {
       const addr = server.address();
       const port = typeof addr === "object" && addr ? addr.port : 0;
-      resolve({ url: `http://127.0.0.1:${port}/t/${token}/`, close: () => server.close() });
+      resolve({ url: `http://127.0.0.1:${port}/`, close: () => server.close() });
     });
   });
 }

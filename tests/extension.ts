@@ -309,8 +309,9 @@ console.log("✓ 待确认队列：/memory review 逐条问用户，问完出队
 notes.length = 0;
 await runCommand("ui");
 const uiNote = notes.at(-1)!;
-assert.match(uiNote, /记忆库页面：http:\/\/127\.0\.0\.1:\d+\/t\/[0-9a-f]{32}\//, "/memory ui 要给出可以点开的地址");
+assert.match(uiNote, /记忆库页面：http:\/\/127\.0\.0\.1:\d+\//, "/memory ui 要给出可以点开的地址");
 assert.match(uiNote, /只绑 127\.0\.0\.1/, "要说明它只在本机");
+assert.match(uiNote, /设账号密码/, "要说明首次访问会要求设账号密码");
 // 再敲一次不该起第二个服务（端口不会变）
 notes.length = 0;
 await runCommand("ui");

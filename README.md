@@ -49,7 +49,7 @@ bash scripts/fetch-model.sh       # 本地 embedding 模型 24MB，拉一次
 /memory topics           主题列表
 /memory topic <名>       某主题下的记忆
 /memory projects         项目注册表
-/memory ui               打开网页面板（打印地址）
+/memory ui               打开网页面板（打印地址，首次访问设账号密码）
 /memory forget <id>      删除
 ```
 

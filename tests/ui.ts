@@ -34,19 +34,54 @@ enqueueReview(project, { kind: "merge", memoryId: attack.id, otherId: attack.id,
 
 const ui = await startUi({ projectDb: project, globalDb: global, projectId: "P" });
 const base = ui.url;
-// 去掉尾斜杠方便拼路径
-const t = base.replace(/\/$/, "");
-const get = (p: string) => fetch(t + p);
-const post = (p: string, body: unknown) => fetch(t + p, { method: "POST", body: JSON.stringify(body) });
-const del = (p: string) => fetch(t + p, { method: "DELETE" });
+const authFile = path.join(tmp, "ui-auth.json");
+const readAuthFile = () => { try { return JSON.parse(fs.readFileSync(authFile, "utf8")) as Record<string, unknown>; } catch { return null; } };
 
-// ------------------------------------------------------------ 绑定与 token
-assert.match(base, /^http:\/\/127\.0\.0\.1:\d+\/t\/[0-9a-f]{32}\/$/, "只绑回环 + URL 带 token");
-const noToken = await fetch(`http://127.0.0.1:${new URL(base).port}/api/overview`);
-assert.equal(noToken.status, 403, "不带 token 一律 403（回环地址不是安全边界：别的进程/网页也能打 localhost）");
-const wrongToken = await fetch(`http://127.0.0.1:${new URL(base).port}/t/deadbeef/api/overview`);
-assert.equal(wrongToken.status, 403);
-console.log("✓ 只绑 127.0.0.1，URL 里的 token 是访问凭证，错了就 403");
+// ------------------------------------------------------------ 认证
+const origin = new URL(base).origin;
+assert.match(base, /^http:\/\/127\.0\.0\.1:\d+\/$/, "只绑回环，地址里不再带 token");
+const noSession = await fetch(origin + "/api/overview");
+assert.equal(noSession.status, 401, "没登录就 401");
+const setupPage = await fetch(origin + "/", { headers: { accept: "text/html" } });
+assert.equal(setupPage.status, 200);
+assert.match(await setupPage.text(), /设置账号密码/, "首次访问是设置页，不是面板");
+
+// 表单 POST 会 303 回首页；测试里手动跟随，否则 fetch 自己跟了就拿不到原始状态码
+const bad = await fetch(origin + "/api/setup", { method: "POST", redirect: "manual", body: new URLSearchParams({ username: "me", password: "short" }) });
+assert.equal(bad.status, 303, "密码太短 → 退回设置页");
+assert.equal(readAuthFile(), null, "不合格的密码不落盘");
+
+const setup = await fetch(origin + "/api/setup", { method: "POST", redirect: "manual", body: new URLSearchParams({ username: "me", password: "s3cret-pass" }) });
+assert.equal(setup.status, 303);
+const cookie = (setup.headers.get("set-cookie") ?? "").split(";")[0]!;
+assert.match(cookie, /^rs_ui=/);
+assert.equal(fs.statSync(authFile).mode & 0o777, 0o600, "账号文件必须 600");
+assert.ok(!fs.readFileSync(authFile, "utf8").includes("s3cret-pass"), "不许明文存密码");
+
+const authedGet = (p: string) => fetch(origin + p, { headers: { cookie } });
+const authedPost = (p: string, body: unknown) => fetch(origin + p, { method: "POST", headers: { cookie, "x-csrf": "1" }, body: JSON.stringify(body) });
+assert.equal((await authedGet("/api/overview")).status, 200, "带会话就能用");
+
+// Cookie 会让跨站表单打过来，所以改状态的请求必须带自定义头（跨源发它要过 CORS 预检）
+assert.equal((await fetch(origin + "/api/config", { method: "POST", headers: { cookie }, body: "{}" })).status, 403, "改状态的请求必须带 x-csrf");
+
+const loginPage = await fetch(origin + "/", { headers: { accept: "text/html" } });
+assert.equal(loginPage.status, 200);
+const loginHtml = await loginPage.text();
+assert.match(loginHtml, /登录/);
+const wrong = await fetch(origin + "/api/login", { method: "POST", redirect: "manual", body: new URLSearchParams({ username: "me", password: "nope" }) });
+assert.equal(wrong.status, 303);
+assert.ok(!(wrong.headers.get("set-cookie") ?? "").includes("rs_ui="), "错密码不给会话");
+assert.match(String(wrong.headers.get("location")), /^\/\?e=/, "退回登录页并带上原因");
+
+const relogin = await fetch(origin + "/api/login", { method: "POST", redirect: "manual", body: new URLSearchParams({ username: "me", password: "s3cret-pass" }) });
+const cookie2 = (relogin.headers.get("set-cookie") ?? "").split(";")[0]!;
+assert.match(cookie2, /^rs_ui=/);
+console.log("✓ 首次设置 → 登录 → 会话 cookie（密码 scrypt 加盐、文件 600、改状态要 x-csrf）");
+
+const get = (p: string) => fetch(origin + p, { headers: { cookie: cookie2 } });
+const post = (p: string, body: unknown) => fetch(origin + p, { method: "POST", headers: { cookie: cookie2, "x-csrf": "1" }, body: JSON.stringify(body) });
+const del = (p: string) => fetch(origin + p, { method: "DELETE", headers: { cookie: cookie2, "x-csrf": "1" } });
 
 // ------------------------------------------------------------ 页面本身
 const pageRes = await get("/");
@@ -54,8 +89,8 @@ assert.equal(pageRes.status, 200);
 const html = await pageRes.text();
 assert.match(html, /textContent/, "内容必须用 textContent 拼，不许把记忆原文塞进 innerHTML");
 assert.ok(!/innerHTML\s*=/.test(html), "页面里不该出现 innerHTML 赋值（记忆原文是不可信输入）");
-const token = new URL(base).pathname.split("/")[2];
-assert.ok(token && html.includes(token), "页面里带着自己的 token（否则前端请求全 403）");
+assert.ok(!/\/t\//.test(html), "页面不再走 URL token（改成账号密码 + 会话）");
+assert.ok(html.includes("me"), "页面里带当前账号名");
 console.log("✓ 页面渲染只认 textContent，不把不可信的记忆原文当 DOM");
 
 // ------------------------------------------------------------ 列表与过滤

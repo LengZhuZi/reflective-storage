@@ -799,7 +799,7 @@ export default function reflectiveStorage(pi: ExtensionAPI): void {
             projectDb: r.projectDb, globalDb: r.globalDb, projectId: r.session.projectId,
             port: r.uiPort,
           });
-          const msg = `记忆库页面：${ui.url}\n（只绑 127.0.0.1，URL 里的 token 是访问凭证；关掉 pi 就停）`;
+          const msg = `记忆库页面：${ui.url}\n（只绑 127.0.0.1；首次访问会让你设账号密码，之后登录用；关掉 pi 就停）`;
           // print / json 模式没有 UI（notify 是空操作），所以那边退到 stderr —— 不然
           // 用户敲了 /memory ui 却什么也看不到。
           if (ctx.hasUI) ctx.ui.notify(msg, "info");

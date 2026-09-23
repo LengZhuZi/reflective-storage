@@ -553,6 +553,13 @@ export default function reflectiveStorage(pi: ExtensionAPI): void {
     ui?.close();
     ui = null;
     await r.pending;   // 待写队列必须落地，失败已经记在 r.error 里
+    // 注册表再刷一次：会话开始时刷的是**进来时**的样子，这一轮写进来的记忆还没算上。
+    // 派生数据、不花钱，所以两头都刷（否则第一次进一个项目时注册表永远是空的）。
+    try {
+      refreshRegistry(r.globalDb, r.projectDb, r.session.projectId, r.session.cwd);
+    } catch (e) {
+      r.error = errText(e);
+    }
     r.projectDb.close();
     r.globalDb.close();
   });

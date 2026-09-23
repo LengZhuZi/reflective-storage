@@ -1,0 +1,17 @@
+name: test
+
+on: [push, pull_request]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      # onnxruntime-node 的 postinstall 会去 api.nuget.org 下 CUDA EP；CPU 版动态库
+      # 已经打包在 npm 包里，所以跳过脚本装
+      - run: npm install --ignore-scripts
+      - run: bash scripts/fetch-model.sh
+      - run: npm test

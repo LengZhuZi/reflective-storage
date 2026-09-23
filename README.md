@@ -15,6 +15,12 @@ SQLite 文件里，判断走一个判断模型（必须有，见下）。
 - 人工兜底：拿不准的（合并、冲突、起主题）排队问你，不替你拍
 - `/memory ui`：本机网页面板，看轨迹、看近义堆、删除、复核
 
+## 要求
+
+- Node 24+（用到内置 `node:sqlite`）
+- **一个判断模型的 key**：现在接的是 [JEV](https://console.typesafe.ai/keys)（TypeSafe AI）。
+  没有可用的判断模型这个扩展不启动 —— 判断与生成分离是这套设计的地基，不退化到规则或对话模型。
+
 ## 安装
 
 ```bash
@@ -169,3 +175,7 @@ sqlite3 $D/projects/*.db "select content,type,scope from memories"
 Phase 1 完成，Phase 2 大部分完成（J9–J13 生命周期、J11 合并、J4 主题、J6 主题/路径参与召回）。
 未做：J16 阈值学习、J17 多租户、Postgres/pgvector 与 Qdrant 迁移、跨设备同步。
 设计文档见 [DESIGN.md](./DESIGN.md)。
+
+## 许可
+
+MIT，见 [LICENSE](./LICENSE)。

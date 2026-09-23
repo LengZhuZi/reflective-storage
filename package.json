@@ -1,6 +1,5 @@
 {
   "name": "reflective-storage",
-  "private": true,
   "type": "module",
   "scripts": {
     "test": "for f in tests/*.ts; do node \"$f\" || exit 1; done"
@@ -14,5 +13,37 @@
     "@huggingface/transformers": "^4.3.0",
     "sqlite-vec": "^0.1.9",
     "typebox": "^1.3.34"
-  }
+  },
+  "description": "Long-term memory for pi: writes decide, recall decides, and memory decays when unused. Local SQLite, no service.",
+  "license": "MIT",
+  "author": "LQ <lq666666lucky@163.com>",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/LengZhuZi/reflective-storage.git"
+  },
+  "homepage": "https://github.com/LengZhuZi/reflective-storage",
+  "bugs": {
+    "url": "https://github.com/LengZhuZi/reflective-storage/issues"
+  },
+  "keywords": [
+    "pi",
+    "pi-extension",
+    "memory",
+    "long-term-memory",
+    "sqlite",
+    "sqlite-vec",
+    "fts5",
+    "local-first"
+  ],
+  "engines": {
+    "node": ">=24"
+  },
+  "files": [
+    "index.ts",
+    "src",
+    "scripts",
+    "README.md",
+    "DESIGN.md",
+    "LICENSE"
+  ]
 }

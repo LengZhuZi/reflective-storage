@@ -59,11 +59,19 @@ const QUESTION_TAIL = /[?？]\s*$/;
 /** 出现这些词就说明用户在下结论/提要求，不是单纯提问。 */
 const DURABLE_SIGNAL = /(记住|记一下|记下来|以后|之后都|不要用|别再|改用|应该改|决定|采用|统一|一律|必须|只能|默认用|remember)/i;
 
-/** 凭据形态。落盘前必须洗掉 —— 记忆库会被注入到每一次对话里。 */
-const SECRET = /(sk-[A-Za-z0-9_-]{8,}|apikey_[A-Za-z0-9_]{8,}|(?:密码|口令|password|passwd|token|secret|api[_-]?key)\s*[:=]\s*\S+)/gi;
+/** 凭据形态。落盘前必须洗掉 —— 记忆库会被注入到每一次对话里。
+ *
+ * 实测漏过的两类（真跑 pi 存进过库）：
+ *   1. 连接串里的明文口令 —— `postgresql://readonly:S3cr3tP%40ss@10.0.0.5:5432/prod`
+ *      旧正则只认 `password=xxx`，DSN 完全不匹配。
+ *   2. 中文口语写法 —— `密码是 hunter2`、`密码：hunter2`，旧正则只认 `[:=]`。
+ * 所以这里补了 DSN（只洗口令段，主机和库名留着，那才是有用的信息）和「是/为/：」。
+ */
+const DSN = /([a-z][a-z0-9+.-]*:\/\/[^\s:@/]*):[^\s@/]+@/gi;
+const SECRET = /(sk-[A-Za-z0-9_-]{8,}|apikey_[A-Za-z0-9_]{8,}|gh[pousr]_[A-Za-z0-9]{16,}|Bearer\s+[A-Za-z0-9._-]{8,}|(?:密码|口令|密钥|password|passwd|pwd|token|secret|api[_-]?key)\s*(?:是|为|[:=：])\s*[^\s，。；、！？,;：]+)/gi;
 
 export function redact(s: string): string {
-  return s.replace(SECRET, "***");
+  return s.replace(DSN, "$1:***@").replace(SECRET, "***");
 }
 
 /**

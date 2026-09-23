@@ -92,6 +92,29 @@ assert.ok(!clean.includes("apikey_TESTFIXTURE0000001"), "apikey_ 形态的密钥
 assert.ok(!clean.includes("hunter2"), "password: 后面的值必须被洗掉");
 console.log("✓ 落盘前脱敏（记忆库会被注入到每一次对话里，凭据进去就洗不干净）");
 
+// 真跑 pi 存进过库的两种形态（见 redact 的注释）：DSN 里的明文口令、中文口语写法。
+assert.equal(
+  redact("现在这台是 postgresql://readonly:S3cr3tP%40ss@10.0.0.5:5432/prod"),
+  "现在这台是 postgresql://readonly:***@10.0.0.5:5432/prod",
+  "连接串里的明文口令必须洗掉，主机和库名要留着（那是这条记忆有用的部分）",
+);
+assert.equal(redact("mysql://root:hunter2@10.1.2.3:3306/db"), "mysql://root:***@10.1.2.3:3306/db");
+assert.equal(redact("redis://:s3cret@10.1.2.3:6379"), "redis://:***@10.1.2.3:6379", "用户名可以为空");
+assert.equal(redact("密码是 hunter2"), "***", "中文口语写法（是）也要认");
+assert.equal(redact("口令：hunter2"), "***");
+assert.equal(redact("这台机器上 pnpm 装依赖"), "这台机器上 pnpm 装依赖", "没有凭据的正常句子不许动");
+assert.equal(redact("数据库连接串从 DB_URL 读"), "数据库连接串从 DB_URL 读", "提到环境变量名不是凭据");
+// 洗到标点就停：中文没有空格，「密码是hunter2，其它照旧」不能把后半句一起吃掉
+assert.equal(redact("密码是hunter2，其它照旧"), "***，其它照旧");
+assert.equal(redact("token是abc123；部署到 pre"), "***；部署到 pre");
+assert.equal(redact("https://github.com/org/repo 这个仓库"), "https://github.com/org/repo 这个仓库", "没有口令的普通链接不许动");
+assert.equal(
+  redact("提交前先跑 tests/lifecycle.ts"),
+  "提交前先跑 tests/lifecycle.ts",
+  "/ 和 . 不能被当成 DSN",
+);
+console.log("✓ 脱敏覆盖 DSN 明文口令与中文写法，且不误伤正常句子");
+
 // ------------------------------------------------------------ 正常写入
 const r1 = await writeFlow(project, global, fakeAdapter(0.89), session, {
   userTexts: ["以后所有的数据库迁移脚本都用 Flyway，不要用 Liquibase"],

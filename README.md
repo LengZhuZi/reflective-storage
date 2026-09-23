@@ -70,7 +70,7 @@ bash scripts/fetch-model.sh       # 本地 embedding 模型 24MB，拉一次
 {
   "typesafe":  { "apiKey": "...", "baseUrl": "https://api.typesafe.ai", "model": "jev-latest" },
   "judge":     { "provider": "jev", "model": "jev-latest" },
-  "proxy":     { "http": "http://127.0.0.1:7897" },
+  "proxy":     { "http": "http://127.0.0.1:1080" },
   "inject":    { "maxPerSession": 5, "minTurnsBetween": 1 },
   "recall":    { "weights": { "relevance": 0.55, "vector": 0.15, "topic": 0.1, "importance": 0.15, "recency": 0.05 },
                  "perSourceLimit": 50 },

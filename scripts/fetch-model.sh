@@ -7,12 +7,12 @@
 # 所以仓库里只留这个脚本，模型文件由使用者自己拉一次。
 #
 # 用法：bash scripts/fetch-model.sh
-# 网络：默认走本机代理（GLOBAL_PROXY 可覆盖）；也可以把 PROXY 设为空走直连。
+# 网络：默认直连；hf 不通会自动换 hf-mirror。要走代理就设 GLOBAL_PROXY=http://host:port。
 set -euo pipefail
 
 REPO="${MODEL_REPO:-Xenova/bge-small-zh-v1.5}"
 BASE="${MODEL_BASE:-https://huggingface.co/$REPO/resolve/main}"
-PROXY="${GLOBAL_PROXY:-http://127.0.0.1:7897}"
+PROXY="${GLOBAL_PROXY:-}"
 OUT="$(cd "$(dirname "$0")/.." && pwd)/models/bge-small-zh-v1.5"
 
 # 代理不通就退回直连（hf-mirror 直连可用）

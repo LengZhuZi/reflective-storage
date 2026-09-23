@@ -1060,15 +1060,8 @@ function recall(db: Database, query: string, scope: Scope, scopeId: string) {
 
 **这个间隔说明一件重要的事：embedding 单独用是一个弱过滤器。** 命中和无关的分数是重叠区间的边缘相碰，靠它自己定阈值不可靠。加上 query 指令前缀（`为这个句子生成表示以用于检索相关文章：`）间隔只有 0.049，没有实质改善。**所以它只当候选生成器，排名交给 J7 的 JEV。** 这正好印证 §10.1 的两段式设计。
 
-**下载（一次性）**：走代理从 HF 拉模型文件（实测 3.5 MB/s，24 MB 约 7 秒；`hf-mirror.com` 直连也行）：
-
-```bash
-B=https://huggingface.co/Xenova/bge-small-zh-v1.5/resolve/main
-for f in config.json tokenizer.json tokenizer_config.json special_tokens_map.json vocab.txt; do
-  curl -sL -x http://127.0.0.1:7897 -o "models/bge-small-zh-v1.5/$f" "$B/$f"
-done
-curl -sL -x http://127.0.0.1:7897 -o models/bge-small-zh-v1.5/onnx/model_quantized.onnx "$B/onnx/model_quantized.onnx"
-```
+**下载（一次性）**：`bash scripts/fetch-model.sh`。脚本先试直连 huggingface，失败就换
+hf-mirror 镜像；要过代理就设 `GLOBAL_PROXY=http://host:port`（脚本不预设任何本机端口）。
 
 **npm 安装注意**：`onnxruntime-node` 的 postinstall 会去 `api.nuget.org` 拉 CUDA EP，本机直连被掐会 `ECONNRESET`。但 **CPU 的 `libonnxruntime.so.1` 本来就打包在 npm 包里**（`bin/napi-v6/linux/x64/`），不需要下载。所以用 `npm install --ignore-scripts` 即可。若将来真要那个脚本，它认 `GLOBAL_AGENT_HTTPS_PROXY` 环境变量而不是 `HTTPS_PROXY`。
 

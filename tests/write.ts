@@ -287,6 +287,20 @@ assert.ok(!(noTopic.review ?? []).some((r) => r.kind === "topic"));
 console.log("✓ J4 主题：引擎在已有主题里挑、提炼层的提议直接落库、不问用户");
 
 
+// ------------------------------------------------------------ 合并触发器（同主题 + 相似）
+const trig = (await import("../src/pipeline/write.ts")).mergeTriggered;
+assert.equal(trig({ content: "甲乙丙丁戊己庚辛", topic: null }, { content: "甲乙丙丁戊己庚辛壬", topic: null }, null), true, "长字面重复 → 触发");
+assert.equal(trig({ content: "缓存走本机 SQLite。", topic: "缓存策略" }, { content: "缓存直接用 SQLite。", topic: "缓存策略" }, 0.82), true, "同主题 + 0.82 → 触发（跨会话重分析靠这条）");
+assert.equal(trig({ content: "缓存走本机 SQLite。", topic: "缓存策略" }, { content: "缓存直接用 SQLite。", topic: "部署流程" }, 0.82), false, "主题不同就不提（避免把不相干的两条拉进来）");
+assert.equal(trig({ content: "缓存走本机 SQLite。", topic: "缓存策略" }, { content: "缓存直接用 SQLite。", topic: "缓存策略" }, 0.7), false, "相似度太低不提");
+assert.equal(trig({ content: "缓存走本机 SQLite。", topic: null }, { content: "缓存直接用 SQLite。", topic: "缓存策略" }, 0.9), true, "高相似不看主题");
+console.log("✓ 合并触发：字面重复 / 高余弦 / 同主题+0.8（只触发，判决还是引擎的）");
+
+// ------------------------------------------------------------ 工具任务书不是记忆
+assert.equal(worthEvaluating("Task: Analyze the module tobacco-service/tobacco-datadistribution and its API module in this Java Spring Cloud BladeX project. Report in Chinese").ok, false, "子任务任务书要挡在门外");
+assert.equal(worthEvaluating("Analyze the module tobacco-service/tobacco-visualsense in this project, report purpose and ports").ok, false);
+assert.equal(worthEvaluating("你分析一下这个模块的职责，然后写个报告给我").ok, true, "用户自己让人分析，那是人话");
+
 // ------------------------------------------------------------ 助手侧的长文不许被「短句规则」吃掉
 // 实测踩过：一段 325 字的代码块（模块地图）末尾带个问号，被 isPureQuestion 整段判成提问丢掉，
 // 只剩 1 个字；`[^\S\n]+ → " "` 又把缩进和列对齐全压平（一块 776 → 399 字）。

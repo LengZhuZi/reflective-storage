@@ -220,7 +220,18 @@ assert.equal(splitSections(inline).length, 1, "行内加粗（后面跟正文）
 // 块数上限给得高：详细的分析不该被尾部合并揉成一条
 const manySecs = Array.from({ length: 12 }, (_, i) => `## 第 ${i + 1} 节\n\n${"内容内容内容。".repeat(30)}`).join("\n\n");
 assert.equal(splitSections(manySecs).length, 12, "12 节就是 12 条（上限 20）");
-console.log("✓ 切分：结构切（H1–H4 / 小节内加粗标题 / 空行 / 句子边界，不丢字），模型标注漏段会补问");
+// 块首寒暄丢掉：「I'll explore this module.」实测混进过记忆
+const pre = splitSections("I'll explore this module.\n\n## 一、用途\n\n" + "真实内容。".repeat(60));
+assert.equal(pre.length, 1);
+assert.ok(!pre[0]!.startsWith("I'll"), "寒暄不该跟着内容进库");
+assert.ok(pre[0]!.startsWith("## 一、用途"), "第一条从真正的内容开始");
+// 只有代码/表格的块并回上一块（它没有结论，单独成条检索不出东西）
+const codeOnly = splitSections("## 一\n\n" + "正文说明。".repeat(80) + "\n\n```\n只看代码没有结论\n```");
+assert.equal(codeOnly.length, 1, "纯代码块并回上一块");
+// `- **要点**：…` 和 `**要点**：…` 一样算小节标题
+const bullets = splitSections("## 一\n\n- **要点 A**：" + "说明内容。".repeat(80) + "\n- **要点 B**：" + "说明内容。".repeat(80));
+assert.equal(bullets.length, 2, "列表里的加粗小标题也要切");
+console.log("✓ 切分：结构切（H1–H4 / 小节内加粗标题 / 空行 / 句子边界，不丢字），寒暄与纯代码块不单独成条，模型标注漏段会补问");
 
 // 端点挂了 → fail-open（存原文），而且要留下原因// 端点挂了 → fail-open（存原文），而且要留下原因
 status = 500;

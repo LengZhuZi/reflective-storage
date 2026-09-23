@@ -35,6 +35,16 @@ export const KEEP_THRESHOLD = 0.5;
 /** 触发合并判定的余弦下限（只当触发器，判决归引擎）。 */
 export const MERGE_TRIGGER_COSINE = 0.85;
 
+/**
+ * 「同一个主题 + 不算低的相似」也触发合并提议（让 J11 去判）。
+ *
+ * 为什么单独一条：**跨会话重分析**同一个模块，两条内容重叠但措辞完全不同 ——
+ * 实测同一份项目的两条分析余弦只有 0.76–0.82，够不到 0.85 这条线，于是库里留着两份
+ * 讲同一件事的记忆。主题是现成的强信号（同一个 topic 说明说的是同一件事），
+ * 所以这条线放宽到 0.8，并且**只提议**：判决还是 J11 的，自动合并仍然要它给高分。
+ */
+export const MERGE_TOPIC_COSINE = 0.8;
+
 /** 引擎不可用时照存的那条记忆给多少重要性 —— 低到会先被衰减/归档，高到还能被召回。 */
 export const FAIL_OPEN_IMPORTANCE = 0.3;
 
@@ -164,10 +174,23 @@ function sentences(text: string): string[] {
  * 本地预筛：决定这份内容值不值得花一次 JEV 调用。
  * 它只负责省钱，不负责判断内容好坏 —— 那是 J1 的活。
  */
+/**
+ * 工具/子任务的**任务书**，不是记忆。
+ *
+ * 实测：用 subagent 拆模块分析时，派给子任务的那段提示词（「Task: Analyze the module
+ * tobacco-service/… Report in Chinese: purpose of module, its application port…」）作为
+ * 「用户的话」进了写入链路，J1 还判了值得记 —— 库里躺着三条 697–724 字的任务书，
+ * 占了三个主题位（`[模块分析]`）。
+ *
+ * 只认特征明确的开头：这一段本来就是给模型看的指令，不会出现在人要记的话里。
+ */
+const TOOL_TASK = /^\s*(Task:|You are\b|You're\b|Analyze the\b|Please analyze\b|分析一下以下|请分析以下|扮演\b)/;
+
 export function worthEvaluating(text: string, opts: { allowQuestion?: boolean } = {}): { ok: boolean; reason?: string } {
   const t = text.trim();
   if (t.length < MIN_LENGTH) return { ok: false, reason: `太短（${t.length} < ${MIN_LENGTH}）` };
   if (NOISE.test(t)) return { ok: false, reason: "纯确认/催促" };
+  if (TOOL_TASK.test(t)) return { ok: false, reason: "工具任务书（派给子任务的指令），不是记忆" };
   // 助手侧跳过问句过滤：一整篇分析里夹个问号就整篇不要了，那不是“判断”，是丢数据。
   if (!opts.allowQuestion && isPureQuestion(t)) {
     return { ok: false, reason: "疑问句，不是记忆" };
@@ -219,6 +242,27 @@ export function buildCandidate(input: TurnInput): string {
     .map((s) => redact(s))
     .filter((s) => s.length > 0 && (agent || !isPureQuestion(s)))
     .join(agent ? "\n\n" : "\n");
+}
+
+/**
+ * 三个本地判据决定「要不要让 J11 判这两条是不是一件事」。**只触发，不判决** ——
+ * 判决交给引擎（阈值见 MERGE_AUTO_ABOVE / MERGE_ASK_ABOVE）。
+ *
+ *   1. 字面连续片段够长（≥ SAME_THING_RUN 个二字组）—— 原样复述，最硬的信号；
+ *   2. 向量余弦 ≥ 0.85 —— 同义改写；
+ *   3. **同主题** + 余弦 ≥ 0.8 —— 跨会话重分析同一个模块：内容重叠但措辞差得远
+ *      （实测同一份项目的两份分析只有 0.76–0.82），够不到第 2 条，而主题是现成的强信号。
+ *      只差一个项目名的两条记忆余弦能到 0.953，所以余弦永远只当触发，不当判决。
+ */
+export function mergeTriggered(
+  a: { content: string; topic: string | null },
+  b: { content: string; topic: string | null },
+  sim: number | null,
+): boolean {
+  if (longestSharedRun(a.content, b.content) >= SAME_THING_RUN) return true;
+  if (sim === null) return false;
+  if (sim >= MERGE_TRIGGER_COSINE) return true;
+  return Boolean(a.topic && b.topic && a.topic === b.topic && sim >= MERGE_TOPIC_COSINE);
 }
 
 export async function writeFlow(
@@ -321,10 +365,13 @@ export async function writeFlow(
   // 不能当判决（实测算过：alpha/beta 0.953 vs 模型转述 0.797）。
   const mergeCandidates = candidates.filter((c) => {
     if (c.id === memory.id) return false;
-    if (longestSharedRun(content, c.content) >= SAME_THING_RUN) return true;
-    if (!vec) return false;
-    const other = getEmbedding(target, c.id);
-    return other ? cosine(vec, other) >= MERGE_TRIGGER_COSINE : false;
+    const other = vec ? getEmbedding(target, c.id) : null;
+    const sim = vec && other ? cosine(vec, other) : null;
+    return mergeTriggered(
+      { content, topic: memory.topic ?? null },
+      { content: c.content, topic: c.topic ?? null },
+      sim,
+    );
   });
   let merged = 0;
   const mergeAsk: ReviewItem[] = [];

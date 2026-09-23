@@ -139,12 +139,31 @@ export function parseLabel(text: string, count: number, maxChars: number): Label
  * （否则「问题清单」会被拆成一行一条）。
  */
 function subHeading(line: string): boolean {
-  const t = line.trim();
+  // 列表标记先剥掉：`- **要点**：…` 和 `**要点**：…` 是同一件事
+  const t = line.trim().replace(/^(?:[-*•]|\d+[.、)])\s+/, "");
   if (!t) return false;
   if (/^\*\*[^*\n]{2,24}\*\*\s*(?:[—–\-:：]|$)/.test(t)) return true;
   if (/^\d+[.、)]\s*\S{1,30}$/.test(t)) return true;
   if (/^[一二三四五六七八九十]+[、.]\s*\S{1,30}$/.test(t)) return true;
   return false;
+}
+
+/** 纯前言/寒暄/过渡句：不是结论，单独成条也没用。 */
+const PREAMBLE = /^\s*(好的[，,]?|好[，,]|收到|明白|让我|我来|我先|先看|下面|接下来|现在开始|开始分析|I'll|I will|Let me|Now,|First,|Here's)/;
+
+/** 这一块是不是只有结构（代码围栏 / 表格），没有一句自然语言结论。 */
+function structuralOnly(text: string): boolean {
+  const t = text.trim();
+  if (!t) return true;
+  const body = t
+    .split("\n")
+    .filter((l) => !/^\s*(?:```|~~~)/.test(l))          // 围栏行
+    .filter((l) => !/^\s*\|.*\|\s*$/.test(l))         // 表格行
+    .filter((l) => !/^\s*\|?[-: ]+\|[-: |]*$/.test(l))  // 表格分隔行
+    .filter((l) => !/^\s*[│├└─┌┐┘┬┴┼]/.test(l))        // 树形图
+    .join("\n")
+    .trim();
+  return body.length < 12;
 }
 
 /**
@@ -217,6 +236,26 @@ export function splitSections(full: string, opts: { maxChars?: number; maxParts?
     subbed.push(...kept);
   }
 
+  // 收尾两道：① 块首的寒暄/过渡句丢掉（「I'll explore this module.」实测混进过记忆）；
+  //          ② 只有代码/表格的块并回上一块（它没有自己的结论，单独成条检索不出东西）。
+  const cleaned: string[] = [];
+  for (const b of subbed) {
+    const lines = b.split("\n");
+    while (lines.length > 1 && PREAMBLE.test(lines[0] ?? "") && (lines[0] ?? "").length < 60) lines.shift();
+    const text = lines.join("\n").trim();
+    if (!text) continue;
+    // 整块就是一句寒暄/过渡（短）→ 丢掉，别让它单独成条，也别粘到下一条前面
+    if (text.length < 60 && PREAMBLE.test(text)) continue;
+    if (structuralOnly(text)) {
+      if (cleaned.length) cleaned[cleaned.length - 1] = `${cleaned[cleaned.length - 1]}\n\n${text}`;
+      else cleaned.push(text);
+      continue;
+    }
+    cleaned.push(text);
+  }
+  subbed.length = 0;
+  subbed.push(...cleaned);
+
   const out: string[] = [];
   for (const b of subbed) {
     if (b.length <= maxChars) {
@@ -248,6 +287,8 @@ export function splitSections(full: string, opts: { maxChars?: number; maxParts?
   if (merged.length > maxParts) return [...merged.slice(0, maxParts - 1), merged.slice(maxParts - 1).join("\n\n")];
   return merged;
 }
+
+/** 整段没有值得记的东西（全是寒暄/任务书）时 splitSections 返回空数组 —— 调用方跳过写入。 */
 
 /**
  * 给切好的每一段都要到标注 —— 模型会漏段（实测 5 段只回来 1 条），漏了要补。

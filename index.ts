@@ -639,8 +639,9 @@ async function closeRuntime(r: Runtime | null): Promise<void> {
           // 零改写风险。实测 glm-4-flash 让它自己切只会回一条，而且两万字它逐字回显不出来。
           // 模型只负责给每段写一句提炼 + 一个主题（一次调用，输出很短）。
           const blocks = splitSections(full);
+          // 整段都是寒暄/任务书 → 没有可写的块（splitSections 会返回空数组）
           let labels: LabelItem[] = [];
-          if (r.refine.available) {
+          if (r.refine.available && blocks.length) {
             if (blocks.length > 1) {
               // 模型会漏段：labelAll 会补问（只把缺的那几段再问一次，还缺就一段一段问）。
               const lb = await labelAll(r.refine, blocks, scope);

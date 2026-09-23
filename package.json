@@ -1,6 +1,6 @@
 {
   "name": "reflective-storage",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "type": "module",
   "scripts": {
     "test": "for f in tests/*.ts; do node \"$f\" || exit 1; done"

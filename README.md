@@ -8,12 +8,14 @@ SQLite 文件里，判断走一个判断模型（必须有，见下）。
 ## 特性
 
 - 自动写入：不用喊「记住」。说完一轮，值钱的那句自己进库
+- 来源权重：用户说的 trust 1.0，模型说的低一档、注入时带「未经用户确认」标记；涨跌只看
+  可观测的事（用户默许 / 撞上反证），而模型说的要不要写、要靠这一轮的工具结果背书
 - 自动召回：会话首轮和新话题开始时，把相关的旧记忆追加在上下文尾部
 - 判断模型可换：同类判断模型（按类型化问题打分）实现一个 `ask` 就能接
 - 作用域隔离：一个项目一个库，SQL 层硬过滤，跨项目引用要显式点名
 - 生命周期：巩固、衰减、归档、复活；session 记忆可配自动清理
-- 人工兜底：拿不准的（合并、冲突、起主题）排队问你，不替你拍
-- `/memory ui`：本机网页面板，看轨迹、看近义堆、删除、复核
+- 人工兜底：拿不准的（合并、冲突、作用域）排队问你，不替你拍；主题由模型自己定，不占你的点击
+- `/memory ui`：本机网页面板。一个页面看**所有项目**的图谱（合并视图里主题相同的跨项目也能连上），可切单个项目 / 全局库、可隐藏不看的项目；图谱两种画法（关系图力导向 + 主题→路径→记忆的分层树）、分布面板（类型/状态/作用域/来源）、看轨迹、看近义堆、删除、复核
 
 ## 声明
 
@@ -56,15 +58,16 @@ bash scripts/fetch-model.sh       # 本地 embedding 模型 24MB，拉一次
 /memory                 状态（库大小、注入次数、上次召回/写入/提醒、配置问题）
 /memory search <词>      关键词 + 向量召回，带分数
 /memory why <id>         这条为什么被记住（判断轨迹 + 一句人话）
-/memory review           待确认队列，逐条问（合并 / 冲突 / 起主题 / 作用域）
+/memory review           待确认队列，逐条问（合并 / 冲突 / 作用域）
 /memory topics           主题列表
 /memory topic <名>       某主题下的记忆
 /memory projects         项目注册表
-/memory ui               打开网页面板（打印地址，首次访问设账号密码）
+/memory ui               打开网页面板（常驻进程：第一个会话拉起，之后就一直是这个地址）
+/memory ui stop          停掉常驻面板
 /memory forget <id>      删除
 ```
 
-工具（模型可调用）：`memory_search`、`memory_add`、`memory_forget`。
+工具（模型可调用）：`memory_search`、`memory_raw`、`memory_add`、`memory_forget`。
 
 ## 配置
 
@@ -81,9 +84,39 @@ bash scripts/fetch-model.sh       # 本地 embedding 模型 24MB，拉一次
                  "perSourceLimit": 50 },
   "lifecycle": { "autoCleanup": false, "sessionTtlDays": 90 },
   "proactive": { "enabled": true, "maxPerSession": 1 },
-  "ui":        { "port": 0 }
+  "ui":        { "port": 4319 },
+  "refine":    { "provider": "hunyuan", "apiKey": "...", "model": "hunyuan-lite", "maxSummaryChars": 600 }
 }
 ```
+
+`refine` 是**可选**的提炼层。它干两件事：
+
+1. **切分由程序做**（`splitSections`）：助手的长回复先按结构切开 —— markdown 标题 → 空行段落 →
+   句子边界，每块默认不超过 3000 字、最多 6 块。切出来的是**逐字原文**，一块存一条记忆。
+   一段 20–30K 的回复里有好几件事时，这一步让它们各自拿到自己的向量、主题、路径和判断，
+   而不是共用一条的（共用的话要么召不回，要么一次召回一整块）。
+   为什么不交给模型切：实测 glm-4-flash 对 9K / 15K 的多话题输入都只回一条，而两万字的输入
+   它逐字回显不出来（被 max_tokens 截断）—— 回显的过程也正是改写的机会。
+2. **标注交给模型**：一次调用把切好的块编号送进去，每块要一句提炼 + 一个主题。它只看不写，
+   原文一个字都不经过它。
+
+用户自己说的话也走它拿主题（引擎挑不出来时才调，见下）。
+不配就是关的（默认不调任何外部模型），长回复原样存、切分照旧。它只要求一个 OpenAI 兼容的
+`/chat/completions`，所以云端和本机同一套代码：
+
+| provider | 端点 | 模型 | 说明 |
+| --- | --- | --- | --- |
+| `hunyuan` | `https://api.hunyuan.cloud.tencent.com/v1` | `hunyuan-lite` | 腾讯混元，Lite 目前免费 |
+| `zhipu` | `https://open.bigmodel.cn/api/paas/v4` | `glm-4-flash` | 智谱，Flash 免费（`glm-4.7-flash` 也免费，但免费档常有 429） |
+| `deepseek` | `https://api.deepseek.com/v1` | `deepseek-chat` | |
+| `openai` | `https://api.openai.com/v1` | `gpt-4o-mini` | |
+| `ollama` | `http://127.0.0.1:11434/v1` | `qwen2.5:7b` | 本机，不要 key |
+| 其他/自定义 | 自己填 `baseUrl` + `model` | | llama.cpp / vLLM / 别的厂商都行 |
+
+两条口径（都在 `DESIGN.md` §8.7）：**原文一律保留**（`content` 永远是原文，提炼进 `summary`），
+**主题名一律由模型生成**（提炼时喂进项目名 + 已有主题并要求优先复用；助手侧顺带拿，用户侧那句
+再问一次；引擎只能在已有主题里挑，只作兜底。同义词碎片由「近义堆」兜底合并）。
+提炼挂了就存原文（fail-open）。
 
 | 环境变量 | 说明 |
 | --- | --- |
@@ -94,6 +127,7 @@ bash scripts/fetch-model.sh       # 本地 embedding 模型 24MB，拉一次
 | `REFLECTIVE_JUDGE_TIMEOUT_MS` / `_WRITE_TIMEOUT_MS` | 交互 / 写入超时，缺省 2500 / 8000 |
 | `REFLECTIVE_JUDGE_THRESHOLD` | 相关性阈值，缺省 0.7（本地小模型分数偏低时调小） |
 | `REFLECTIVE_PROXY` | 代理地址，等价于 `proxy.http` |
+| `REFLECTIVE_REFINE_PROVIDER` / `_API_KEY` / `_BASE_URL` / `_MODEL` | 提炼层，等价于 `refine.*` |
 | `HTTP_PROXY` / `HTTPS_PROXY` + `NODE_USE_ENV_PROXY=1` | 需要代理时用。**开关必须在启动 pi 之前设好**，进程内改无效 |
 | `REFLECTIVE_HOME` | 记忆库位置，缺省 `~/.pi/agent/reflective-storage` |
 
@@ -155,7 +189,8 @@ node tests/ui.ts          # 本地页面
 
 自检不联网（判断引擎用假 fetch），断言风格，不用框架。
 
-面板（`ui/`）是 Vite + Preact，构建产物 `ui/dist` 提交进仓库 —— 用面板的人不需要装依赖。
+面板（`ui/`）是 Vite + Preact + `Cytoscape.js`/`fcose`（只在构建时用到；图谱那一块是
+动态加载的独立 chunk），构建产物 `ui/dist` 提交进仓库 —— 用面板的人不需要装依赖。
 改前端：`cd ui && npm install && npm run build`（规范见 [ui/DESIGN.md](./ui/DESIGN.md)，
 真浏览器自检见 `ui/test/e2e.mjs`，它需要 playwright，所以不进 `npm test`）。
 
@@ -182,6 +217,14 @@ sqlite3 $D/projects/*.db "select content,type,scope from memories"
 - **cited 是下限**：引擎判「回复用上了这条」会漏掉换措辞的情况，命中率偏低，只能看趋势
 - **没有向量层时**冲突检测会退化成「最近的作用域内记忆」
 - **目录改名**会让 path 树的旧路径成孤儿（保留、不自动迁移）
+- **提炼层是可选的后端**，默认关。配了（`refine.provider`）就只能把助手的长回复压成一条
+  精炼记忆 + 提议主题名；原文一律保留在 `content`，提炼进 `summary`，模型能用 `memory_raw`
+  取回原文。提炼错、端点挂、key 不对都只影响提炼那一步，写入照旧（fail-open）
+- **短句规则只作用于用户侧**：助手侧的长文原样入库，不拆句、不滤问句、不折叠空白。改这条得有
+  测试兜着 —— 一旦长文被当短句处理，一段带问号的代码块会被整段丢掉（实测 325 字剩 1 个字）
+- **切分按结构，不按语义**：标题和空行是切分依据。一整段两万字、没有换行的流水账切不开，
+  只能整段存一条（`splitSections` 会在句子边界硬切，但那已经是上限了）。要按语义切得更细，
+  得换一个愿意逐字回显的模型，或者让模型只回锚点、程序按锚点切（试过，见上面那条实测）
 - 待确认队列一次问一条（`/memory review` 一次过 5 条）
 
 ## 状态

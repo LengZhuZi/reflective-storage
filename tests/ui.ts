@@ -92,6 +92,24 @@ const named = project.db.prepare(`SELECT topic FROM memories WHERE id = ?`).get(
 assert.equal(named.topic, "发布流程", "页面起名要真的写进 topic");
 console.log("✓ 复核与起名都能从页面走通");
 
+// ------------------------------------------------------------ 近义堆 + 手动合并
+const { putEmbedding, getMemory: getM } = await import("../src/storage/db.ts");
+const { embed, cosine } = await import("../src/embed/encoder.ts");
+const twinA = insertMemory(project, { content: "日志统一用 logback，不要用 log4j2", type: "fact", scope: "project", scopeId: "P" });
+const twinB = insertMemory(project, { content: "日志统一用 logback，不要用 log4j2 这个库", type: "fact", scope: "project", scopeId: "P" });
+for (const m of [twinA, twinB]) putEmbedding(project, m.id, await embed(m.content));
+const dupes = await (await get("/api/dupes?scope=project")).json() as { items: Array<{ a: string; b: string; sim: number }> };
+const pair = dupes.items.find((p) => (p.a === twinA.id && p.b === twinB.id) || (p.a === twinB.id && p.b === twinA.id));
+assert.ok(pair, `近义堆要能认出这一对，实际 ${JSON.stringify(dupes.items.map((p) => p.sim.toFixed(3)))}`);
+assert.ok(pair!.sim >= 0.85);
+
+const merged = await (await post("/api/merge", { keep: twinA.id, drop: twinB.id })).json() as { ok: boolean; result: string };
+assert.equal(merged.ok, true);
+assert.equal(getM(project, twinB.id)!.state, "superseded", "被合并的标成已取代");
+assert.match(getM(project, twinA.id)!.metadata ?? "", /mergedFrom/, "旧原文存进保留那条的 metadata");
+assert.match(getM(project, twinA.id)!.metadata ?? "", /不要用 log4j2 这个库/, "存的是 B 的原文");
+console.log("✓ 近义堆能列出来，一键合并保留了旧原文（可查可回滚）");
+
 // ------------------------------------------------------------ 删除（不可逆，要留痕）
 const before = countMemories(project);
 assert.equal((await del(`/api/memory/${attack.id}?scope=project`)).status, 200);

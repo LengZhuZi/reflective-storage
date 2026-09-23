@@ -20,10 +20,14 @@ import * as http from "node:http";
 import * as crypto from "node:crypto";
 import type { MemoryNode } from "../core/types.ts";
 import {
-  addTrace, countMemories, countPendingReviews, distinctTopics, getMemory, hardDelete,
+  addTrace, countMemories, countPendingReviews, distinctTopics, getEmbedding, getMemory, hardDelete,
   pendingReviews, queryMemories, resolveReview, setTopic, tracesFor, type OpenedDb,
 } from "../storage/db.ts";
-import { RESOLUTION_LABELS, applyResolution, SCOPE_WIDEN, widenScopeToGlobal } from "../pipeline/review.ts";
+import { cosine } from "../embed/encoder.ts";
+import { RESOLUTION_LABELS, applyResolution, mergeMemories, SCOPE_WIDEN, widenScopeToGlobal } from "../pipeline/review.ts";
+
+/** 「近义堆」的余弦下限。只用来分组给你看，不用它自动合并。 */
+const DUPE_COSINE = 0.85;
 
 export interface UiHandles {
   url: string;
@@ -86,6 +90,7 @@ const page = (token: string): string => `<!doctype html>
     <button id="refresh">刷新</button>
   </div>
   <section id="pending"></section>
+  <details id="dupesBox" style="margin: 0 0 16px"><summary style="cursor:pointer">近义堆（可能该合并的）</summary><div id="dupes"></div></details>
   <section id="list"></section>
 </main>
 <script>
@@ -170,6 +175,30 @@ function renderList(items, scope) {
   }
 }
 
+async function loadDupes(scope) {
+  const box = document.getElementById('dupes');
+  box.replaceChildren();
+  const r = await api('/api/dupes?scope=' + scope);
+  if (!r.items.length) { box.appendChild(el('div', 'empty', '没有余弦 ≥ 0.85 的对子')); return; }
+  for (const p of r.items) {
+    const card = el('div', 'card');
+    card.appendChild(el('div', 'dim', '余弦 ' + p.sim.toFixed(3) + '（只表示「很像」，不表示「是同一件事」）'));
+    card.appendChild(el('div', 'content', 'A ' + p.aText));
+    card.appendChild(el('div', 'content', 'B ' + p.bText));
+    const row = el('div', 'row');
+    const merge = el('button', null, '合并成一条（保留 A）');
+    merge.onclick = async () => {
+      if (!confirm('合并这两条？B 会标为已取代，原文存进 A 的 metadata。')) return;
+      merge.disabled = true;
+      await api('/api/merge', { method: 'POST', body: JSON.stringify({ keep: p.a, drop: p.b }) });
+      await refresh();
+    };
+    row.appendChild(merge);
+    card.appendChild(row);
+    box.appendChild(card);
+  }
+}
+
 async function refresh() {
   const state = await loadState();
   const scope = document.getElementById('scope').value;
@@ -180,6 +209,7 @@ async function refresh() {
   cache = r.items.filter(m => !q || m.content.includes(q) || (m.topic || '').includes(q));
   renderPending(r.pending, () => scope);
   renderList(cache, scope);
+  await loadDupes(scope);
 }
 
 document.getElementById('refresh').onclick = refresh;
@@ -237,6 +267,35 @@ export function startUi(deps: UiDeps): Promise<UiHandles> {
               id: String(r.id), kind: String(r.kind), question: String(r.question), options: String(r.options), memoryId: String(r.memory_id),
             })),
           });
+        }
+
+        if (req.method === "GET" && path === "/api/dupes") {
+          // 「近义堆」：把余弦 ≥ 0.85 的两两列出来，让你一眼看到该合的。
+          // 只用余弦**分组**，不用它判「是不是同一件事」—— 实测只差一个项目名的两条
+          // 余弦 0.953，比真重复（模型转述 0.797）还高，判决得靠引擎或你。
+          const scope = url.searchParams.get("scope") === "global" ? "global" : "project";
+          const db = dbFor(scope);
+          const items = queryMemories(db, { scope: scope === "global" ? "global" : undefined, limit: 300 })
+            .filter((m) => m.state === "active" || m.state === "cold");
+          const vecs = items.map((m) => ({ m, v: getEmbedding(db, m.id) })).filter((x) => x.v);
+          const pairs: Array<{ a: string; b: string; sim: number; aText: string; bText: string }> = [];
+          for (let i = 0; i < vecs.length; i++) {
+            for (let j = i + 1; j < vecs.length; j++) {
+              const sim = cosine(vecs[i].v!, vecs[j].v!);
+              if (sim >= DUPE_COSINE) {
+                pairs.push({ a: vecs[i].m.id, b: vecs[j].m.id, sim, aText: vecs[i].m.content, bText: vecs[j].m.content });
+              }
+            }
+          }
+          pairs.sort((x, y) => y.sim - x.sim);
+          return json(res, 200, { items: pairs.slice(0, 50) });
+        }
+
+        if (req.method === "POST" && path === "/api/merge") {
+          const body = JSON.parse((await readBody(req)) || "{}") as { keep?: string; drop?: string };
+          if (!body.keep || !body.drop) return json(res, 400, { error: "缺少 keep / drop" });
+          // 用户点的，直接执行（合并不可逆 → 旧原文会存进 metadata，见 mergeMemories）
+          return json(res, 200, { ok: true, result: mergeMemories(deps.projectDb, body.keep, body.drop, "本地 UI 手动合并") });
         }
 
         if (req.method === "GET" && path === "/api/traces") {

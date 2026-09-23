@@ -109,6 +109,8 @@ export function queueAfterWrite(
   candidates: readonly MemoryNode[],
   relation: { choice: string; confidence: number },
   targetId?: string | null,
+  /** 引擎不可用时才用本地判据提议合并（引擎能给分的时候，合不合并由它的分说话）。 */
+  proposeLocalMerge = true,
 ): ReviewItem[] {
   const out: ReviewItem[] = [];
   const options = Object.values(RESOLUTION_LABELS);
@@ -133,7 +135,7 @@ export function queueAfterWrite(
     .map((c) => ({ c, run: longestSharedRun(memory.content, c.content) }))
     .filter((x) => x.run >= SAME_THING_RUN)
     .sort((a, b) => b.run - a.run)[0];
-  if (best) {
+  if (best && proposeLocalMerge) {
     const question = `这两条看起来是同一件事：\n  A（刚记的）${clip(memory.content)}\n  B（已有的）${clip(best.c.content)}\n要合并吗？`;
     const id = enqueueReview(o, { kind: "merge", memoryId: memory.id, otherId: best.c.id, question, options });
     if (id) out.push({ id, kind: "merge", memoryId: memory.id, otherId: best.c.id, question, options });
@@ -159,6 +161,41 @@ export function queueTopicNaming(o: OpenedDb, memory: MemoryNode, existingTopics
   const question = `要不要给这条记忆起个主题？（方便以后按主题找回）\n${clip(memory.content, 80)}`;
   const id = enqueueReview(o, { kind: "topic", memoryId: memory.id, otherId: null, question, options });
   return id ? [{ id, kind: "topic", memoryId: memory.id, otherId: null, question, options }] : [];
+}
+
+/**
+ * 真合并：新的留着，旧的标 `superseded`，**旧原文存进新的 `metadata`**（可查、可回滚），
+ * 关系与轨迹都留痕。为什么保留原文：`superseded` 只是状态，用户以后想看一眼
+ * 「当时是怎么说的」还得看得到 —— 合并不可逆，所以要留退路。
+ */
+export function mergeMemories(o: OpenedDb, keepId: string, dropId: string, reason: string): string {
+  const keep = getMemory(o, keepId);
+  const drop = getMemory(o, dropId);
+  if (!keep) return "要保留的那条已经不在了";
+  if (!drop) return "被合并的那条已经不在了";
+  const meta = keep.metadata ? (JSON.parse(keep.metadata) as Record<string, unknown>) : {};
+  const mergedFrom = Array.isArray(meta.mergedFrom) ? (meta.mergedFrom as unknown[]) : [];
+  mergedFrom.push({ id: drop.id, content: drop.content, at: Date.now(), reason });
+  o.db.prepare(`UPDATE memories SET metadata = ? WHERE id = ?`).run(JSON.stringify({ ...meta, mergedFrom }), keep.id);
+  setState(o, drop.id, "superseded");
+  addRelation(o, keep.id, drop.id, "supersedes", 1);
+  addTrace(o, { memoryId: keep.id, stage: "governance", gate: "J11", action: "merge", targetId: drop.id, reason, status: "ok" });
+  addTrace(o, { memoryId: drop.id, stage: "governance", gate: "J11", action: "merged_away", targetId: keep.id, reason, status: "ok" });
+  return `已合并：保留 ${keep.id.slice(0, 8)}，旧原文存进它的 metadata`;
+}
+
+/**
+ * 排队问「要不要合并」（引擎给的相似度落在 0.7–0.9 这一档）。
+ *
+ * 为什么单独一个函数而不复用 queueAfterWrite：那个函数里的阈值是**关系**的
+ * （`RELATION_AUTO_BELOW = 0.8`），合并的档位是另一回事（0.7–0.9）。混用会漏掉
+ * 0.8–0.9 这一段 —— 既不自动合并、也不问，静默什么都不做。
+ */
+export function queueMerge(o: OpenedDb, memory: MemoryNode, other: MemoryNode, score: number): ReviewItem[] {
+  const options = Object.values(RESOLUTION_LABELS);
+  const question = `引擎觉得这两条很像（${score.toFixed(2)}），但不完全确定是同一件事：\n  A（刚记的）${clip(memory.content)}\n  B（已有的）${clip(other.content)}\n要合并吗？`;
+  const id = enqueueReview(o, { kind: "merge", memoryId: memory.id, otherId: other.id, question, options });
+  return id ? [{ id, kind: "merge", memoryId: memory.id, otherId: other.id, question, options }] : [];
 }
 
 export function pendingItems(o: OpenedDb, limit = 20): ReviewRow[] {

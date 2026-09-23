@@ -63,6 +63,15 @@ export function createRuleAdapter(relevanceThreshold: number = RULE_RELEVANCE_TH
       return { cited, meta: meta("J15(rules)") };
     },
 
+    async judgeMerge(_memory, candidates) {
+      // 规则档不做自动合并：判「这两条是不是同一件事、合并丢不丢信息」需要真读语义，
+      // 而实测连**余弦相似度都分不开**（只差一个项目名的两条 0.953 > 真重复的 0.797）。
+      // 所以这一档只走「提议 + 问用户」那条路（见 write.ts / review.ts）。
+      const out = new Map<string, number>();
+      for (const c of candidates) out.set(c.id, 0);
+      return Object.assign(out, { meta: meta("J11(rules)") });
+    },
+
     async judgeProactive() {
       // 规则档**不做主动召回**：判断「用户现在就想知道这条吗」需要真的理解会话，
       // 关键词规则只会变成定时骚扰。宁可这一档没有这个能力（DESIGN §4 的降级策略也是关闭）。

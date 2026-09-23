@@ -15,19 +15,23 @@
 import type { MemoryNode, SessionInfo } from "../core/types.ts";
 import { resolveScope } from "../core/governance.ts";
 import type { JevAdapter } from "../jev/adapter.ts";
-import { MAX_CANDIDATES } from "../jev/adapter.ts";
+import { MAX_CANDIDATES, MERGE_ASK_ABOVE, MERGE_AUTO_ABOVE } from "../jev/adapter.ts";
 import { RELATION_AUTO_BELOW } from "./review.ts";
-import { ruleScope } from "../jev/rule.ts";
-import { embed } from "../embed/encoder.ts";
+import { longestSharedRun, ruleScope } from "../jev/rule.ts";
+import { cosine, embed } from "../embed/encoder.ts";
 import {
-  addRelation, addTrace, distinctTopics, insertMemory, putEmbedding, setState,
+  addRelation, addTrace, distinctTopics, getEmbedding, insertMemory, putEmbedding, setState,
   type InsertMemory, type OpenedDb,
 } from "../storage/db.ts";
 import { recallCandidates } from "./recall.ts";
-import { queueAfterWrite, queueScopeWidening, queueTopicNaming, type ReviewItem } from "./review.ts";
+import { SAME_THING_RUN } from "./review.ts";
+import { mergeMemories, queueAfterWrite, queueMerge, queueScopeWidening, queueTopicNaming, type ReviewItem } from "./review.ts";
 
 /** 低于这个概率就不写。实测 §4.1：明确要求记住的给出 0.86–0.89，无关内容 0.2。 */
 export const KEEP_THRESHOLD = 0.5;
+
+/** 触发合并判定的余弦下限（只当触发器，判决归引擎）。 */
+export const MERGE_TRIGGER_COSINE = 0.85;
 
 /** 引擎不可用时照存的那条记忆给多少重要性 —— 低到会先被衰减/归档，高到还能被召回。 */
 export const FAIL_OPEN_IMPORTANCE = 0.3;
@@ -89,6 +93,8 @@ export interface WriteResult {
   review?: ReviewItem[];
   /** 判断引擎的三态。调用方靠它决定要不要提示（例如引擎连不上时提示代理）。 */
   status?: "ok" | "degraded" | "unavailable";
+  /** 自动合并掉了几条（引擎判定是同一件事）。 */
+  merged?: number;
 }
 
 /** 有疑问句形状且没有持久化信号 —— 就是提问，不是记忆。 */
@@ -220,10 +226,44 @@ export async function writeFlow(
   const memory = insertMemory(target, insert);
 
   // 向量是加分项：编码失败不能让写入失败（原则 2：向量层可重建）。
+  let vec: number[] | null = null;
   try {
-    putEmbedding(target, memory.id, await embed(content));
+    vec = await embed(content);
+    putEmbedding(target, memory.id, vec);
   } catch {
     /* 没有向量也不影响这条记忆的使用，只影响语义召回那一路 */
+  }
+
+  // J11 合并：**触发**用本地判据（字面连续片段够长、或向量余弦够高），**决定**交给引擎。
+  // 只差一个项目名的两条记忆余弦 0.953 —— 比真重复还高，所以余弦只能当触发器，
+  // 不能当判决（实测算过：alpha/beta 0.953 vs 模型转述 0.797）。
+  const mergeCandidates = candidates.filter((c) => {
+    if (c.id === memory.id) return false;
+    if (longestSharedRun(content, c.content) >= SAME_THING_RUN) return true;
+    if (!vec) return false;
+    const other = getEmbedding(target, c.id);
+    return other ? cosine(vec, other) >= MERGE_TRIGGER_COSINE : false;
+  });
+  let merged = 0;
+  const mergeAsk: ReviewItem[] = [];
+  if (mergeCandidates.length && j.meta.status !== "unavailable") {
+    try {
+      const scores = await adapter.judgeMerge(memory, mergeCandidates);
+      if (scores.meta.status === "ok") {
+        for (const c of mergeCandidates) {
+          const same = scores.get(c.id) ?? 0;
+          if (same >= MERGE_AUTO_ABOVE) {
+            mergeMemories(target, memory.id, c.id, `引擎判定是同一件事（${same.toFixed(2)}）`);
+            merged++;
+          } else if (same >= MERGE_ASK_ABOVE) {
+            // 中间档问用户（不自动合并）。返回的项要带出去，否则调用方不知道要弹这一条。
+            mergeAsk.push(...queueMerge(target, memory, c, same));
+          }
+        }
+      }
+    } catch {
+      /* 合并判不了就不合并：合错了不可逆 */
+    }
   }
 
   if (j.relation.choice !== "none" && j.targetId) {
@@ -245,10 +285,11 @@ export async function writeFlow(
   // 引擎不确定的事（§6 的 <0.5 档）和「看着是同一件事」（§9.3 合并）排进待确认队列。
   // 这里只提议、不动数据 —— 判不了就交给用户，别让污染记忆自己沉淀下去。
   const review = [
-    ...queueAfterWrite(target, memory, candidates, j.relation, j.targetId),
+    ...queueAfterWrite(target, memory, candidates, j.relation, j.targetId, j.meta.status !== "ok"),
     ...queueTopicNaming(target, memory, topics),
     // J14b：引擎说 global 但我们收窄了 → 问用户要不要放宽（本地版不做 LLM 复核，就问用户）
     ...queueScopeWidening(target, memory, j.scope.choice),
+    ...mergeAsk,
   ];
 
   addTrace(target, {
@@ -259,5 +300,5 @@ export async function writeFlow(
     route: resolved.route,
   });
 
-  return { action: "stored", memory, review, status: j.meta.status };
+  return { action: "stored", memory, review, status: j.meta.status, merged };
 }

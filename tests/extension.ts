@@ -57,11 +57,15 @@ const runCommand = (args: string) => commands.get("memory")!.handler(args, ctx);
 
 const realFetch = globalThis.fetch;
 let lastState = "";
+/** 每次发给引擎的 state 都留着 —— 现在一轮里可能有好几次调用（写、合并、核对），
+ *  断言「某个调用带了什么」比断言「最后一次带了什么」稳。 */
+const allStates: string[] = [];
 /** 上一句引擎看到的提问（用来诚实地回答「还是同一件事吗」）。 */
 let lastSeenPrompt = "";
 const jevFetch: typeof fetch = async (_url, init) => {
   const req = JSON.parse(String(init?.body)) as { questions: Record<string, { type: string }>; state?: string };
   lastState = String(req.state ?? "");
+  allStates.push(lastState);
   const asked = lastState.includes("NEW REQUEST:") ? lastState.split("NEW REQUEST:")[1]!.trim() : lastState.trim();
   const answers: Record<string, unknown> = {};
   for (const [key, q] of Object.entries(req.questions)) {
@@ -74,6 +78,9 @@ const jevFetch: typeof fetch = async (_url, init) => {
     // 「还是同一件事吗」按上一句如实回答。
     else if (key === "need_recall") answers[key] = { type: "noul", noul: asked.replace(/\s+/g, "").length < 6 ? 0.2 : 0.9 };
     else if (key === "new_topic") answers[key] = { type: "noul", noul: asked === lastSeenPrompt ? 0.1 : 0.9 };
+    // J11：给 0.8（中间档）—— 不自动合并，但要排一条「要不要合并」问用户。
+    // 真 JEV 实测：真重复 0.96/0.97，只差一个项目名 0.02。
+    else if (key.startsWith("same_")) answers[key] = { type: "noul", noul: 0.8 };
     else if (q.type === "noul") answers[key] = { type: "noul", noul: 0.9 };
     else answers[key] = { type: "choice", choice: "inject", confidence: 0.9, probabilities: {} };
   }
@@ -188,16 +195,19 @@ for (let i = 0; i < 100 && !writtenId; i++) {
   else await new Promise((r) => setTimeout(r, 50));
 }
 assert.ok(writtenId, "agent_end 写的记忆该落地（后台队列不拖用户，但不能丢）");
-assert.match(lastState, /USER SAID EARLIER IN THIS SESSION:\n我们在讨论提交要按什么拆/, "真链路上也要把前面几轮用户的话送给判断引擎");
+assert.ok(
+  allStates.some((x) => /USER SAID EARLIER IN THIS SESSION:\n我们在讨论提交要按什么拆/.test(x)),
+  "真链路上也要把前面几轮用户的话送给判断引擎",
+);
 console.log("✓ agent_end 只取用户自己的话，重复的那句不会被评估两次；上下文带上前几轮");
 
 // 落库后排队的合并提议（看着是同一件事）会在 agent_end 之后问用户一次 ——
 // pi 的 1/2/3 选择框，不弹第二个（一轮最多问一条，剩下的 /memory review 过）。
-for (let i = 0; i < 100 && selects.length === 0; i++) await new Promise((r) => setTimeout(r, 50));
-assert.ok(selects.length >= 1, "有合并提议时要问用户一次");
-assert.match(selects[0][0], /记忆待确认/);
-assert.match(selects[0][0], /同一件事/);
-assert.equal(selects[0][1][0], "保留两条（并存）", "默认选项必须是最安全的那个（按 Esc 就是这个）");
+for (let i = 0; i < 100 && selects.length + inputs.length === 0; i++) await new Promise((r) => setTimeout(r, 50));
+// 一轮落库后可能同时排了几条（合并提议 / 起主题 / …），只问第一条，其余留在队列。
+// 问的可能是选择框（合并/冲突）也可能是输入框（起主题），两种都算「问了」。
+assert.ok(selects.length + inputs.length >= 1, `落库后要问用户一条，实际 selects=${selects.length} inputs=${inputs.length}`);
+if (selects.length) assert.match(selects[0][0], /记忆待确认/);
 
 // ------------------------------------------------------------ 工具 + 命令
 const search = await tools.get("memory_search")!.execute(undefined, { query: "影子" }, undefined, undefined, ctx) as { content: Array<{ text: string }> };

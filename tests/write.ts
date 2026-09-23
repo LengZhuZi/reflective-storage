@@ -298,6 +298,47 @@ const sup = project.db.prepare(`SELECT action FROM reflection_traces WHERE actio
 assert.equal(sup.action, "superseded", "自动取代要留痕");
 console.log("✓ >0.8 的取代自动标掉旧记忆（不再两条并存）");
 
+// -------------------------------------- J11 自动合并（引擎判定同一件事才合）
+// 触发用本地判据（连续片段 ≥6 或余弦 ≥0.85），**决定**交给引擎 —— 实测只差一个项目名的
+// 两条记忆余弦 0.953，比真重复（模型转述 0.797）还高，所以余弦只能当触发器。
+const nearDup = insertMemory(project, { content: "部署前必须先跑一遍 index 重建", type: "procedure", scope: "project", scopeId: "P" });
+const withMerge = (score: number, onlyId?: string) => ({
+  async judgeWrite() {
+    return {
+      worthKeeping: { noul: 0.9 }, type: { choice: "procedure", confidence: 0.9, probabilities: {} },
+      scope: { choice: "project", confidence: 0.9, probabilities: {} },
+      relation: { choice: "none", confidence: 0.9, probabilities: {} }, targetId: null, topic: null,
+      meta: { gate: "J1+J2+J3", fallbackUsed: "none", status: "ok", latencyMs: 3 },
+    };
+  },
+  async judgeMerge(_m: unknown, cands: Array<{ id: string }>) {
+    const out = new Map(cands.map((c) => [c.id, onlyId && c.id !== onlyId ? 0.02 : score]));
+    return Object.assign(out, { meta: { gate: "J11", fallbackUsed: "none", status: "ok", latencyMs: 3 } });
+  },
+} as never);
+
+const auto = await writeFlow(project, global, withMerge(0.96, nearDup.id), session, {
+  // 换个说法（不是只改标点）：只改标点会被精确查重先挡掉，就走不到 J11 这条路了
+  userTexts: ["部署前要先跑一遍 index 重建才行"], context: "",
+});
+assert.equal(auto.merged, 1, "引擎说 0.96 是同一件事 → 自动合并");
+assert.equal(getMemory(project, nearDup.id)!.state, "superseded", "旧的标成已取代");
+const survivorMeta = getMemory(project, auto.memory!.id)!.metadata ?? "";
+assert.match(survivorMeta, /mergedFrom/, "旧原文存进新的 metadata（合并不可逆，要留退路）");
+assert.match(survivorMeta, /部署前必须先跑一遍 index 重建/, "旧原文真的在里面");
+const mergeTrace = project.db.prepare(`SELECT action FROM reflection_traces WHERE gate = 'J11' AND action = 'merge'`).get() as Record<string, unknown>;
+assert.equal(mergeTrace.action, "merge", "自动合并要留痕");
+
+// 中间档（0.7–0.9）不自动合并，问用户
+const midNear = insertMemory(project, { content: "灰度发布比例先从 5% 起步，再逐步放量", type: "procedure", scope: "project", scopeId: "P" });
+const mid = await writeFlow(project, global, withMerge(0.8, midNear.id), session, {
+  userTexts: ["灰度发布比例先从 5% 起步再放量"], context: "",
+});
+assert.equal(mid.merged, 0, "0.8 这一档不自动合并");
+assert.equal(getMemory(project, midNear.id)!.state, "active", "中间档不许动数据");
+assert.ok((mid.review ?? []).some((r) => r.kind === "merge"), "中间档要问用户（合并提议）");
+console.log("✓ J11 自动合并：≥0.9 自动合（旧原文留 metadata），0.7–0.9 问用户");
+
 project.close();
 global.close();
 fs.rmSync(tmp, { recursive: true, force: true });

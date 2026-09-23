@@ -556,6 +556,18 @@ export function staleSessionMemories(o: OpenedDb, days: number, now: number): st
   return rows.map((r) => String(r.id));
 }
 
+/** 读回某条记忆的向量（合并判重时算余弦用）。向量层没开或没存过就返回 null。 */
+export function getEmbedding(o: OpenedDb, id: string): number[] | null {
+  if (!o.vecEnabled) return null;
+  try {
+    const row = o.db.prepare(`SELECT embedding FROM memory_embeddings WHERE memory_id = ?`).get(id) as Row | undefined;
+    if (!row || !(row.embedding instanceof Uint8Array)) return null;
+    return Array.from(new Float32Array(row.embedding.buffer, row.embedding.byteOffset, row.embedding.byteLength / 4));
+  } catch {
+    return null;
+  }
+}
+
 /** 本地 UI 用：按条件列记忆（条件都可选）。排序用 rowid 兜底，避免同毫秒不确定。 */
 export function queryMemories(
   o: OpenedDb,

@@ -18,7 +18,9 @@ import { JevHttpClient, JevUnavailableError, type AskOptions, type Answer, type 
 import { LlmClient } from "./llm.ts";
 import { createRuleAdapter, RULE_RELEVANCE_THRESHOLD } from "./rule-adapter.ts";
 import { ruleRelation, ruleRelevance, ruleScope, ruleType, ruleWorthKeeping, sameTopic } from "./rule.ts";
-import type { CitationJudgment, InjectionJudgment, Judged, NoulResult, ProactiveJudgment, RecallJudgment, WriteJudgment } from "./types.ts";
+import type {
+  CitationJudgment, InjectionJudgment, Judged, NoulResult, ProactiveJudgment, RecallJudgment, WriteJudgment,
+} from "./types.ts";
 
 /**
  * 判断引擎只需要这一个方法。JEV HTTP 和任何 OpenAI 兼容端点（见 llm.ts）都满足它，
@@ -41,6 +43,13 @@ export const SCOPE_BLOCK_BELOW = 0.5;
 export const CITED_BELOW = 0.5;
 /** J16：主动提醒的阈值。故意高一点 —— 主动打扰错了比不打扰烦得多。 */
 export const PROACTIVE_BELOW = 0.6;
+/**
+ * J11：引擎判定「同一件事、合并不丢信息」的阈值。实测分得很开：
+ * 真重复（转述/换标点）0.96/0.97，假重复（只差一个项目名、同类不同事）0.02。
+ */
+export const MERGE_AUTO_ABOVE = 0.9;
+/** 0.7–0.9 这一档不自动合并，问用户。 */
+export const MERGE_ASK_ABOVE = 0.7;
 
 /** 交给 createJevAdapter 的时间预算。本地模型比 JEV 慢一个量级，所以这两个值可以调。 */
 export interface JudgeTimeouts {
@@ -68,6 +77,12 @@ export interface JevAdapter {
    *  没有 query 的话 JEV 只能拿着一段孤立的候选列表瞎猜（实测：把�ype影那条判成了 skip，
    *  反而把不相关的小车点表判成 inject）。 */
   judgeInjection(query: string, candidates: MemoryNode[], budget: TokenBudget): Promise<Judged<InjectionJudgment>>;
+  /**
+   * J11 合并：这条候选和新记的这条是不是**同一件事**，合并会不会丢信息。
+   * 返回 memoryId → 0–1。**只有引擎能判** —— 实测：只差一个项目名的两条
+   * （alpha/beta 的影子算法）余弦相似度 0.953，比真重复（模型转述 0.797）还高。
+   */
+  judgeMerge(memory: MemoryNode, candidates: MemoryNode[]): Promise<Judged<Map<string, number>>>;
   /** J15：回复里到底用上了哪几条注入的记忆。没有引擎时退回字符串比对（见 feedback.ts）。 */
   judgeCitations(reply: string, injected: MemoryNode[]): Promise<Judged<CitationJudgment>>;
   /**
@@ -333,6 +348,35 @@ export function createJevAdapter(client: JudgeClient, opts: JudgeTimeouts = {}):
         // §11.3 说的「JEV 挂了隔离不能跟着失效」靠的就是那层。
         for (const m of capped) relevance.set(m.id, ruleRelevance(query, m));
         return { relevance, blocked, meta: degradation("J7", e, t0, "JEV 不可用，已退回关键词打分") };
+      }
+    },
+
+    async judgeMerge(memory, candidates): Promise<Judged<Map<string, number>>> {
+      const t0 = Date.now();
+      const out = new Map<string, number>();
+      const capped = candidates.slice(0, MAX_CANDIDATES);
+      if (capped.length === 0) {
+        return Object.assign(out, { meta: { gate: "J11", fallbackUsed: "none" as const, status: "ok" as const, latencyMs: 0 } });
+      }
+      const state = `NEW MEMORY:\n${memory.content}\n\nCANDIDATES:\n${candidateBlock(capped)}`;
+      const questions: Questions = Object.fromEntries(
+        capped.map((m) => [
+          `same_${m.id}`,
+          {
+            type: "noul" as const,
+            instructions:
+              `The NEW MEMORY and [${m.id}] state the same thing, and merging them into one loses no ` +
+              `information (no differing project, name, number, negation or condition)`,
+          },
+        ]),
+      );
+      try {
+        const res = await client.ask(state, questions, { timeoutMs: fast });
+        for (const m of capped) out.set(m.id, num(res.answers[`same_${m.id}`], "noul"));
+        return Object.assign(out, { meta: okMeta("J11", res, questions, t0) });
+      } catch (e) {
+        // 判不了就不合并（fail-closed：合错了会把两条不同的记忆并成一条，不可逆）
+        return Object.assign(out, { meta: degradation("J11", e, t0, "JEV 不可用，本轮不自动合并") });
       }
     },
 

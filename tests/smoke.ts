@@ -130,6 +130,37 @@ assert.equal(rGlobal.blocked.has(gNode.id), true, "引擎判 global 记忆不适
 assert.equal(rGlobal.relevance.get(gNode.id), 0.9, "被屏蔽的那条仍然保留自己的相关性分数 —— 屏蔽和低分是两条通道");
 console.log("✓ J14a：边界判断只问 global 记忆，挡下的是「屏蔽」而不是低分");
 
+// J14a（2026-09-23 修正）：**别的项目**的记忆要用另一句问法。
+// 旧写法把它当 global（“关于用户而不是某个代码库”），JEV 一看就问错了对象：
+// 真跑里 projB 问 projA 的提交规范，那条相关度 0.95 被 applies=0.04 整条挡掉。
+let seenQuestions: Record<string, { instructions?: string }> = {};
+const recorder = (noul: number): typeof fetch => async (_url, init) => {
+  const req = JSON.parse(String(init?.body)) as { questions: Record<string, { instructions?: string }> };
+  seenQuestions = req.questions;
+  const answers: Record<string, unknown> = {};
+  for (const key of Object.keys(req.questions)) answers[key] = { type: "noul", noul: key.startsWith("applies_") ? noul : 0.95 };
+  return new Response(JSON.stringify({ model: "t", answers, usage: { input_tokens: 1, output_tokens: 1 } }), { status: 200 });
+};
+const foreignNode = { ...getMemory(o, a.id)!, scope: "project" as const, scopeId: "Other" };
+const foreignAdapter = createJevAdapter(new JevHttpClient({ apiKey: "test", fetchImpl: recorder(0.2) }));
+const rForeign = await foreignAdapter.judgeRelevance("提交要怎么拆", [foreignNode], { projectId: "World" });
+assert.equal(seenQuestions[`applies_${foreignNode.id}`]!.instructions!.includes("comes from another project"), true, "别的项目要用「来自别的项目」的问法，而不是 global");
+assert.equal(rForeign.blocked.has(foreignNode.id), true, "别的项目的记忆不适用时照样屏蔽");
+// 上层路由已经点名「这次问的就是那个项目」时，不再问适用性 —— 那里的记忆正是答案
+const rFocus = await foreignAdapter.judgeRelevance("提交要怎么拆", [foreignNode], { projectId: "World", focusProjects: ["Other"] });
+assert.equal(seenQuestions[`applies_${foreignNode.id}`], undefined, "点名过的项目不许再问边界");
+assert.equal(rFocus.blocked.size, 0);
+assert.equal(rFocus.relevance.get(foreignNode.id), 0.95, "不问边界，但相关性照常算");
+// global 的问法保持原样，不能被这次改动带跑
+const rGlobalWords = await foreignAdapter.judgeRelevance("影子太黑", [gNode], { projectId: "World" });
+assert.equal(seenQuestions[`applies_${gNode.id}`]!.instructions!.includes("global memory"), true);
+assert.equal(rGlobalWords.blocked.has(gNode.id), true);
+// session 作用域既不问 global 也不问别的项目（它不是“关于用户的”也不是“别的项目的”）
+const sessNode = { ...getMemory(o, a.id)!, scope: "session" as const, scopeId: "sess-1" };
+await foreignAdapter.judgeRelevance("影子太黑", [sessNode], { projectId: "World" });
+assert.equal(seenQuestions[`applies_${sessNode.id}`], undefined, "session 记忆不问适用性");
+console.log("✓ J14a：别的项目与 global 分开问，点名过的项目免检");
+
 // J15：让引擎判「回复用上了哪几条注入的记忆」
 const citedRes = await live.judgeCitations("第一条我按影子强度改了", [getMemory(o, a.id)!, getMemory(o, b.id)!]);
 assert.equal(citedRes.meta.status, "ok");

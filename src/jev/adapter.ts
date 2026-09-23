@@ -91,8 +91,16 @@ export interface JevAdapter {
       topicsLabel?: string;
     },
   ): Promise<Judged<RouteJudgment>>;
-  /** J7 + J14a（global 记忆在当前项目适不适用，边界才问）。`projectId` 给边界判断用。 */
-  judgeRelevance(query: string, candidates: MemoryNode[], opts?: { projectId?: string }): Promise<Judged<RecallJudgment>>;
+  /**
+   * J7 + J14a（记忆在当前项目适不适用，边界才问）。`projectId` 给边界判断用。
+   * `focusProjects`：上层路由已经点名「这次问的就是那个项目」（§10.6），点名过的项目
+   * 不再过边界判断 —— 那里的记忆正是答案本身，再问一次「你适用吗」只会把它挡掉。
+   */
+  judgeRelevance(
+    query: string,
+    candidates: MemoryNode[],
+    opts?: { projectId?: string; focusProjects?: readonly string[] },
+  ): Promise<Judged<RecallJudgment>>;
   /** J8。query 必须传进来 —— J8 问的是「这条记忆对**眼下这件事**有没有用」，
    *  没有 query 的话 JEV 只能拿着一段孤立的候选列表瞎猜（实测：把�ype影那条判成了 skip，
    *  反而把不相关的小车点表判成 inject）。 */
@@ -129,8 +137,19 @@ const confidenceOf = (a: Answer | undefined): number =>
 const probabilitiesOf = (a: Answer | undefined): Record<string, number> =>
   a && a.type !== "noul" && a.probabilities && typeof a.probabilities === "object" ? a.probabilities : {};
 
+/**
+ * 交给判断引擎看的候选块。
+ *
+ * 带上作用域和归属项目是有原因的：JEV 看不到库（SQL 那层已经滤过了），只看到这段文字。
+ * 不给归属时，「这个项目的提交规范是…」这条 projA 的记忆，在 projB 的会话里看起来
+ * 就是当前项目的约定，于是「projA 的提交规范是什么」这种点名提问它只给 0.41；
+ * 写成 `(fact, project projA)` 之后同一问给 0.98 —— 点名召回差点就死在少了这六个字。
+ * global 列成 global：那是「关于用户、不属于哪个代码库」的那类（J14a 要问的）。
+ */
 function candidateBlock(candidates: MemoryNode[]): string {
-  return candidates.map((m, i) => `[${m.id}] (${m.type}) ${m.content}`).join("\n");
+  return candidates
+    .map((m) => `[${m.id}] (${m.type}, ${m.scope}${m.scopeId ? ` ${m.scopeId}` : ""}) ${m.content}`)
+    .join("\n");
 }
 
 /**
@@ -334,13 +353,19 @@ export function createJevAdapter(client: JudgeClient, opts: JudgeTimeouts = {}):
         return { relevance, blocked, meta: { gate: "J7", fallbackUsed: "none", status: "ok", latencyMs: 0 } };
       }
 
-      // J14a：只对 global 记忆问边界问题（§11.1 的三个例子之一）。项目的和本会话的
-      // 记忆已经被 SQL 那层门禁管住了，不需要再问；而 global 是唯一「谁都能看见、
-      // 但未必都适用」的那类。多问不涨价（§5.1），跟在 J7 同一次调用里。
-      // J14a 只问「可能不该用在这里」的那些：global（谁都能看见）和**别的项目**的
-      // （跨项目引用是引擎自己提出来的，但适用不适用还得再过一道，§11.3）。
-      const globals = capped.filter(
-        (m) => m.scope === "global" || (opts.projectId != null && m.scopeId != null && m.scopeId !== opts.projectId),
+      // J14a 只问「可能不该用在这里」的那些：global（谁都能看见、但未必都适用）和
+      // **别的项目**的（跨项目引用是引擎自己找出来的，适不适用还得再过一道，§11.3）。
+      // 当前项目自己的和 session 的已经被 SQL 那层门禁管住了，不问。多问不涨价（§5.1）。
+      //
+      // 实测修正（2026-09-23）：原来把「别的项目」和 global 合成一类，还共用一句
+      // 「这是关于用户而不是某个代码库的 global 记忆」。别的项目的记忆明明是某一个
+      // 代码库的，JEV 一看就问错了对象：projB 里问 projA 的提交规范，那条相关度
+      // 0.95，被这句错措辞判成 applies=0.04 后**整条挡掉** —— 跨项目点名召回 2/2 失败。
+      // 分开问之后同一问给 0.84，正常召回。
+      const focus = new Set(opts.focusProjects ?? []);
+      const globals = capped.filter((m) => m.scope === "global");
+      const foreign = capped.filter(
+        (m) => m.scope === "project" && m.scopeId != null && m.scopeId !== opts.projectId && !focus.has(m.scopeId),
       );
       const state =
         `CURRENT REQUEST:\n${query}\n\n` +
@@ -366,20 +391,30 @@ export function createJevAdapter(client: JudgeClient, opts: JudgeTimeouts = {}):
             },
           ]),
         ),
+        ...Object.fromEntries(
+          foreign.map((m) => [
+            `applies_${m.id}`,
+            {
+              type: "noul" as const,
+              instructions:
+                `Memory [${m.id}] comes from another project (${m.scopeId}), not the CURRENT PROJECT. It still applies to the work being discussed in the CURRENT REQUEST`,
+            },
+          ]),
+        ),
       };
 
       try {
         // 召回/注入在 before_agent_start 里，宁可不注入也不能拖住用户：短超时、不重试。
         const res = await client.ask(state, questions, { timeoutMs: fast });
         for (const m of capped) relevance.set(m.id, num(res.answers[`rel_${m.id}`], "noul"));
-        for (const m of globals) {
+        for (const m of [...globals, ...foreign]) {
           if (num(res.answers[`applies_${m.id}`], "noul") < SCOPE_BLOCK_BELOW) blocked.add(m.id);
         }
         const meta = okMeta("J7", res, questions, t0);
         return {
           relevance,
           blocked,
-          meta: blocked.size ? { ...meta, detail: `${meta.detail ? `${meta.detail}；` : ""}J14a 挡下 ${blocked.size} 条 global` } : meta,
+          meta: blocked.size ? { ...meta, detail: `${meta.detail ? `${meta.detail}；` : ""}J14a 挡下 ${blocked.size} 条不适用于当前项目的记忆` } : meta,
         };
       } catch (e) {
         // fail-degraded：少召回几条可以，一条都不召回不行。

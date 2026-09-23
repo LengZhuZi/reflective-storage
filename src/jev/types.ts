@@ -69,9 +69,10 @@ export interface RecallJudgment {
   /** J7：memoryId -> 相关性 0–1。 */
   relevance: Map<string, number>;
   /**
-   * J14a：被边界判断挡下的 memoryId（§11.1）。现在是「global 记忆在当前项目不适用」
-   * 这一类。它是**屏蔽**而不是低分 —— 低分会走阈值，而阈值在降级时不生效
-   * （fail-degraded），那正好把该挡的放过来了。所以单独一条通道。
+   * J14a：被边界判断挡下的 memoryId（§11.1）。现在是两类：global 记忆在当前项目不适用、
+   * 别的项目的记忆在当前项目不适用（上层路由点过名的除外）。它是**屏蔽**而不是低分 ——
+   * 低分会走阈值，而阈值在降级时不生效（fail-degraded），那正好把该挡的放过来了。
+   * 所以单独一条通道。
    */
   blocked: Set<string>;
 }

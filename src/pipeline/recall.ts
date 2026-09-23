@@ -446,13 +446,15 @@ async function runRecall(query: string, deps: RecallDeps): Promise<RecallResult>
 
   const j7 = await deps.adapter.judgeRelevance(query, candidates.map((c) => c.memory), {
     projectId: deps.session.projectId,
+    // 上层路由点过名的项目不过边界判断：那里的记忆正是这次要问的东西（§10.6）。
+    focusProjects: route.projectId ? [route.projectId] : [],
   });
   // J14a：被边界判断挡下的直接剔除（不是低分 —— 低分在降级时会被阈值放行，见 types.ts）。
   const blocked = j7.blocked ?? new Set<string>();
   if (blocked.size) {
     addTrace(deps.projectDb, {
       stage: "governance", gate: "J14a", action: "block",
-      reason: `${blocked.size} 条 global 记忆判定为不适用于当前项目（${deps.session.projectId}）`,
+      reason: `${blocked.size} 条记忆判定为不适用于当前项目（${deps.session.projectId}）`,
       status: j7.meta.status,
     });
   }

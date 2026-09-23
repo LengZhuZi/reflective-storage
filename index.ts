@@ -49,6 +49,8 @@ interface Runtime {
   inject: InjectConfig;
   /** §10.2 的混合排序权重。 */
   weights: RecallWeights;
+  /** 每一路召回各取多少条。 */
+  perSourceLimit: number;
   /** J16 主动召回的开关与频率（每会话几次）。 */
   proactive: { enabled: boolean; maxPerSession: number };
   /** 本会话已经主动提醒过几次。 */
@@ -303,6 +305,7 @@ export default function reflectiveStorage(pi: ExtensionAPI): void {
       adapter: createJudgeAdapter(judge),
       engine: judge.provider,
       weights: loaded.recall.weights,
+      perSourceLimit: loaded.recall.perSourceLimit,
       proactive: loaded.proactive,
       proactiveCount: 0,
       uiPort: loaded.ui.port,
@@ -401,6 +404,7 @@ export default function reflectiveStorage(pi: ExtensionAPI): void {
         session: r.session,
         budget: { maxTokens: DEFAULT_MAX_TOKENS },
         weights: r.weights,
+        perSourceLimit: r.perSourceLimit,
       });
       r.lastRecall = {
         status: res.status, candidates: res.candidates.length,
@@ -483,7 +487,7 @@ export default function reflectiveStorage(pi: ExtensionAPI): void {
       .then(async () => {
         const res = await recallFlow(said, {
           projectDb: r.projectDb, globalDb: r.globalDb, adapter: r.adapter, session: r.session,
-          weights: r.weights,
+          weights: r.weights, perSourceLimit: r.perSourceLimit,
         });
         if (res.candidates.length === 0) return;
         const j = await r.adapter.judgeProactive(said, res.candidates.map((c) => c.memory));
@@ -541,7 +545,7 @@ export default function reflectiveStorage(pi: ExtensionAPI): void {
       if (!r) throw new Error("记忆库未打开（没有活动会话）");
       const res = await recallFlow(params.query, {
         projectDb: r.projectDb, globalDb: r.globalDb, adapter: r.adapter, session: r.session,
-        weights: r.weights,
+        weights: r.weights, perSourceLimit: r.perSourceLimit,
       });
       r.lastRecall = { status: res.status, candidates: res.candidates.length, injected: res.injected.length, detail: res.detail, at: Date.now() };
       if (res.candidates.length === 0) {
@@ -649,7 +653,7 @@ export default function reflectiveStorage(pi: ExtensionAPI): void {
       if (sub === "search" && tail) {
         const res = await recallFlow(tail, {
           projectDb: r.projectDb, globalDb: r.globalDb, adapter: r.adapter, session: r.session,
-          weights: r.weights,
+          weights: r.weights, perSourceLimit: r.perSourceLimit,
         });
         ctx.ui.notify(
           res.candidates.length === 0

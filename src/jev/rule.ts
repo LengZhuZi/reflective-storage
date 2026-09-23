@@ -60,18 +60,29 @@ export function sameTopic(a: string, b: string, overlapAtLeast = 0.6): boolean {
 }
 
 /**
+ * 提问的二字组被这段文字覆盖了多少（0–1）。本地、免费、对中文有效。
+ *
+ * 为什么单独抽出来：它是**粗筛**（决定 20 条候选里谁能进来）唯一能用的字面信号。
+ * FTS5 那条路对中文近乎失效（trigram 要 3 个字连续，`影子太黑` 匹配不到 `影子强度`），
+ * 而这一个在候选集合上直接算，不受索引分词器限制。注意它只适合**排序**，不适合定阈值：
+ * 用 Set 求交是「有没有」，不是「像不像」。
+ */
+export function bigramCoverage(query: string, text: string): number {
+  const q = bigrams(query);
+  if (q.size === 0) return 0;
+  const t = bigrams(text);
+  let hit = 0;
+  for (const g of q) if (t.has(g)) hit++;
+  return hit / q.size;
+}
+
+/**
  * 关键词兜底的相关性。FTS5 的 trigram 分词器对中文是字符三元组匹配，
  * 「影子太黑」匹配不到「影子强度」（没有共同三字组，见 DESIGN.md §7.3），
  * 所以这里用 2 字滑窗求交，比 trigram 宽一点。
  */
 export function ruleRelevance(query: string, memory: MemoryNode): number {
-  const grams = bigrams(query);
-  if (grams.size === 0) return 0;
-  const text = memory.content + " " + (memory.summary ?? "");
-  const hit = bigrams(text);
-  let overlap = 0;
-  for (const g of grams) if (hit.has(g)) overlap++;
-  const ratio = overlap / grams.size;
+  const ratio = bigramCoverage(query, memory.content + " " + (memory.summary ?? ""));
   // 重要度高一点的实际记忆也算相关，避免兜底时一条都召不回来。
   return Math.min(1, ratio * 1.5 + memory.importance * 0.2);
 }

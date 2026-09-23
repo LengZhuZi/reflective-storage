@@ -91,6 +91,8 @@ export interface RecallWeights {
 
 export interface RecallConfig {
   weights: RecallWeights;
+  /** 每一路召回各取多少条再合并（默认 50）。库里记忆多了可以调大，代价是本地排序压力。 */
+  perSourceLimit: number;
 }
 
 export const DEFAULT_RECALL_WEIGHTS: RecallWeights = {
@@ -192,7 +194,9 @@ function resolveRecall(raw: unknown): RecallConfig {
   const w = (file.weights ?? {}) as Record<string, unknown>;
   const num = (v: unknown, fallback: number): number =>
     typeof v === "number" && Number.isFinite(v) && v >= 0 ? v : fallback;
+  const limit = file.perSourceLimit;
   return {
+    perSourceLimit: typeof limit === "number" && Number.isInteger(limit) && limit >= 5 ? limit : 50,
     weights: {
       relevance: num(w.relevance, DEFAULT_RECALL_WEIGHTS.relevance),
       vector: num(w.vector, DEFAULT_RECALL_WEIGHTS.vector),

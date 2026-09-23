@@ -120,7 +120,7 @@ sqlite3 $D/projects/*.db "select content,type,scope from memories; select gate,a
 | `REFLECTIVE_JUDGE_TIMEOUT_MS` / `_WRITE_TIMEOUT_MS` | 交互路径 / 写入路径超时，缺省 2500 / 8000。本地模型要调大 |
 | `REFLECTIVE_JUDGE_THRESHOLD` | 相关性阈值，缺省 0.7。本地小模型分数普遍偏低时调小 |
 
-行为开关只放配置文件（环境变量留给凭据和端点）：`ui.port`（缺省 0 = 系统挑端口）、`proactive.enabled`（缺省 `true`）、`proactive.maxPerSession`（缺省 1，主动提醒每会话最多几次）、`lifecycle.autoCleanup`（缺省 `false`）、`lifecycle.sessionTtlDays`（缺省 90）、`inject.maxPerSession`（缺省 5，设 1 = 每会话只注入一次）、`inject.minTurnsBetween`（缺省 1，不再用轮次拦）、`recall.weights`（混合排序权重，缺省 `0.55/0.15/0.1/0.15/0.05`，偏向 JEV 判断）。`inject.maxPerSession` / `minTurnsBetween` 只管机械约束（前缀缓存的账）；
+行为开关只放配置文件（环境变量留给凭据和端点）：`ui.port`（缺省 0 = 系统挑端口）、`proactive.enabled`（缺省 `true`）、`proactive.maxPerSession`（缺省 1，主动提醒每会话最多几次）、`lifecycle.autoCleanup`（缺省 `false`）、`lifecycle.sessionTtlDays`（缺省 90）、`inject.maxPerSession`（缺省 5，设 1 = 每会话只注入一次）、`inject.minTurnsBetween`（缺省 1，不再用轮次拦）、`recall.weights`（混合排序权重，缺省 `0.55/0.15/0.1/0.15/0.05`，偏向 JEV 判断）、`recall.perSourceLimit`（每一路召回各取多少条，缺省 50）。`inject.maxPerSession` / `minTurnsBetween` 只管机械约束（前缀缓存的账）；
 「这句话用不用得上记忆」「是不是刚才那件事」都由 J5 判断 —— **每一句话都会问一次 J5**（包括第一句），
 本地不再用「prompt 太短」这类规则拦召回（实测那个拦法会把整段会话挡在门外）。
 

@@ -27,14 +27,25 @@ import {
   addTrace, distinctTopics, listInScope, markAccessed, memoriesByTopic, recordRecall, searchByKeyword,
   searchByVector, type OpenedDb,
 } from "../storage/db.ts";
-import { bigrams } from "../jev/rule.ts";
+import { bigramCoverage, bigrams } from "../jev/rule.ts";
 import { buildInjectionBlock, fitBudget } from "./inject.ts";
 
 /** J7 之后的相关性阈值。每个引擎的分数尺度不同，所以实际用的是 adapter.relevanceThreshold。 */
 export const RELEVANCE_THRESHOLD = DEFAULT_RELEVANCE_THRESHOLD;
 
-/** 每一路各取多少条再合并，合并后再压到 MAX_CANDIDATES。 */
+/** 每一路各取多少条再合并，合并后再压到 MAX_CANDIDATES。可用 recall.perSourceLimit 调。 */
 const PER_SOURCE_LIMIT = 50;
+
+/**
+ * 压到 20 条时的**每路保底名额**。
+ *
+ * 为什么不能只按一个分数排序取前 20：库里同主题、措辞几乎一样的记忆（改口、转述、不同时间的
+ * 同一条约定）会挤成一坨，它们的向量分数只差零点几；一个扁平的 preScore 排序会让这一坨互相
+ * 挤，把**真正该被看见的那条**（比如刚记的、或字面对得上的）挤到 20 名之外 —— J7 根本没机会
+ * 看到它。所以先给每一路保底名额，再用 preScore 补满：宁可牺牲一点排序纯度，也不让某一路
+ * 整体消失。
+ */
+const QUOTA: ReadonlyArray<[Source, number]> = [["vector", 8], ["topic", 5], ["keyword", 3]];
 
 /**
  * 短于这个长度就不值得花一次召回（"继续"、"好"）。
@@ -69,6 +80,8 @@ export interface RecallDeps {
   limit?: number;
   /** §10.2 的混合排序权重。不给就用默认（偏向 JEV 判断）。 */
   weights?: RecallWeights;
+  /** 每一路召回各取多少条（默认 50）。 */
+  perSourceLimit?: number;
 }
 
 export interface Recalled {
@@ -144,27 +157,29 @@ export interface CandidateDeps {
   globalDb: OpenedDb;
   session: SessionInfo;
   limit?: number;
+  perSourceLimit?: number;
 }
 
 async function gather(query: string, deps: CandidateDeps): Promise<Map<string, Candidate>> {
   const pool = new Map<string, Candidate>();
+  const per = deps.perSourceLimit ?? PER_SOURCE_LIMIT;
 
   // 向量那一路只生成候选。实测命中与无关的余弦间隔只有 0.046（§13.2），
   // 靠它自己定阈值不可靠，排名交给 J7。
   try {
     const qv = await embed(query);
-    for (const [m, dist] of searchByVector(deps.projectDb, qv, PER_SOURCE_LIMIT)) {
+    for (const [m, dist] of searchByVector(deps.projectDb, qv, per)) {
       remember(pool, m, "vector", similarity(dist));
     }
-    for (const [m, dist] of searchByVector(deps.globalDb, qv, PER_SOURCE_LIMIT)) {
+    for (const [m, dist] of searchByVector(deps.globalDb, qv, per)) {
       remember(pool, m, "vector", similarity(dist));
     }
   } catch {
     // 向量层可缺：编码器加载不了就少一路语义候选，其他路照跑。原则 2：向量层可重建。
   }
 
-  for (const m of searchByKeyword(deps.projectDb, query, PER_SOURCE_LIMIT)) remember(pool, m, "keyword");
-  for (const m of searchByKeyword(deps.globalDb, query, PER_SOURCE_LIMIT)) remember(pool, m, "keyword");
+  for (const m of searchByKeyword(deps.projectDb, query, per)) remember(pool, m, "keyword");
+  for (const m of searchByKeyword(deps.globalDb, query, per)) remember(pool, m, "keyword");
 
   // 同主题那一路上：**只有当提问里出现了某个已知主题的名字**（或它的二字组基本覆盖了
   // 提问）才走。这不是语义判断，是查表 —— 判断谁是相关的仍然是 J7 的活，
@@ -173,8 +188,8 @@ async function gather(query: string, deps: CandidateDeps): Promise<Map<string, C
     const topics = [...distinctTopics(deps.projectDb), ...distinctTopics(deps.globalDb)];
     const hitTopics = topics.filter((t) => mentionsTopic(query, t)).slice(0, 3);
     for (const t of hitTopics) {
-      for (const m of memoriesByTopic(deps.projectDb, t, PER_SOURCE_LIMIT)) remember(pool, m, "topic");
-      for (const m of memoriesByTopic(deps.globalDb, t, PER_SOURCE_LIMIT)) remember(pool, m, "topic");
+      for (const m of memoriesByTopic(deps.projectDb, t, per)) remember(pool, m, "topic");
+      for (const m of memoriesByTopic(deps.globalDb, t, per)) remember(pool, m, "topic");
     }
   } catch {
     // 主题那一路只是加分项：查不到就少一路候选，不影响其他路
@@ -183,9 +198,9 @@ async function gather(query: string, deps: CandidateDeps): Promise<Map<string, C
   // 作用域内全部 + 近期：listInScope 就是 ORDER BY created_at DESC，
   // 所以「树遍历」和「时间过滤」是同一趟查询，不重复扫库（§10.1 的两路）。
   // session 作用域单独取一次，因为它的 scope_id 是会话而不是项目。
-  for (const m of listInScope(deps.projectDb, "project", deps.session.projectId, PER_SOURCE_LIMIT)) remember(pool, m, "scope");
-  for (const m of listInScope(deps.projectDb, "session", deps.session.sessionId, PER_SOURCE_LIMIT)) remember(pool, m, "scope");
-  for (const m of listInScope(deps.globalDb, "global", null, PER_SOURCE_LIMIT)) remember(pool, m, "scope");
+  for (const m of listInScope(deps.projectDb, "project", deps.session.projectId, per)) remember(pool, m, "scope");
+  for (const m of listInScope(deps.projectDb, "session", deps.session.sessionId, per)) remember(pool, m, "scope");
+  for (const m of listInScope(deps.globalDb, "global", null, per)) remember(pool, m, "scope");
 
   return pool;
 }
@@ -214,12 +229,14 @@ function recency(m: MemoryNode, now: number): number {
  * 交给 J7 之前用来压候选的廉价分（§10.2 去掉 JEV 那一项，因为还没判）。
  * 关键词命中是 0/1，权重不能大：它只说明字面对上了，不代表语义相关。
  */
-function preScore(c: Candidate, now: number): number {
-  return 0.35 * c.vectorSim
-    + 0.15 * (c.sources.has("keyword") ? 1 : 0)
+function preScore(c: Candidate, now: number, query: string): number {
+  const lexical = bigramCoverage(query, c.memory.content + " " + (c.memory.summary ?? ""));
+  return 0.3 * c.vectorSim
+    + 0.25 * lexical                            // 字面对得上：一堆近似记忆里唯一能分开它们的本地信号
+    + 0.1 * (c.sources.has("keyword") ? 1 : 0)
     + 0.15 * (c.sources.has("topic") ? 1 : 0)   // 主题是人起的名，命中一次比关键词更值钱
-    + 0.2 * c.memory.importance
-    + 0.15 * recency(c.memory, now);
+    + 0.15 * c.memory.importance
+    + 0.05 * recency(c.memory, now);
 }
 
 /**
@@ -253,12 +270,31 @@ export async function recallFlow(query: string, deps: RecallDeps): Promise<Recal
   return result;
 }
 
-/** 合并后的排序 + 门禁 + 压到 limit 条。召回和写入两条路共用同一套口径。 */
-function rank(pool: Map<string, Candidate>, session: SessionInfo, limit: number, now: number): Candidate[] {
-  return [...pool.values()]
-    .filter((c) => inScope(c.memory, session))
-    .sort((a, b) => preScore(b, now) - preScore(a, now))
-    .slice(0, limit);
+/**
+ * 合并后的排序 + 门禁 + 压到 limit 条。召回和写入两条路共用同一套口径。
+ * `query` 只用于算字面覆盖（粗筛里唯一对中文有效的本地信号）。
+ */
+function rank(pool: Map<string, Candidate>, session: SessionInfo, limit: number, now: number, query: string): Candidate[] {
+  const all = [...pool.values()].filter((c) => inScope(c.memory, session));
+  const score = (c: Candidate) => preScore(c, now, query);
+  const seen = new Set<string>();
+  const picked: Candidate[] = [];
+  // 先按路保底（每路内部按 preScore 排），再按 preScore 补满。
+  for (const [source, quota] of QUOTA) {
+    const lane = all.filter((c) => c.sources.has(source)).sort((a, b) => score(b) - score(a));
+    for (const c of lane.slice(0, quota)) {
+      if (seen.has(c.memory.id)) continue;
+      seen.add(c.memory.id);
+      picked.push(c);
+    }
+  }
+  for (const c of [...all].sort((a, b) => score(b) - score(a))) {
+    if (picked.length >= limit) break;
+    if (seen.has(c.memory.id)) continue;
+    seen.add(c.memory.id);
+    picked.push(c);
+  }
+  return picked.sort((a, b) => score(b) - score(a)).slice(0, limit);
 }
 
 /**
@@ -271,7 +307,7 @@ function rank(pool: Map<string, Candidate>, session: SessionInfo, limit: number,
  */
 export async function recallCandidates(query: string, deps: CandidateDeps): Promise<MemoryNode[]> {
   const pool = await gather(query, deps);
-  return rank(pool, deps.session, deps.limit ?? MAX_CANDIDATES, Date.now()).map((c) => c.memory);
+  return rank(pool, deps.session, deps.limit ?? MAX_CANDIDATES, Date.now(), query).map((c) => c.memory);
 }
 
 async function runRecall(query: string, deps: RecallDeps): Promise<RecallResult> {
@@ -282,7 +318,7 @@ async function runRecall(query: string, deps: RecallDeps): Promise<RecallResult>
   // 已注入过的先删：这些 id 不重复判断也不重复付费（§8.3）
   for (const id of deps.session.injectedIds) pool.delete(id);
 
-  const candidates = rank(pool, deps.session, limit, now);
+  const candidates = rank(pool, deps.session, limit, now, query);
 
   if (candidates.length === 0) {
     return { candidates: [], injected: [], status: "ok", detail: "库里没有命中" };

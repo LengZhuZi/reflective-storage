@@ -48,6 +48,10 @@ interface Runtime {
   inject: InjectConfig;
   /** §10.2 的混合排序权重。 */
   weights: RecallWeights;
+  /** J16 主动召回的开关与频率（每会话几次）。 */
+  proactive: { enabled: boolean; maxPerSession: number };
+  /** 本会话已经主动提醒过几次。 */
+  proactiveCount: number;
   /** 配置读取时发现的问题（文件缺失 / 权限不对 / 解析失败），/memory 要能看见。 */
   configProblems: string[];
   /** 本会话用哪个判断引擎（rules / jev / openai），/memory 要能看见。 */
@@ -61,6 +65,7 @@ interface Runtime {
   lastRecall?: { status: JudgeMeta["status"] | "skipped"; candidates: number; injected: number; detail?: string; query?: string; at: number };
   lastWrite?: { action: string; reason?: string; at: number };
   lastFeedback?: { injected: number; cited: number; score: number | null; by: string; at: number };
+  lastProactive?: { id: string; content: string; at: number };
   error?: string;
 }
 
@@ -185,6 +190,7 @@ function statusText(r: Runtime): string {
     `本会话注入：${r.state.doneThisSession ? `${r.state.injectedIds.size} 条 / ${r.state.injectionCount} 次` : "未注入"}`,
     `注入策略：每会话最多 ${r.inject.maxPerSession} 次，间隔 ≥${r.inject.minTurnsBetween} 轮，换话题才再注入`,
     `判断引擎：${r.engine}`,
+    `主动召回：${r.proactive.enabled ? `开（每会话最多 ${r.proactive.maxPerSession} 次）` : "关"}`,
     `自动清理：${r.cleanup.autoCleanup ? `开（session 记忆 ${r.cleanup.sessionTtlDays} 天没命中就销毁）` : "关（session 记忆只归档不销毁）"}`,
   ];
   const lr = r.lastRecall;
@@ -192,6 +198,7 @@ function statusText(r: Runtime): string {
   if (r.lastWrite) lines.push(`上次写入：${r.lastWrite.action}${r.lastWrite.reason ? `（${r.lastWrite.reason}）` : ""}`);
   const pending = countPendingReviews(r.projectDb);
   if (pending > 0) lines.push(`待确认：${pending} 条（/memory review 过一遍）`);
+  if (r.lastProactive) lines.push(`上次主动提醒：${r.lastProactive.content.slice(0, 40)}`);
   if (r.lastFeedback) {
     const how = r.lastFeedback.by === "engine" ? "引擎判定" : "字符串比对（下限）";
     lines.push(`上次注入效果：注入 ${r.lastFeedback.injected} 条，确凿用上 ${r.lastFeedback.cited} 条${r.lastFeedback.score === null ? "" : `（${how}，命中率 ${(r.lastFeedback.score * 100).toFixed(0)}%）`}`);
@@ -291,6 +298,8 @@ export default function reflectiveStorage(pi: ExtensionAPI): void {
       adapter: createJudgeAdapter(judge),
       engine: judge.provider,
       weights: loaded.recall.weights,
+      proactive: loaded.proactive,
+      proactiveCount: 0,
       proxyHint: hint,
       inject: loaded.inject,
       session: {
@@ -444,6 +453,46 @@ export default function reflectiveStorage(pi: ExtensionAPI): void {
         // 写入排队问用户的事项：一轮最多问一条，别刷屏（剩下的 /memory review 随时能过）。
         // hasUI 为假（print 模式）就只排队，不问。
         if (firstReviewId && ctx.hasUI) await askReview(r.projectDb, ctx, firstReviewId);
+      })
+      .catch((e) => { r.error = errText(e); });
+  });
+
+  // J16 主动召回（§4）：用户没问、但库里有一条他现在就该知道的。
+  //
+  // 挂在 agent_settled（pi 确认不会再自动继续）——那一轮已经答完，用户正在看，此刻提醒
+  // 不打断任何东西。**提醒只给用户看（notify），不往上下文里塞**：注入有 §8.3 的纪律
+  // （每会话有界几次、保前缀缓存），主动提醒挤进上下文会把那条纪律毁掉。
+  //
+  // 频率先保证不烦人：每会话最多 maxPerSession 次（默认 1），而且只提醒**本次会话还没
+  // 注入过**的记忆（注入过的话模型已经知道，再提醒是唠叨）。降级策略是关闭。
+  pi.on("agent_settled", async (_event, ctx) => {
+    const r = rt;
+    if (!r || !r.proactive.enabled) return;
+    if (r.proactiveCount >= r.proactive.maxPerSession) return;
+    const said = lastUserText(ctx.sessionManager.getBranch());
+    if (!said || !worthRecalling(said).ok) return;
+    r.proactiveCount++;   // 先占位：判失败也算用掉了这一轮，不许反复试
+
+    r.pending = r.pending
+      .then(async () => {
+        const res = await recallFlow(said, {
+          projectDb: r.projectDb, globalDb: r.globalDb, adapter: r.adapter, session: r.session,
+          weights: r.weights,
+        });
+        if (res.candidates.length === 0) return;
+        const j = await r.adapter.judgeProactive(said, res.candidates.map((c) => c.memory));
+        if (j.meta.status !== "ok") return;   // 降级 = 关闭（§4 的 J16 降级策略）
+        const pick = res.candidates.find((c) => j.remind.has(c.memory.id));
+        if (!pick) return;
+        addTrace(r.projectDb, {
+          memoryId: pick.memory.id, stage: "recall", gate: "J16", action: "remind",
+          reason: `主动提醒（J7 相关度 ${pick.relevance.toFixed(2)}）`,
+          status: j.meta.status, latencyMs: j.meta.latencyMs,
+        });
+        r.lastProactive = { id: pick.memory.id, content: pick.memory.content, at: Date.now() };
+        if (ctx.hasUI) {
+          ctx.ui.notify(`记忆提醒：${pick.memory.content.slice(0, 140)}\n/memory why ${pick.memory.id.slice(0, 8)} 看依据`, "info");
+        }
       })
       .catch((e) => { r.error = errText(e); });
   });

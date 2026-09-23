@@ -18,7 +18,7 @@ import { JevHttpClient, JevUnavailableError, type AskOptions, type Answer, type 
 import { LlmClient } from "./llm.ts";
 import { createRuleAdapter, RULE_RELEVANCE_THRESHOLD } from "./rule-adapter.ts";
 import { ruleRelation, ruleRelevance, ruleScope, ruleType, ruleWorthKeeping, sameTopic } from "./rule.ts";
-import type { CitationJudgment, InjectionJudgment, Judged, NoulResult, RecallJudgment, WriteJudgment } from "./types.ts";
+import type { CitationJudgment, InjectionJudgment, Judged, NoulResult, ProactiveJudgment, RecallJudgment, WriteJudgment } from "./types.ts";
 
 /**
  * 判断引擎只需要这一个方法。JEV HTTP 和任何 OpenAI 兼容端点（见 llm.ts）都满足它，
@@ -39,6 +39,8 @@ export const MAX_CANDIDATES = 20;
 export const SCOPE_BLOCK_BELOW = 0.5;
 /** J15：引擎判定「回复用上了这条记忆」的阈值。 */
 export const CITED_BELOW = 0.5;
+/** J16：主动提醒的阈值。故意高一点 —— 主动打扰错了比不打扰烦得多。 */
+export const PROACTIVE_BELOW = 0.6;
 
 /** 交给 createJevAdapter 的时间预算。本地模型比 JEV 慢一个量级，所以这两个值可以调。 */
 export interface JudgeTimeouts {
@@ -68,6 +70,11 @@ export interface JevAdapter {
   judgeInjection(query: string, candidates: MemoryNode[], budget: TokenBudget): Promise<Judged<InjectionJudgment>>;
   /** J15：回复里到底用上了哪几条注入的记忆。没有引擎时退回字符串比对（见 feedback.ts）。 */
   judgeCitations(reply: string, injected: MemoryNode[]): Promise<Judged<CitationJudgment>>;
+  /**
+   * J16 主动召回：用户没问，但这条记忆他现在就该知道吗（§4）。
+   * 降级策略是**关闭** —— 判不了就不打扰（主动打扰错了比不打扰更烦）。
+   */
+  judgeProactive(context: string, candidates: MemoryNode[]): Promise<Judged<ProactiveJudgment>>;
 }
 
 const num = (a: Answer | undefined, key: "noul" | "score"): number =>
@@ -326,6 +333,46 @@ export function createJevAdapter(client: JudgeClient, opts: JudgeTimeouts = {}):
         // §11.3 说的「JEV 挂了隔离不能跟着失效」靠的就是那层。
         for (const m of capped) relevance.set(m.id, ruleRelevance(query, m));
         return { relevance, blocked, meta: degradation("J7", e, t0, "JEV 不可用，已退回关键词打分") };
+      }
+    },
+
+    async judgeProactive(context, candidates): Promise<Judged<ProactiveJudgment>> {
+      const t0 = Date.now();
+      const remind = new Set<string>();
+      if (candidates.length === 0) {
+        return { remind, meta: { gate: "J16", fallbackUsed: "none", status: "ok", latencyMs: 0 } };
+      }
+      const state =
+        `WHAT JUST HAPPENED IN THE SESSION:\n${context.slice(0, 2000)}\n\n` +
+        `CANDIDATE MEMORIES (not yet used in this session):\n${candidateBlock(candidates)}`;
+      const questions: Questions = {
+        any_worth_reminding: {
+          type: "noul",
+          instructions:
+            "There is at least one memory below that the user would clearly want to be reminded of right now, and would not be annoyed to see",
+        },
+        ...Object.fromEntries(
+          candidates.map((m) => [
+            `remind_${m.id}`,
+            {
+              type: "noul" as const,
+              instructions:
+                `Memory [${m.id}] is worth surfacing to the user right now: it changes what they should do or know, and they have not asked about it`,
+            },
+          ]),
+        ),
+      };
+      try {
+        const res = await client.ask(state, questions, { timeoutMs: fast });
+        if (num(res.answers.any_worth_reminding, "noul") >= PROACTIVE_BELOW) {
+          for (const m of candidates) {
+            if (num(res.answers[`remind_${m.id}`], "noul") >= PROACTIVE_BELOW) remind.add(m.id);
+          }
+        }
+        return { remind, meta: okMeta("J16", res, questions, t0) };
+      } catch (e) {
+        // 降级 = 关闭：主动提醒判不了就不打扰（DESIGN §4 的 J16 降级策略）
+        return { remind, meta: degradation("J16", e, t0, "JEV 不可用，本轮不主动提醒") };
       }
     },
 

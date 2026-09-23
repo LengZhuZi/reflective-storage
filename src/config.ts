@@ -57,8 +57,18 @@ export interface LoadedConfig {
   inject: InjectConfig;
   lifecycle: LifecycleConfig;
   recall: RecallConfig;
+  proactive: ProactiveConfig;
   /** 读取时发现的问题。降级时必须把这些说出去，不能静默（§6.2）。 */
   problems: string[];
+}
+
+/**
+ * J16 主动召回（§4）。默认**开**，但每会话最多一次 —— 主动打扰的频率必须先保证不烦人。
+ * 关掉就设 `proactive.enabled = false`。
+ */
+export interface ProactiveConfig {
+  enabled: boolean;
+  maxPerSession: number;
 }
 
 /**
@@ -147,7 +157,18 @@ export function loadConfig(): LoadedConfig {
     inject: resolveInject(file?.inject),
     lifecycle: resolveLifecycle(file?.lifecycle),
     recall: resolveRecall(file?.recall),
+    proactive: resolveProactive(file?.proactive),
     problems,
+  };
+}
+
+/** J16 开关。默认开、每会话 1 次。 */
+function resolveProactive(raw: unknown): ProactiveConfig {
+  const file = (raw ?? {}) as Record<string, unknown>;
+  const n = file.maxPerSession;
+  return {
+    enabled: file.enabled !== false,
+    maxPerSession: typeof n === "number" && Number.isFinite(n) && n >= 0 ? Math.floor(n) : 1,
   };
 }
 

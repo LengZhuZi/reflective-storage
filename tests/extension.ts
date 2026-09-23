@@ -267,6 +267,20 @@ assert.equal(selects.length, 0);
 assert.match(notes.at(-1)!, /没有待确认/);
 console.log("✓ 待确认队列：/memory review 逐条问用户，问完出队列");
 
+// ------------------------------------------------------------ J16 主动召回
+// 用户没问、库里有一条他现在就该知道的 → agent_settled 之后提醒一句（只给用户看，不塞上下文）
+await call("session_compact");   // 解锁注入判定，避免状态互相干扰
+notes.length = 0;
+selects.length = 0;
+branch.push({ type: "message", message: { role: "user", content: "提交流程要注意什么" } });
+await call("agent_settled", {});
+await call("session_shutdown");
+const proactiveNote = notes.find((n) => /记忆提醒：/.test(n));
+assert.ok(proactiveNote, `该提醒一次，实际 notes=${JSON.stringify(notes).slice(0, 120)}`);
+assert.match(proactiveNote!, /\/memory why/);
+assert.equal(selects.length, 0, "主动提醒是通知，不是对话框（不打扰）");
+console.log("✓ J16 主动召回：agent_settled 后提醒一句（notify 不弹窗）");
+
 // ------------------------------------------------------------ 收尾冲刷待写队列
 await call("session_shutdown");
 globalThis.fetch = realFetch;
@@ -280,9 +294,11 @@ assert.ok(
   (after.db.prepare(`SELECT count(*) c FROM review_queue WHERE status = 'pending'`).get() as { c: number }).c <= 1,
   "待确认队列不能越攒越多",
 );
+const proactiveTrace = after.db.prepare(`SELECT action FROM reflection_traces WHERE gate = 'J16'`).get() as Record<string, unknown> | undefined;
+assert.equal(proactiveTrace?.action, "remind", "主动提醒要留痕");
 after.close();
 seed.close();
-console.log("✓ session_shutdown 冲刷待写队列，注入块没被写回库");
+console.log("✓ session_shutdown 冲刷待写队列，注入块没被写回库；J16 提醒留痕");
 
 // ------------------------------------------------------------ 没配 key：默认 rules 档
 // 这一档存在的理由：对别的用户来说，「没配 key 就什么都不发生」等于没装这个扩展。

@@ -72,6 +72,8 @@ const okFetch: typeof fetch = async (_url, init) => {
     else if (key === "new_topic") answers[key] = { type: "noul", noul: 0.1 };
     else if (key.startsWith("rel_")) answers[key] = { type: "noul", noul: key === `rel_${a.id}` ? 0.85 : 0.03 };
     else if (key.startsWith("applies_")) answers[key] = { type: "noul", noul: 0.9 };
+    else if (key === "any_worth_reminding") answers[key] = { type: "noul", noul: 0.8 };
+    else if (key.startsWith("remind_")) answers[key] = { type: "noul", noul: key === `remind_${a.id}` ? 0.9 : 0.2 };
     else if (key.startsWith("used_")) answers[key] = { type: "noul", noul: key === `used_${a.id}` ? 0.8 : 0.1 };
     else if (key.startsWith("inj_")) answers[key] = { type: "choice", choice: key === `inj_${a.id}` ? "inject" : "skip", confidence: 0.8, probabilities: {} };
   }
@@ -129,6 +131,12 @@ const citedRes = await live.judgeCitations("第一条我按影子强度改了", 
 assert.equal(citedRes.meta.status, "ok");
 assert.deepEqual([...citedRes.cited], [a.id]);
 console.log("✓ J15：引擎判定「回复用上了哪几条」（可用性失败路径见下面的 dead 引擎）");
+
+// J16：主动召回。两问：整体「有没有值得提醒的」+ 逐条「这条值得现在提醒吗」，
+// 整体那一问不过就一条都不提醒（少打扰优先）。
+const proactive = await live.judgeProactive("刚在聊提交规范", [getMemory(o, a.id)!, getMemory(o, b.id)!]);
+assert.equal(proactive.meta.status, "ok");
+assert.deepEqual([...proactive.remind], [a.id]);
 
 const inj = await live.judgeInjection("影子太黑", [getMemory(o, a.id)!, getMemory(o, b.id)!], { maxTokens: 500 });
 assert.equal(inj.decisions.get(a.id), "inject");

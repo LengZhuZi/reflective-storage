@@ -63,6 +63,12 @@ export function createRuleAdapter(relevanceThreshold: number = RULE_RELEVANCE_TH
       return { cited, meta: meta("J15(rules)") };
     },
 
+    async judgeProactive() {
+      // 规则档**不做主动召回**：判断「用户现在就想知道这条吗」需要真的理解会话，
+      // 关键词规则只会变成定时骚扰。宁可这一档没有这个能力（DESIGN §4 的降级策略也是关闭）。
+      return { remind: new Set<string>(), meta: meta("J16(rules)") };
+    },
+
     async judgeInjection(query, candidates, budget: TokenBudget) {
       // 没有模型时也必须注得进去，否则这一档就是「装了个寂寞」。但分数不到位仍然
       // 不注入：注入是 fail-closed 的那一层，沉默优于噪声（§6.1）。

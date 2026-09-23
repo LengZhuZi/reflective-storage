@@ -118,7 +118,7 @@ sqlite3 $D/projects/*.db "select content,type,scope from memories; select gate,a
 | `REFLECTIVE_JUDGE_TIMEOUT_MS` / `_WRITE_TIMEOUT_MS` | 交互路径 / 写入路径超时，缺省 2500 / 8000。本地模型要调大 |
 | `REFLECTIVE_JUDGE_THRESHOLD` | 相关性阈值，缺省 0.7。本地小模型分数普遍偏低时调小 |
 
-行为开关只放配置文件（环境变量留给凭据和端点）：`lifecycle.autoCleanup`（缺省 `false`）、`lifecycle.sessionTtlDays`（缺省 90）、`inject.maxPerSession`（缺省 3，设 1 = 每会话只注入一次）、`inject.minTurnsBetween`（缺省 3）、`recall.weights`（混合排序权重，缺省 `0.55/0.15/0.1/0.15/0.05`，偏向 JEV 判断）。后两个只管机械约束；「这个提问是不是刚才那件事」由 J5 判断（引擎说了算，不让本地规则兼职）。
+行为开关只放配置文件（环境变量留给凭据和端点）：`proactive.enabled`（缺省 `true`）、`proactive.maxPerSession`（缺省 1，主动提醒每会话最多几次）、`lifecycle.autoCleanup`（缺省 `false`）、`lifecycle.sessionTtlDays`（缺省 90）、`inject.maxPerSession`（缺省 3，设 1 = 每会话只注入一次）、`inject.minTurnsBetween`（缺省 3）、`recall.weights`（混合排序权重，缺省 `0.55/0.15/0.1/0.15/0.05`，偏向 JEV 判断）。后两个只管机械约束；「这个提问是不是刚才那件事」由 J5 判断（引擎说了算，不让本地规则兼职）。
 
 `lifecycle.autoCleanup` 打开之后：`scope='session'` 且超过 `sessionTtlDays` 天没被召回命中过的记忆**直接销毁**（不是归档）。删除不可逆，所以默认关；`/memory` 里能看到它开没开。
 | `REFLECTIVE_PROXY` | 代理地址，等价于配置文件里的 `proxy.http` |
@@ -155,6 +155,15 @@ sqlite3 $D/projects/*.db "select content,type,scope from memories; select gate,a
 - **FTS5 对中文是字符三元组**：`影子太黑` 匹配不到 `影子强度`（没有共同三字组），只能当粗筛。
 - 向量层缺失时系统照常运行，只是召回少一路语义候选。关系层是事实源，向量层随时可重建。
 - 写入口的 J3 候选（跟新内容最相关的 20 条）也靠向量那一路排序。向量层不可用时它会退化成「最近的作用域内记忆」，冲突检测随之变弱 —— 但写入本身不受影响。
+
+## 它也会主动提醒你
+
+一轮答完之后（pi 确认不会再自动继续时），如果库里有一条「你现在就该知道、但你没问」的记忆，
+它会提醒一句 —— 只在终端显示，**不塞进模型上下文**，每会话最多一次。关掉：
+
+```json
+{ "proactive": { "enabled": false } }
+```
 
 ## 会问你的两种情况
 

@@ -70,12 +70,28 @@ export interface RecallJudgment {
   blocked: Set<string>;
 }
 
+/**
+ * J16 主动召回：用户没问，但这条记忆他现在就该知道吗。
+ * 引擎说「值得提醒」的 id 集合 —— 提醒只给用户看（notify），不往上下文里塞（§8.3）。
+ */
+export interface ProactiveJudgment {
+  remind: Set<string>;
+}
+
 /** J15：事后核对用引擎判「这条注入的记忆有没有被回复用上」。 */
 export interface CitationJudgment {
   cited: Set<string>;
 }
 
 /** 注入闸（J8）的输出。 */
+
+/**
+ * J16 主动召回：用户没问，但这条记忆他现在就该知道吗。
+ * 引擎说「值得提醒」的 id 集合 —— 提醒只给用户看（notify），不往上下文里塞（§8.3）。
+ */
+export interface ProactiveJudgment {
+  remind: Set<string>;
+}
 
 /** J15：事后核对用引擎判「这条注入的记忆有没有被回复用上」。 */
 export interface CitationJudgment {

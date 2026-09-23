@@ -287,6 +287,35 @@ assert.ok(!(noTopic.review ?? []).some((r) => r.kind === "topic"));
 console.log("✓ J4 主题：引擎在已有主题里挑、提炼层的提议直接落库、不问用户");
 
 
+// ------------------------------------------------------------ 同主题 + 高余弦 → 直接自动合并
+const { autoMergeable } = await import("../src/pipeline/write.ts");
+const scopeP = { topic: "缓存策略", scope: "project", scopeId: "P" };
+assert.equal(autoMergeable(scopeP, scopeP, 0.9), true, "同主题 + 0.9 → 自动合并");
+assert.equal(autoMergeable(scopeP, scopeP, 0.84), false, "差一点点就走正常流程（J11 判 / 问用户）");
+assert.equal(autoMergeable(scopeP, { ...scopeP, topic: "部署流程" }, 0.9), false, "主题不同不自动合并");
+assert.equal(autoMergeable(scopeP, { ...scopeP, scope: "global", scopeId: null }, 0.9), false, "别把全局的那条并进项目库");
+assert.equal(autoMergeable({ ...scopeP, topic: null }, scopeP, 0.95), false, "没主题就没有「同主题」可言");
+
+const autoA = await writeFlow(project, global, fakeAdapter(0.9, { topic: "缓存策略" }), session, {
+  userTexts: ["缓存统一走本机 SQLite，没有 Redis 这一层，避免多引入一个组件。"], context: "",
+});
+assert.equal(autoA.action, "stored");
+const autoB = await writeFlow(project, global, fakeAdapter(0.9, { topic: "缓存策略" }), session, {
+  userTexts: ["缓存直接用本机 SQLite，不引入 Redis，少一个组件。"], context: "",
+});
+assert.equal(autoB.merged, 1, "重分析同一条 → 自动合并，不惊动用户");
+assert.equal(getMemory(project, autoA.memory!.id)!.state, "superseded", "旧的那条标 superseded（没硬删，原文进 metadata）");
+assert.ok(!(autoB.review ?? []).some((r) => r.kind === "merge"), "自动合并之后不再排队问用户");
+const inMerge = project.db.prepare(`SELECT state FROM memories WHERE id IN (?, ?)`).all(autoA.memory!.id, autoB.memory!.id) as Array<{ state: string }>;
+assert.deepEqual(inMerge.map((r) => r.state).sort(), ["active", "superseded"], "两条都还在（旧的是 superseded，可回滚），但 active 只剩一条");
+const keeper = getMemory(project, autoB.memory!.id)!;
+assert.match(String(keeper.metadata ?? ""), /mergedFrom/, "被合并那条的原文存进保留者的 metadata");
+assert.ok(String(keeper.metadata).includes("Redis"), "存的是原文，不是摘要");
+const autoTrace = project.db.prepare(`SELECT action, reason FROM reflection_traces WHERE gate = 'J11' AND action = 'auto_merge'`).get() as Record<string, unknown> | undefined;
+assert.ok(autoTrace, "自动合并要留痕");
+assert.match(String(autoTrace.reason), /同主题「缓存策略」/, "轨迹里要说清为什么自动合并");
+console.log("✓ 合并：同主题 + ≥0.85 直接自动合并（旧的标 superseded，旧原文进 metadata，留痕）");
+
 // ------------------------------------------------------------ 合并触发器（同主题 + 相似）
 const trig = (await import("../src/pipeline/write.ts")).mergeTriggered;
 assert.equal(trig({ content: "甲乙丙丁戊己庚辛", topic: null }, { content: "甲乙丙丁戊己庚辛壬", topic: null }, null), true, "长字面重复 → 触发");

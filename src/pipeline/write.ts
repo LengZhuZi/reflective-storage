@@ -45,6 +45,16 @@ export const MERGE_TRIGGER_COSINE = 0.85;
  */
 export const MERGE_TOPIC_COSINE = 0.8;
 
+/**
+ * **同主题 + 余弦 ≥ 这条线 → 直接合并，不花引擎、不占用户一次确认**（用户定的口径）。
+ *
+ * 为什么敢自动：同一个主题说明说的就是同一件事，0.85 的余弦在这个前提下已经很高
+ * （跨会话重分析同一模块实测 0.82 上下，同义改写在 0.88–0.89）。而且合并是**可回滚**的：
+ * 旧原文存进保留那条的 `metadata.mergedFrom`，旧条只是标 `superseded`，没有硬删。
+ * 另外这条只在**同作用域同库**之间生效 —— 别把一条全局偏好并进某个项目的记忆里。
+ */
+export const AUTO_MERGE_SAME_TOPIC_COSINE = 0.85;
+
 /** 引擎不可用时照存的那条记忆给多少重要性 —— 低到会先被衰减/归档，高到还能被召回。 */
 export const FAIL_OPEN_IMPORTANCE = 0.3;
 
@@ -254,6 +264,19 @@ export function buildCandidate(input: TurnInput): string {
  *      （实测同一份项目的两份分析只有 0.76–0.82），够不到第 2 条，而主题是现成的强信号。
  *      只差一个项目名的两条记忆余弦能到 0.953，所以余弦永远只当触发，不当判决。
  */
+/** 同主题 + 高余弦 = 直接合并（判据同 AUTO_MERGE_SAME_TOPIC_COSINE，单独抽出来便于断言）。 */
+export function autoMergeable(
+  a: { topic: string | null; scope: string; scopeId: string | null },
+  b: { topic: string | null; scope: string; scopeId: string | null },
+  sim: number | null,
+): boolean {
+  if (sim === null || !a.topic || a.topic !== b.topic) return false;
+  if (sim < AUTO_MERGE_SAME_TOPIC_COSINE) return false;
+  if (a.scope !== b.scope) return false;
+  if (a.scope === "project" && a.scopeId !== b.scopeId) return false;
+  return true;
+}
+
 export function mergeTriggered(
   a: { content: string; topic: string | null },
   b: { content: string; topic: string | null },
@@ -363,17 +386,44 @@ export async function writeFlow(
   // J11 合并：**触发**用本地判据（字面连续片段够长、或向量余弦够高），**决定**交给引擎。
   // 只差一个项目名的两条记忆余弦 0.953 —— 比真重复还高，所以余弦只能当触发器，
   // 不能当判决（实测算过：alpha/beta 0.953 vs 模型转述 0.797）。
-  const mergeCandidates = candidates.filter((c) => {
-    if (c.id === memory.id) return false;
-    const other = vec ? getEmbedding(target, c.id) : null;
-    const sim = vec && other ? cosine(vec, other) : null;
-    return mergeTriggered(
-      { content, topic: memory.topic ?? null },
-      { content: c.content, topic: c.topic ?? null },
-      sim,
+  // 先算触发（字面重复 / 高余弦 / 同主题+0.8），再分流：
+  //   **同主题 + ≥0.85 → 直接合并**（`autoMergeable`，可回滚，不花引擎不占用户确认）
+  //   其余的照旧交给 J11 判（0.85 以上自动、0.7–0.9 问用户）
+  const triggered = candidates
+    .filter((c) => c.id !== memory.id)
+    .map((c) => {
+      const other = vec ? getEmbedding(target, c.id) : null;
+      const sim = vec && other ? cosine(vec, other) : null;
+      return { c, sim };
+    })
+    .filter((x) =>
+      mergeTriggered(
+        { content, topic: memory.topic ?? null },
+        { content: x.c.content, topic: x.c.topic ?? null },
+        x.sim,
+      ),
     );
-  });
   let merged = 0;
+  const mergeCandidates: typeof candidates = [];
+  for (const x of triggered) {
+    // 保留谁：用户原话优先（把模型的重述并进用户的话，不该反过来）；否则留**新的**
+    // —— 判据是「后分析的那份通常更全」，而旧原文会原样存进 metadata，丢不了。
+    const keepUser = memory.origin === "agent" && x.c.origin === "user";
+    if (autoMergeable(memory, x.c, x.sim)) {
+      const keepId = keepUser ? x.c.id : memory.id;
+      const dropId = keepUser ? memory.id : x.c.id;
+      const result = mergeMemories(target, keepId, dropId, `同主题「${memory.topic}」+ 余弦 ${x.sim!.toFixed(2)}，自动合并（旧原文存进 metadata）`);
+      addTrace(target, {
+        memoryId: keepId, stage: "governance", gate: "J11", action: "auto_merge",
+        targetId: dropId, reason: `同主题「${memory.topic}」+ 余弦 ${x.sim!.toFixed(2)} ≥ ${AUTO_MERGE_SAME_TOPIC_COSINE}`,
+        status: "ok",
+      });
+      void result;
+      merged++;
+      continue;
+    }
+    mergeCandidates.push(x.c);
+  }
   const mergeAsk: ReviewItem[] = [];
   if (mergeCandidates.length && j.meta.status !== "unavailable") {
     try {

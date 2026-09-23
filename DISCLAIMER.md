@@ -17,8 +17,9 @@
 
 ## 许可与责任
 
-MIT 许可，按原样提供（AS IS），不提供任何担保。使用风险自负。作者不对数据丢失、
-模型账单、被注入的内容或任何间接损失负责。
+[PolyForm Noncommercial 1.0.0](./LICENSE) 许可：个人、学习、研究、非营利使用免费；
+**商业使用需要单独授权**。按原样提供（AS IS），不提供任何担保，使用风险自负。作者不对
+数据丢失、模型账单、被注入的内容或任何间接损失负责。
 
 ## English
 
@@ -26,7 +27,9 @@ This project was written entirely by **vibe coding**: humans set the goals and m
 trade-offs, an AI wrote the code, iterating against tests and real runs. It has had no
 formal review and has not been run in production for long.
 
-Provided AS IS under the MIT license, with no warranty of any kind. Memory writes, merges,
+Licensed under PolyForm Noncommercial 1.0.0: free for personal, educational, research and
+non-profit use; **commercial use requires a separate license**. Provided AS IS, with no
+warranty of any kind. Memory writes, merges,
 deletes and the optional auto-cleanup can lose data — merges and deletes are irreversible.
 Judgements come from a third-party model (JEV / TypeSafe AI) whose output this project does
 not control, and those judgements decide what is stored and what is injected into your

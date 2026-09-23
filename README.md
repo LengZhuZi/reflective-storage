@@ -183,4 +183,6 @@ Phase 1 完成，Phase 2 大部分完成（J9–J13 生命周期、J11 合并、
 
 ## 许可
 
-MIT，见 [LICENSE](./LICENSE)。
+[PolyForm Noncommercial 1.0.0](./LICENSE)：**个人使用、学习、研究、非营利都可以**，
+**商业使用需要单独授权**（开 issue 说明用途）。这不是 OSI 认可的开源许可，属于源码公开
+（source-available）。

@@ -3,7 +3,8 @@
   "version": "0.3.0",
   "type": "module",
   "scripts": {
-    "test": "for f in tests/*.ts; do node \"$f\" || exit 1; done"
+    "test": "for f in tests/*.ts; do node \"$f\" || exit 1; done",
+    "wipe": "node scripts/wipe.ts"
   },
   "pi": {
     "extensions": [

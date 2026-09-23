@@ -135,7 +135,7 @@ export function runLifecycle(o: OpenedDb, opts: LifecycleOptions = {}): Lifecycl
         state = "active";   // 又用上了：缓存过但最近碰到
       }
 
-      if (state === m.state && importance === m.importance) continue;
+      if (state === m.state && importance === m.importance && Math.abs(score - m.decayScore) < 0.01) continue;
       updateLifecycle(o, m.id, { decayScore: score, state, importance });
       summary.decayed++;
       if (state === "archived") {

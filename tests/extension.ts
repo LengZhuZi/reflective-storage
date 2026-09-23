@@ -305,6 +305,45 @@ assert.equal(selects.length, 0);
 assert.match(notes.at(-1)!, /没有待确认/);
 console.log("✓ 待确认队列：/memory review 逐条问用户，问完出队列");
 
+// 并发：模型一次发出两个 memory_add（真跑里就是这样）—— 两条都写的话库里会出现两行
+// 完全一样的记忆（实测 1.2 秒内两行 147 字一致）。写入必须排在同一条队列上。
+branch.length = 0;
+branch.push({ type: "message", message: { role: "user", content: "并发测试：缓存统一用本机 SQLite" } });
+const beforePar = countMemories(seed);
+await Promise.all([
+  tools.get("memory_add")!.execute(undefined, { content: "缓存统一用本机 SQLite" }, undefined, undefined, ctx),
+  tools.get("memory_add")!.execute(undefined, { content: "缓存统一用本机 SQLite" }, undefined, undefined, ctx),
+]);
+await new Promise((r) => setTimeout(r, 80));
+assert.equal(
+  countMemories(seed),
+  beforePar + 1,
+  `并发的两次 memory_add 只能落一行，实际多了 ${countMemories(seed) - beforePar} 行`,
+);
+
+// 一轮多句：memory_add 和 agent_end 必须用同一套拆句口径，否则两条路径存的内容对不上，
+// 整轮原话会和分句并存（实测一轮 5 行：2 行整轮 + 3 行分句）。
+const multiText = "多句测试：以后提交都按模块拆开。另外依赖统一用 pnpm 装。";
+branch.length = 0;
+branch.push({ type: "message", message: { role: "user", content: multiText } });
+const beforeMulti = countMemories(seed);
+await tools.get("memory_add")!.execute(undefined, { content: "模型重述，（不该被存）" }, undefined, undefined, ctx);
+await call("agent_end", { messages: [{ role: "user", content: multiText }] });
+await new Promise((r) => setTimeout(r, 120));
+assert.equal(
+  countMemories(seed),
+  beforeMulti + 2,
+  `两句就是两行，agent_end 不能再存一遍整轮原话，实际多了 ${countMemories(seed) - beforeMulti} 行`,
+);
+assert.equal(
+  (seed.db.prepare(`SELECT count(*) c FROM memories WHERE content = ?`).get(multiText) as { c: number }).c,
+  0,
+  "整轮原话（两句连在一起）不能作为一条记忆落库",
+);
+branch.length = 0;
+console.log("✓ 写入排队 + 拆句口径一致：并发不重复、整轮原话不落库");
+await runCommand("review");   // 上面几条排的队过完，不影响后面「队列不越攒越多」的断言
+
 // ------------------------------------------------------------ /memory ui：告诉用户去哪个地址
 notes.length = 0;
 await runCommand("ui");

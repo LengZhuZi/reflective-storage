@@ -78,6 +78,20 @@ const rec = await recallFlow("小车点表", { projectDb: o, globalDb: o, sessio
 assert.ok(!rec.candidates.some((c) => c.memory.id === stale.id), "归档的记忆不该再进候选");
 console.log("✓ 归档后不再被召回");
 
+// J10 的分数要**真的落盘**。以前只在跨状态线时才回写，没跨线的记忆 decay_score 永远
+// 停在 1.0（实测 200 天没访问的 fact 在库里还是 1.0），/memory ui 面板显示的就是假数据。
+const cooling = insertMemory(o, { content: "两周前定下的一个字段命名", type: "fact", scope: "project", scopeId: "P", importance: 0.6 });
+backdate(cooling.id, 14);
+runLifecycle(o, { now });
+const cooled = getMemory(o, cooling.id)!;
+assert.equal(cooled.state, "active", "14 天还不至于降温（COLD 线在 0.2 以下）");
+assert.ok(cooled.decayScore < 1, `没跨状态线的记忆也要回写衰减分，实际 ${cooled.decayScore}`);
+assert.ok(
+  Math.abs(cooled.decayScore - decayScore(cooled, now)) < 0.01,
+  `落盘的分数要和公式算出来的一致：${cooled.decayScore} vs ${decayScore(cooled, now)}`,
+);
+console.log("✓ J10：衰减分持续落盘，不只是跨状态线才写");
+
 // ------------------------------------------------------------ J13 复活
 const revived = resurrectFor(o, "小车点表的字段顺序还能改吗", { now });
 assert.equal(revived.resurrected, 1);

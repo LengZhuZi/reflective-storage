@@ -330,14 +330,17 @@ export default function reflectiveStorage(pi: ExtensionAPI): void {
     // 一上来就警告会在网络正常时天天误报。改成「引擎真的连不上时才提示一次」（见 warnProxy）。
     const hint = loaded.config.proxy ? proxyHint(loaded.config) : null;
     // 引擎配错了（openai 缺 baseUrl 之类）要当场说 —— 那个是配置错误，不是网络问题。
-    if (judge.problems.length && ctx.hasUI) {
-      ctx.ui.notify(`reflective-storage 判断引擎配置：\n${judge.problems.join("\n")}`, "warning");
+    // 顶层 problems 一起带上：配置文件不存在 / 权限不是 600 / JSON 解析失败，都在那里。
+    // 不带的话，权限不对时只会报「没有判断模型的 key」，让人去查 key —— 其实是文件没读。
+    const configProblems = [...loaded.problems, ...judge.problems];
+    if (configProblems.length && ctx.hasUI) {
+      ctx.ui.notify(`reflective-storage 判断引擎配置：\n${configProblems.join("\n")}`, "warning");
     }
 
     // 判断模型是硬要求（跟跑 Java 要 JDK 一样）：没有就**不启动**，把原因说清楚，
     // 所有 hook 直接返回 —— 不做「退化成规则引擎」那种降级档位。
     if (!judge.ready) {
-      const why = judge.problems.join("；") || "没有可用的判断模型";
+      const why = configProblems.join("；") || "没有可用的判断模型";
       projectDb.close();
       globalDb.close();
       rt = null;
@@ -672,19 +675,48 @@ export default function reflectiveStorage(pi: ExtensionAPI): void {
       const r = rt;
       if (!r) throw new Error("记忆库未打开（没有活动会话）");
       // 优先存用户自己的话（见 lastUserText 的说明）；拿不到当前用户消息时才用模型给的文本。
+      //
+      // 和 agent_end 用**同一套拆句**：两条路径存出来的内容必须一模一样，否则精确查重
+      // 对不上，一轮存两遍（实测：整轮原话一条 + 分句三条并存）。拆句口径一致后，
+      // agent_end 那条会直接命中查重并回 duplicate。
       const said = lastUserText(ctx.sessionManager.getBranch());
-      const texts = said ? [said] : [params.content];
-      const res = await writeFlow(r.projectDb, r.globalDb, r.adapter, r.session, {
-        userTexts: texts,
-        context: `memory_add 工具：模型判断这条值得记（${ctx.sessionManager.getSessionId() ?? "?"}）`,
+      const pieces = splitForWrite(said ? [said] : [params.content]);
+      if (pieces.length === 0) {
+        return { content: [{ type: "text", text: "没有写入（内容被本地预筛挡下：太短或只是确认）" }], details: { action: "noise" } };
+      }
+      // 必须**串行**：并发写同一条内容时，两边都会在对方落库前查重（实测存出两行完全一致）。
+      // 走和 agent_end 同一条 pending 队列，写就是排着队做的。
+      const task = r.pending.then(async () => {
+        const out: Array<{ action: string; id?: string; reason?: string }> = [];
+        for (const piece of pieces) {
+          const res = await writeFlow(r.projectDb, r.globalDb, r.adapter, r.session, {
+            userTexts: [piece],
+            context: `memory_add 工具：模型判断这条值得记（${ctx.sessionManager.getSessionId() ?? "?"}）`,
+          });
+          r.lastWrite = { action: res.action, reason: res.reason, at: Date.now() };
+          out.push({ action: res.action, id: res.memory?.id, reason: res.reason });
+        }
+        return out;
       });
-      r.lastWrite = { action: res.action, reason: res.reason, at: Date.now() };
-      const text = res.action === "stored"
-        ? `已记住 [${res.memory?.id}] (${res.memory?.type}/${res.memory?.scope})： ${(res.memory?.content ?? "").slice(0, 80)}`
-        : res.action === "duplicate"
-          ? `已经有这条了（${res.reason}），没有重复写入`
-          : `没有写入（${res.action}：${res.reason ?? "写入闸没放行"}）`;
-      return { content: [{ type: "text", text }], details: { action: res.action, id: res.memory?.id } };
+      // 队列本身不能因为这条出错而卡死：错误记下来，链子接到下一个 then。
+      r.pending = task.then(
+        () => undefined,
+        (e) => { r.error = errText(e); },
+      );
+      let out: Array<{ action: string; id?: string; reason?: string }>;
+      try {
+        out = await task;
+      } catch (e) {
+        throw new Error(`写入失败：${errText(e)}`);
+      }
+      const stored = out.filter((o) => o.action === "stored");
+      const dup = out.filter((o) => o.action === "duplicate");
+      const text = stored.length
+        ? `已记住 ${stored.map((o) => `[${o.id}]`).join(" ")}：${pieces.map((p) => p.slice(0, 60)).join(" ｜ ")}${dup.length ? `（另有 ${dup.length} 条已存在）` : ""}`
+        : dup.length
+          ? `已经有这几条了（${dup[0]?.reason ?? ""}），没有重复写入`
+          : `没有写入（${out[0]?.action ?? "skip"}：${out[0]?.reason ?? "写入闸没放行"}）`;
+      return { content: [{ type: "text", text }], details: { action: stored.length ? "stored" : out[0]?.action, id: stored[0]?.id, count: stored.length } };
     },
   });
 

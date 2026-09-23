@@ -130,6 +130,24 @@ export function parseLabel(text: string, count: number, maxChars: number): Label
 }
 
 /**
+ * 块**内部**的小标题：`**tobacco-datadistribution** — 数据入口。…`、`**用途**：…`、
+ * 或者一整行很短的编号行（`1. 定位` / `一、定位`）。
+ *
+ * 为什么需要它：`## 4. 模块职责` 这样的一节里常常并排放着四五个模块，每个一段、段首加粗。
+ * 只按标题切的话这一节就是一条 2400 字的巨记忆 —— 用户的原话是「起码应该把这四个拆开」。
+ * 加粗要**后面紧跟分隔符或行尾**才算标题：`**高** 1. 明文密钥` 那种行内加粗不算
+ * （否则「问题清单」会被拆成一行一条）。
+ */
+function subHeading(line: string): boolean {
+  const t = line.trim();
+  if (!t) return false;
+  if (/^\*\*[^*\n]{2,24}\*\*\s*(?:[—–\-:：]|$)/.test(t)) return true;
+  if (/^\d+[.、)]\s*\S{1,30}$/.test(t)) return true;
+  if (/^[一二三四五六七八九十]+[、.]\s*\S{1,30}$/.test(t)) return true;
+  return false;
+}
+
+/**
  * 程序侧的切分：markdown 标题 → 空行段落 → 句子边界。**零模型、零改写**，切出来的一定是逐字原文。
  *
  * 三步：
@@ -139,8 +157,11 @@ export function parseLabel(text: string, count: number, maxChars: number): Label
  * 最后块数超上限就把尾部合并（同样不丢字）。
  */
 export function splitSections(full: string, opts: { maxChars?: number; maxParts?: number } = {}): string[] {
-  const maxChars = opts.maxChars ?? 3000;
-  const maxParts = opts.maxParts ?? 6;
+  const maxChars = opts.maxChars ?? 1500;
+  // 块数上限给得高：块数直接决定记忆粒度，而「尾部合并」是最坏的兜底 —— 它专挑最详细的那几节
+  // 揉成一条（实测：6220 字的分析切出 13 块被并回 6 块，最后一条 3478 字，里面并排放着四个模块，
+  // 正是要拆开的东西）。每条一次 JEV 判断，成本按条算 —— 粒度优先。
+  const maxParts = opts.maxParts ?? 20;
   const text = full.trim();
   if (!text) return [];
   const HEAD = /^#{1,4}\s/;
@@ -170,8 +191,34 @@ export function splitSections(full: string, opts: { maxChars?: number; maxParts?
     }
     if (buf) blocks.push(buf);
   }
-  const out: string[] = [];
+  // 块内二次切分：一节里并排放着好几个「**名字** — 说明」时按它们切开。
+  const subbed: string[] = [];
   for (const b of blocks) {
+    const lines = b.split("\n");
+    const marks = lines.map((l, i) => (subHeading(l) ? i : -1)).filter((i) => i >= 0);
+    if (marks.length < 2 || b.length <= 400) {
+      subbed.push(b);
+      continue;
+    }
+    const pieces: string[] = [];
+    let start = 0;
+    for (const i of marks) {
+      if (i === 0) continue;
+      pieces.push(lines.slice(start, i).join("\n").trim());
+      start = i;
+    }
+    pieces.push(lines.slice(start).join("\n").trim());
+    // 切出来的碎片太小就并回上一片（保持「一小节一段话」的粒度）
+    const kept: string[] = [];
+    for (const p of pieces.filter(Boolean)) {
+      if (kept.length && p.length < 150) kept[kept.length - 1] = `${kept[kept.length - 1]}\n\n${p}`;
+      else kept.push(p);
+    }
+    subbed.push(...kept);
+  }
+
+  const out: string[] = [];
+  for (const b of subbed) {
     if (b.length <= maxChars) {
       out.push(b);
       continue;

@@ -206,7 +206,21 @@ const idle = fakeLabelRefiner([four.map(() => ({ summary: null, topic: null }))]
 const none = await labelAll(idle, four, { existingTopics: [], maxChars: 60 });
 assert.equal(none.items.filter((i) => i.summary).length, 0);
 assert.ok(!/补问/.test(none.reason), "全缺就不补问（同一批输入再问一遍也不会变）");
-console.log("✓ 切分：程序按结构切（H1/H2 / 空行 / 句子边界，不丢字），模型标注漏段会补问");
+// 一节里并排放着好几个「**名字** — 说明」时，要按它们切开（用户实测的痛点：
+// 「## 4. 模块职责」里四个模块被压成一条 2400 字的记忆）
+const mods = ["tobacco-datadistribution", "tobacco-calculation", "tobacco-hbaseinterface", "tobacco-visualsense"]
+  .map((m, i) => `**${m}** — 第 ${i + 1} 个模块的说明。${"细节细节细节。".repeat(30)}`);
+const dutyDoc = `## 4. 模块职责\n\n${mods.join("\n\n")}\n\n## 5. 数据管道\n\n${"管道说明。".repeat(40)}`;
+const duty = splitSections(dutyDoc).filter((b) => b.includes("**tobacco-"));
+assert.equal(duty.length, 4, "四个模块要拆成四条");
+assert.ok(duty.every((b) => b.length < 800), "每条都是单个模块，不再是四合一");
+// 行内加粗不算小标题（「问题清单」里一行一个问题，不能一行一条）
+const inline = `## 问题清单\n\n${Array.from({ length: 4 }, (_, i) => `**高** ${i + 1}. 这里是第 ${i + 1} 个问题的描述，写长一点。${"细节。".repeat(30)}`).join("\n")}`;
+assert.equal(splitSections(inline).length, 1, "行内加粗（后面跟正文）不算小节标题");
+// 块数上限给得高：详细的分析不该被尾部合并揉成一条
+const manySecs = Array.from({ length: 12 }, (_, i) => `## 第 ${i + 1} 节\n\n${"内容内容内容。".repeat(30)}`).join("\n\n");
+assert.equal(splitSections(manySecs).length, 12, "12 节就是 12 条（上限 20）");
+console.log("✓ 切分：结构切（H1–H4 / 小节内加粗标题 / 空行 / 句子边界，不丢字），模型标注漏段会补问");
 
 // 端点挂了 → fail-open（存原文），而且要留下原因// 端点挂了 → fail-open（存原文），而且要留下原因
 status = 500;

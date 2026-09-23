@@ -18,13 +18,14 @@ import * as http from "node:http";
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { spawn } from "node:child_process";
 import { CONFIG_PATH } from "../config.ts";
 import type { MemoryNode } from "../core/types.ts";
 import { cosine } from "../embed/encoder.ts";
 import {
   addTrace, countMemories, countPendingReviews, distinctTopics, getEmbedding, getMemory, hardDelete,
-  listRegistry, pendingReviews, projectDbFile, queryMemories, recentRecalls, resolveReview, setTopic,
-  tracesFor, type OpenedDb,
+  listRegistry, openDb, openGlobalDb, pendingReviews, projectDbFile, queryMemories, recentRecalls,
+  resolveReview, setTopic, tracesFor, type OpenedDb,
 } from "../storage/db.ts";
 import { RESOLUTION_LABELS, applyResolution, mergeMemories, SCOPE_WIDEN, widenScopeToGlobal } from "../pipeline/review.ts";
 import { loadConfig } from "../config.ts";
@@ -158,9 +159,11 @@ export interface UiHandles {
 }
 
 export interface UiDeps {
-  projectDb: OpenedDb;
-  globalDb: OpenedDb;
-  projectId: string;
+  /**
+   * 带 `scope=project` 的请求落到哪个项目（测试和单会话内嵌用）。省略 = 默认看全部项目。
+   * 注意这里收的是**项目 id**，不是连接 —— 面板自己按 id 开库，因为它不属于任何会话。
+   */
+  defaultProject?: string;
   /** 0 或省略 = 让系统挑空闲端口。 */
   port?: number;
 }
@@ -201,9 +204,9 @@ function maskedConfig(): Record<string, unknown> {
     /* 文件不存在或坏了：返回空对象，页面显示「未配置」 */
   }
   const out = JSON.parse(JSON.stringify(raw)) as Record<string, unknown>;
-  const tf = (out.typesafe ?? {}) as Record<string, unknown>;
-  const jd = (out.judge ?? {}) as Record<string, unknown>;
-  for (const block of [tf, jd]) {
+  // 每个可能存 key 的块都要盖住：面板只报「有没有、多长」，不回显明文。
+  for (const key of ["typesafe", "judge", "refine"]) {
+    const block = (out[key] ?? {}) as Record<string, unknown>;
     const k = block.apiKey;
     if (typeof k === "string" && k) {
       block.apiKey = "";
@@ -238,24 +241,50 @@ function writeConfigPatch(patch: Record<string, unknown>): Record<string, unknow
   return maskedConfig();
 }
 
-/** 图谱：节点 + 边。边来自四类依据：取代/冲突关系、同主题、同路径、高余弦。 */
-function buildGraph(projectDb: OpenedDb, globalDb: OpenedDb, scope: "project" | "global"): { nodes: unknown[]; links: unknown[] } {
-  const db = scope === "global" ? globalDb : projectDb;
-  const nodes = queryMemories(db, {
-    states: ["active", "cold"],
-    scope: scope === "global" ? "global" : undefined,
-    limit: GRAPH_NODE_LIMIT,
-  });
+/** 图谱：节点 + 边。边来自四类依据：取代/冲突关系、同主题、同路径、高余弦。
+ *
+ *  多库合并（`scope=all`）时按 id 去重（id 是 UUID，跨库唯一）。主题边和余弦边跨库也连 ——
+ *  同主题的两条记忆分别活在两个项目里，本来就是一回事，图谱不连反而是骗人。
+ */
+function buildGraph(sources: Array<{ db: OpenedDb; project: string | null }>, scope: "project" | "global" | "all"): { nodes: unknown[]; links: unknown[] } {
+  const cap = scope === "all" ? GRAPH_NODE_LIMIT * 2 : GRAPH_NODE_LIMIT;
+  const nodes: MemoryNode[] = [];
+  const owner = new Map<string, OpenedDb>();
+  const projectOf = new Map<string, string | null>();
+  for (const src of sources) {
+    const batch = queryMemories(src.db, {
+      states: ["active", "cold"],
+      scope: scope === "global" ? "global" : undefined,
+      limit: cap,
+    });
+    for (const m of batch) {
+      if (owner.has(m.id) || nodes.length >= cap) continue;
+      owner.set(m.id, src.db);
+      projectOf.set(m.id, src.project);
+      nodes.push(m);
+    }
+  }
   const ids = new Set(nodes.map((m) => m.id));
   const links: Array<{ source: string; target: string; kind: string }> = [];
+  const seenLink = new Set<string>();
   const push = (a: string, b: string, kind: string) => {
-    if (a !== b && ids.has(a) && ids.has(b)) links.push({ source: a, target: b, kind });
+    if (a === b || !ids.has(a) || !ids.has(b)) return;
+    const key = `${a < b ? `${a}|${b}` : `${b}|${a}`}|${kind}`;
+    if (seenLink.has(key)) return;
+    seenLink.add(key);
+    links.push({ source: a, target: b, kind });
   };
 
-  for (const r of db.db.prepare(`SELECT from_id, to_id, relation FROM memory_relations`).all() as Array<Record<string, unknown>>) {
-    push(String(r.from_id), String(r.to_id), String(r.relation));
+  const pathOf = new Map<string, string>();
+  for (const src of sources) {
+    for (const r of src.db.db.prepare(`SELECT from_id, to_id, relation FROM memory_relations`).all() as Array<Record<string, unknown>>) {
+      push(String(r.from_id), String(r.to_id), String(r.relation));
+    }
+    const paths = src.db.db.prepare(`SELECT memory_id, path FROM memory_tree_links WHERE tree_name='path'`).all() as Array<Record<string, unknown>>;
+    for (const p of paths) pathOf.set(String(p.memory_id), String(p.path));
   }
-  const byKey = (key: (m: MemoryNode) => string | null, kind: string, cap = 8) => {
+
+  const byKey = (key: (m: MemoryNode) => string | null, kind: string, capGroup = 8) => {
     const groups = new Map<string, string[]>();
     for (const m of nodes) {
       const k = key(m);
@@ -263,17 +292,14 @@ function buildGraph(projectDb: OpenedDb, globalDb: OpenedDb, scope: "project" | 
       groups.set(k, [...(groups.get(k) ?? []), m.id]);
     }
     for (const [, group] of groups) {
-      if (group.length < 2 || group.length > cap) continue;   // 太散的组连线会变成毛球
+      if (group.length < 2 || group.length > capGroup) continue;   // 太散的组连线会变成毛球
       for (let i = 1; i < group.length; i++) push(group[i - 1]!, group[i]!, kind);
     }
   };
   byKey((m) => m.topic, "topic");
-  const paths = db.db.prepare(`SELECT memory_id, path FROM memory_tree_links WHERE tree_name='path'`).all() as Array<Record<string, unknown>>;
-  const byMemory = new Map<string, string>();
-  for (const p of paths) byMemory.set(String(p.memory_id), String(p.path));
-  byKey((m) => byMemory.get(m.id) ?? null, "path");
+  byKey((m) => pathOf.get(m.id) ?? null, "path");
 
-  const vecs = nodes.map((m) => ({ m, v: getEmbedding(db, m.id) })).filter((x) => x.v);
+  const vecs = nodes.map((m) => ({ m, v: getEmbedding(owner.get(m.id)!, m.id) })).filter((x) => x.v);
   let similar = 0;
   for (let i = 0; i < vecs.length && similar < 40; i++) {
     for (let j = i + 1; j < vecs.length && similar < 40; j++) {
@@ -285,9 +311,13 @@ function buildGraph(projectDb: OpenedDb, globalDb: OpenedDb, scope: "project" | 
   }
   return {
     nodes: nodes.map((m) => ({
-      id: m.id, label: m.content.slice(0, 70), type: m.type, topic: m.topic, scope: m.scope,
+      id: m.id, label: (m.summary ?? m.content).slice(0, 70), type: m.type, topic: m.topic, scope: m.scope,
       state: m.state, importance: m.importance, access: m.accessCount,
-      path: byMemory.get(m.id) ?? null, created: m.createdAt,
+      path: pathOf.get(m.id) ?? null, created: m.createdAt,
+      // 来源和可信度也画出来：图谱是用户核对「哪些是模型自己说的」的地方（§8.5）。
+      origin: m.origin, trust: m.trust,
+      // 哪条属于哪个项目：合并视图下这就是唯一的归属线索。
+      project: projectOf.get(m.id) ?? null,
     })),
     links,
   };
@@ -295,7 +325,48 @@ function buildGraph(projectDb: OpenedDb, globalDb: OpenedDb, scope: "project" | 
 
 export function startUi(deps: UiDeps): Promise<UiHandles> {
   const sessions = new Map<string, { user: string; exp: number }>();
-  const dbFor = (scope: string): OpenedDb => (scope === "global" ? deps.globalDb : deps.projectDb);
+  const globalDb = openGlobalDb();
+  const projectDbs = new Map<string, OpenedDb>();
+
+  /** 按 id 开项目库（缓存）。id 是垃圾就给 null，不抛 —— 一个坏参数不该把服务打挂。 */
+  const openProject = (id: string): OpenedDb | null => {
+    if (!id || id === "global" || id === "all") return null;
+    const hit = projectDbs.get(id);
+    if (hit) return hit;
+    try {
+      const db = openDb(projectDbFile(id));
+      projectDbs.set(id, db);
+      return db;
+    } catch {
+      return null;
+    }
+  };
+  /** 项目库目录（ROOT/projects）。「所有项目」以磁盘上的库为准，不只看注册表。 */
+  const projectsDir = path.join(path.dirname(CONFIG_PATH), "projects");
+  /** 已知项目：注册表里的 + 本次已打开的 + 磁盘上真的存在的库。 */
+  const knownProjects = (): string[] => {
+    let onDisk: string[] = [];
+    try {
+      onDisk = fs.readdirSync(projectsDir).filter((f) => f.endsWith(".db")).map((f) => f.slice(0, -3));
+    } catch {
+      /* 目录还没建 */
+    }
+    return [...new Set([...listRegistry(globalDb).map((r) => r.projectId), ...projectDbs.keys(), ...onDisk])];
+  };
+  /** 所有项目库（合并视图用）。项目数量是人级的，不缓存开销问题。 */
+  const allDbs = (): Array<{ id: string; db: OpenedDb }> =>
+    knownProjects()
+      .map((id) => ({ id, db: openProject(id)! }))
+      .filter((x) => x.db);
+  /** 选择器要的列表：id + 目录 + 条数。 */
+  const projectList = (): Array<{ id: string; dir: string; count: number }> => {
+    const dirs = new Map(listRegistry(globalDb).map((r) => [r.projectId, r.dir]));
+    return allDbs().map((x) => ({ id: x.id, dir: dirs.get(x.id) ?? "", count: countMemories(x.db) }));
+  };
+  const dbFor = (scope: string): OpenedDb | null => (scope === "global" ? globalDb : openProject(scope));
+  /** 一个 id 到底在哪一库里（id 是 UUID，全局唯一）。合并视图下删除/详情靠它找家。 */
+  const dbOwning = (id: string): OpenedDb | null =>
+    getMemory(globalDb, id) ? globalDb : (allDbs().find((x) => getMemory(x.db, id))?.db ?? null);
 
   const cookieOf = (req: http.IncomingMessage): string | null => {
     const raw = req.headers.cookie ?? "";
@@ -321,13 +392,21 @@ export function startUi(deps: UiDeps): Promise<UiHandles> {
       try {
         const url = new URL(req.url ?? "/", "http://127.0.0.1");
         const path = url.pathname;
-        const scopeParam = url.searchParams.get("scope") === "global" ? "global" : "project";
-        const db = dbFor(scopeParam);
+        // scope: `all`（默认，所有项目合并）/ `global` / 项目 id。`project` 是内嵌会话用的别名。
+        const rawScope = url.searchParams.get("scope") ?? "project";
+        const scope = rawScope === "project" ? (deps.defaultProject ?? "all") : rawScope;
+        const isAll = scope === "all";
+        const db = dbFor(scope) ?? globalDb;
         const wantsHtml = (req.headers.accept ?? "").includes("text/html");
         const back = (res2: http.ServerResponse, dest: string, error = "") => {
           res2.writeHead(303, { location: error ? `${dest}?e=${encodeURIComponent(error)}` : dest });
           res2.end();
         };
+
+        // 探活：不要求登录（其他会话靠它发现这个面板在跑），但只吐身份，不吐内容。
+        if (path === "/api/health") {
+          return json(res, 200, { ok: true, service: UI_SERVICE, version: uiVersion(), pid: process.pid, projects: knownProjects().length });
+        }
 
         // 首次设置 / 登录
         if (!readAuth()) {
@@ -410,9 +489,16 @@ export function startUi(deps: UiDeps): Promise<UiHandles> {
 
         if (req.method === "GET" && path === "/api/overview") {
           const cfg = loadConfig();
-          const rows = db.db.prepare(`SELECT type, scope, state FROM memories`).all() as Array<Record<string, unknown>>;
-          const dupes = (await jsonDupes("project")).length;
-          const recalls = recentRecalls(db, 8).map((r) => {
+          // 一个项目库都还没有（新装机 / 刚清空）时 sources 是空的：
+          // 聚合回落到全局库，页面照常打开 —— 「刚清空所以 500」是最没道理的 500。
+          const sources = isAll ? allDbs().map((x) => x.db) : [db];
+          const list = sources.length ? sources : [globalDb];
+          const rows = list.flatMap(
+            (d) => d.db.prepare(`SELECT type, scope, state, origin, trust, topic FROM memories`).all() as Array<Record<string, unknown>>,
+          );
+          const primary = list[0]!;
+          const dupes = isAll ? 0 : (await jsonDupes(primary, scopeFilter(scope))).length;
+          const recalls = recentRecalls(primary, 8).map((r) => {
             const injected = (JSON.parse(String(r.injected_ids ?? "[]")) as string[]).length;
             const cited = (JSON.parse(String(r.cited_ids ?? "[]")) as string[]).length;
             return { query: String(r.query).slice(0, 80), recalled: (JSON.parse(String(r.recalled_ids ?? "[]")) as string[]).length, injected, cited, effect: r.effect_score == null ? null : Number(r.effect_score), at: Number(r.created_at) };
@@ -420,41 +506,65 @@ export function startUi(deps: UiDeps): Promise<UiHandles> {
           const withInject = recalls.filter((r) => r.injected > 0);
           const injectedTotal = withInject.reduce((n, r) => n + r.injected, 0);
           const citedTotal = withInject.reduce((n, r) => n + r.cited, 0);
+          const topics = [...new Set(list.flatMap((d) => distinctTopics(d, 40)))];
           return json(res, 200, {
+            scope,
+            isAll,
             project: {
-              file: deps.projectDb.file, count: countMemories(deps.projectDb),
+              file: isAll ? `${sources.length} 个项目库` : primary.file,
+              count: list.reduce((n, d) => n + countMemories(d), 0),
               byType: tally(rows, "type"), byState: tally(rows, "state"), byScope: tally(rows, "scope"),
-              topics: distinctTopics(deps.projectDb, 40),
-              paths: Number((deps.projectDb.db.prepare(`SELECT count(DISTINCT path) c FROM memory_tree_links WHERE tree_name='path'`).get() as { c: number }).c),
+              // 来源权重（§8.5）：多少条是用户原话、多少条是模型自己写的、其中多少条还没被确认。
+              byOrigin: tally(rows, "origin"),
+              unconfirmed: rows.filter((r) => Number(r.trust ?? 1) < 0.8).length,
+              // 主题带条数：只给名字看不出分布，而分布才是「这个项目记住了什么」的答案。
+              topicCounts: Object.entries(tally(rows, "topic"))
+                .filter(([t]) => t && t !== "?" && t !== "null")
+                .sort((a, b) => b[1] - a[1])
+                .slice(0, 12)
+                .map(([topic, n]) => ({ topic, n })),
+              topics,
+              paths: list.reduce(
+                (n, d) => n + Number((d.db.prepare(`SELECT count(DISTINCT path) c FROM memory_tree_links WHERE tree_name='path'`).get() as { c: number }).c),
+                0,
+              ),
             },
-            global: { file: deps.globalDb.file, count: countMemories(deps.globalDb) },
-            pending: countPendingReviews(deps.projectDb),
+            global: { file: globalDb.file, count: countMemories(globalDb) },
+            pending: list.reduce((n, d) => n + countPendingReviews(d), 0),
             dupes, dupeCosine: DUPE_COSINE,
             hitRate: injectedTotal ? citedTotal / injectedTotal : null,
             injectedTotal, citedTotal,
             engine: cfg.judge,
-            topics: distinctTopics(deps.projectDb, 20),
-            registry: listRegistry(deps.globalDb),
+            topics: topics.slice(0, 20),
+            registry: listRegistry(globalDb),
+            projects: projectList(),
             recalls,
-            traces: (deps.projectDb.db
+            traces: (primary.db
               .prepare(`SELECT stage, gate, action, reason, status, user_visible FROM reflection_traces ORDER BY created_at DESC, rowid DESC LIMIT 10`)
               .all() as Array<Record<string, unknown>>)
               .map((t) => ({ stage: String(t.stage), gate: String(t.gate), action: String(t.action), reason: t.reason ?? "", status: t.status ?? "", userVisible: t.user_visible ?? "" })),
           });
         }
 
-        if (req.method === "GET" && path === "/api/graph") return json(res, 200, buildGraph(deps.projectDb, deps.globalDb, scopeParam));
+        if (req.method === "GET" && path === "/api/graph") {
+          // 合并视图把全局库也算进来：全局记忆是所有项目共用的，「全部」少它就不叫全部。
+          const sources = isAll
+            ? [{ db: globalDb, project: null }, ...allDbs().map((x) => ({ db: x.db, project: x.id }))]
+            : [{ db, project: scope === "global" ? null : scope }];
+          return json(res, 200, buildGraph(sources, isAll ? "all" : scope === "global" ? "global" : "project"));
+        }
 
         if (req.method === "GET" && path === "/api/memory-detail") {
           const id = url.searchParams.get("id") ?? "";
-          const m = getMemory(db, id);
-          if (!m) return json(res, 404, { error: "没有这条记忆" });
-          const rows = db.db.prepare(`SELECT path FROM memory_tree_links WHERE memory_id = ?`).all(id) as Array<Record<string, unknown>>;
+          const home = isAll ? dbOwning(id) : db;
+          const m = home ? getMemory(home, id) : null;
+          if (!m || !home) return json(res, 404, { error: "没有这条记忆" });
+          const rows = home.db.prepare(`SELECT path FROM memory_tree_links WHERE memory_id = ?`).all(id) as Array<Record<string, unknown>>;
           return json(res, 200, {
             memory: m,
             topic: m.topic,
             paths: rows.map((r) => String(r.path)),
-            traces: tracesFor(db, id).map((t) => ({
+            traces: tracesFor(home, id).map((t) => ({
               gate: String(t.gate), action: String(t.action), reason: t.reason ?? "",
               status: t.status ?? "", userVisible: t.user_visible ?? "",
             })),
@@ -470,30 +580,40 @@ export function startUi(deps: UiDeps): Promise<UiHandles> {
         if (req.method === "GET" && path === "/api/memories") {
           const st = url.searchParams.get("state");
           const topic = url.searchParams.get("topic");
-          const items = queryMemories(db, {
-            states: st ? [st as MemoryNode["state"]] : undefined,
-            scope: scopeParam === "global" ? "global" : undefined,
-            topic: topic || undefined,
-          });
-          return json(res, 200, {
-            items,
-            topics: distinctTopics(db, 40),
-            pending: pendingReviews(deps.projectDb, 20).map((r) => ({
+          const states = st ? [st as MemoryNode["state"]] : undefined;
+          const opts = { states, topic: topic || undefined };
+          const items = isAll
+            ? [
+                ...queryMemories(globalDb, { ...opts, scope: "global" }).map((m) => ({ ...m, project: null })),
+                ...allDbs().flatMap((x) => queryMemories(x.db, opts).map((m) => ({ ...m, project: x.id }))),
+              ]
+            : queryMemories(db, { ...opts, scope: scope === "global" ? "global" : undefined });
+          const pending = (isAll ? allDbs().map((x) => ({ id: x.id, db: x.db })) : [{ id: scope, db }]).flatMap((x) =>
+            pendingReviews(x.db, 20).map((r) => ({
               id: String(r.id), kind: String(r.kind), question: String(r.question), options: String(r.options),
-              memoryId: String(r.memory_id), otherId: r.other_id == null ? null : String(r.other_id),
+              memoryId: String(r.memory_id), otherId: r.other_id == null ? null : String(r.other_id), project: x.id,
             })),
-          });
+          );
+          return json(res, 200, { items, topics: [...new Set((isAll ? allDbs().map((x) => x.db) : [db]).flatMap((d) => distinctTopics(d, 40)))], pending });
         }
 
         if (req.method === "GET" && path === "/api/dupes") {
-          const items = (await jsonDupes(scopeParam)).slice(0, 50);
+          const sources = isAll
+            ? [
+                { db: globalDb, filter: "global" as const },
+                ...allDbs().map((x) => ({ db: x.db, filter: null })),
+              ]
+            : [{ db, filter: scopeFilter(scope) }];
+          const items = (await Promise.all(sources.map((s) => jsonDupes(s.db, s.filter)))).flat().sort((x, y) => y.sim - x.sim).slice(0, 50);
           return json(res, 200, { items, threshold: DUPE_COSINE });
         }
 
         if (req.method === "GET" && path === "/api/traces") {
           const id = url.searchParams.get("id") ?? "";
+          const home = isAll ? dbOwning(id) : db;
+          if (!home) return json(res, 200, { items: [] });
           return json(res, 200, {
-            items: tracesFor(db, id).map((r) => ({
+            items: tracesFor(home, id).map((r) => ({
               gate: String(r.gate), action: String(r.action), reason: r.reason ?? null,
               status: r.status ?? null, userVisible: r.user_visible ?? null, judgment: r.judgment ?? null,
             })),
@@ -502,40 +622,46 @@ export function startUi(deps: UiDeps): Promise<UiHandles> {
 
         if (req.method === "DELETE" && path.startsWith("/api/memory/")) {
           const id = decodeURIComponent(path.slice("/api/memory/".length));
-          if (!getMemory(db, id)) return json(res, 404, { error: "没有这条记忆" });
-          addTrace(db, { memoryId: id, stage: "governance", gate: "J12", action: "delete", reason: "本地 UI 手动删除" });
-          hardDelete(db, id);
+          const home = isAll ? dbOwning(id) : db;
+          if (!home || !getMemory(home, id)) return json(res, 404, { error: "没有这条记忆" });
+          addTrace(home, { memoryId: id, stage: "governance", gate: "J12", action: "delete", reason: "本地 UI 手动删除" });
+          hardDelete(home, id);
           return json(res, 200, { ok: true });
         }
 
         if (req.method === "POST" && path === "/api/merge") {
           const body = JSON.parse((await readBody(req)) || "{}") as { keep?: string; drop?: string };
           if (!body.keep || !body.drop) return json(res, 400, { error: "缺少 keep / drop" });
-          return json(res, 200, { ok: true, result: mergeMemories(deps.projectDb, body.keep, body.drop, "本地 UI 手动合并") });
+          // 合并要改库：合并视图下按 keep id 找家（id 全局唯一，找得到就说明是同一库里的两条）。
+          const home = isAll ? dbOwning(body.keep) : db;
+          if (!home) return json(res, 404, { error: "找不到这条记忆" });
+          return json(res, 200, { ok: true, result: mergeMemories(home, body.keep, body.drop, "本地 UI 手动合并") });
         }
 
         if (req.method === "POST" && path.startsWith("/api/review/")) {
           const id = decodeURIComponent(path.slice("/api/review/".length));
           const body = JSON.parse((await readBody(req)) || "{}") as { resolution?: string };
-          const item = pendingReviews(deps.projectDb, 100).find((r) => String(r.id) === id);
+          const home = isAll ? allDbs().find((x) => pendingReviews(x.db, 100).some((r) => String(r.id) === id)) : { id: scope, db };
+          if (!home) return json(res, 404, { error: "这条待确认已经不在了" });
+          const item = pendingReviews(home.db, 100).find((r) => String(r.id) === id);
           if (!item) return json(res, 404, { error: "这条待确认已经不在了" });
           const kind = String(item.kind);
           const resolution = body.resolution ?? "";
 
           if (kind === "topic") {
             if (resolution && resolution !== "先不起主题") {
-              const target = getMemory(deps.projectDb, String(item.memory_id)) ?? getMemory(deps.globalDb, String(item.memory_id));
-              if (target) setTopic(target.scope === "global" ? deps.globalDb : deps.projectDb, String(item.memory_id), resolution);
+              const target = getMemory(home.db, String(item.memory_id)) ?? getMemory(globalDb, String(item.memory_id));
+              if (target) setTopic(target.scope === "global" ? globalDb : home.db, String(item.memory_id), resolution);
             }
-            resolveReview(deps.projectDb, id, resolution ? `topic:${resolution}` : "topic:skipped");
+            resolveReview(home.db, id, resolution ? `topic:${resolution}` : "topic:skipped");
             return json(res, 200, { ok: true, resolution });
           }
           if (kind === "scope") {
-            resolveReview(deps.projectDb, id, resolution === SCOPE_WIDEN ? "scope:widen" : "scope:keep");
-            return json(res, 200, { ok: true, result: resolution === SCOPE_WIDEN ? widenScopeToGlobal(deps.projectDb, deps.globalDb, String(item.memory_id)) : "保持项目级" });
+            resolveReview(home.db, id, resolution === SCOPE_WIDEN ? "scope:widen" : "scope:keep");
+            return json(res, 200, { ok: true, result: resolution === SCOPE_WIDEN ? widenScopeToGlobal(home.db, globalDb, String(item.memory_id)) : "保持项目级" });
           }
           const label = Object.entries(RESOLUTION_LABELS).find(([, l]) => l === resolution)?.[0] ?? "keep_both";
-          return json(res, 200, { ok: true, result: applyResolution(deps.projectDb, item, label as never) });
+          return json(res, 200, { ok: true, result: applyResolution(home.db, item, label as never) });
         }
 
         return json(res, 404, { error: "not found" });
@@ -545,10 +671,9 @@ export function startUi(deps: UiDeps): Promise<UiHandles> {
     })();
   });
 
-  /** 近义堆：余弦 ≥ 阈值的两两组合。 */
-  const jsonDupes = async (scope: string): Promise<Array<{ a: string; b: string; sim: number; aText: string; bText: string }>> => {
-    const d = dbFor(scope);
-    const items = queryMemories(d, { scope: scope === "global" ? "global" : undefined, limit: 300 })
+  /** 近义堆：余弦 ≥ 阈值的两两组合。同库里才算 —— 跨库两条相似不一定是重复（见 DESIGN §J11）。 */
+  const jsonDupes = async (d: OpenedDb, scopeFilter: "global" | null): Promise<Array<{ a: string; b: string; sim: number; aText: string; bText: string }>> => {
+    const items = queryMemories(d, { scope: scopeFilter ?? undefined, limit: 300 })
       .filter((m) => m.state === "active" || m.state === "cold");
     const vecs = items.map((m) => ({ m, v: getEmbedding(d, m.id) })).filter((x) => x.v);
     const pairs: Array<{ a: string; b: string; sim: number; aText: string; bText: string }> = [];
@@ -572,3 +697,125 @@ export function startUi(deps: UiDeps): Promise<UiHandles> {
 }
 
 export { projectDbFile };
+
+/* ---------------------------------------------------------------- 常驻面板
+ *
+ * 面板不再属于某个会话：会话退了它还在，所以别的会话进来看到的是同一个页面、同一份数据。
+ * 「已经在跑」靠 `ui.json` + `/api/health` 认 service 字段，不靠端口能不能连 ——
+ * 端口上坐着别的进程时，猜错的代价是给用户一个别人的页面。
+ */
+export const UI_SERVICE = "reflective-storage-ui";
+export const UI_MARKER = path.join(path.dirname(CONFIG_PATH), "ui.json");
+
+function uiVersion(): string {
+  try {
+    const pkg = JSON.parse(fs.readFileSync(new URL("../../package.json", import.meta.url), "utf8")) as { version?: string };
+    return pkg.version ?? "0";
+  } catch {
+    return "0";
+  }
+}
+
+/** 记下实际端口和 pid：端口 0（系统挑）时这是唯一的发现方式。 */
+export function writeUiMarker(port: number): void {
+  fs.mkdirSync(path.dirname(UI_MARKER), { recursive: true });
+  fs.writeFileSync(UI_MARKER, `${JSON.stringify({ port, pid: process.pid, version: uiVersion() }, null, 2)}\n`, { mode: 0o600 });
+}
+
+export function readUiMarker(): { port: number; pid: number; version: string } | null {
+  try {
+    const m = JSON.parse(fs.readFileSync(UI_MARKER, "utf8")) as { port?: number; pid?: number; version?: string };
+    return typeof m.port === "number" && m.port > 0 ? { port: m.port, pid: Number(m.pid ?? 0), version: String(m.version ?? "") } : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 探活。只认自己的面板（service 对得上），别人的服务占着端口不算。
+ *
+ * 用 node:http 而不是 fetch：配了代理的环境里（`http_proxy` + `NODE_USE_ENV_PROXY`）
+ * fetch 会把 127.0.0.1 的请求也发给代理，探活于是永远失败。http.get 直连，不受代理影响。
+ */
+export function probeUi(port: number, timeoutMs = 1200): Promise<boolean> {
+  return new Promise((resolve) => {
+    const req = http.get({ host: "127.0.0.1", port, path: "/api/health", timeout: timeoutMs }, (res) => {
+      if (res.statusCode !== 200) {
+        res.resume();
+        return resolve(false);
+      }
+      let body = "";
+      res.setEncoding("utf8");
+      res.on("data", (c: string) => (body += c));
+      res.on("end", () => {
+        try {
+          resolve((JSON.parse(body) as { service?: string }).service === UI_SERVICE);
+        } catch {
+          resolve(false);
+        }
+      });
+    });
+    req.on("timeout", () => {
+      req.destroy();
+      resolve(false);
+    });
+    req.on("error", () => resolve(false));
+  });
+}
+
+export interface UiStatus {
+  url: string;
+  /** true = 这次刚拉起来（第一次 `/memory ui`），false = 复用已经在跑的那个。 */
+  started: boolean;
+  pid: number;
+}
+
+/** 有就跑着，没有就 detached 起一个。起了就不归这个会话管了（会话退了它还在）。 */
+export async function ensureUi(opts: { port?: number } = {}): Promise<UiStatus> {
+  const alive = readUiMarker();
+  if (alive && (await probeUi(alive.port))) {
+    return { url: `http://127.0.0.1:${alive.port}/`, started: false, pid: alive.pid };
+  }
+  if (alive) fs.rmSync(UI_MARKER, { force: true });      // 标记还在、进程没了
+
+  const script = path.resolve(path.dirname(new URL(import.meta.url).pathname), "../../scripts/ui-server.ts");
+  // 子进程的输出落到 ui.log：detached 进程起不来时，没有日志就只能猜（用户也能看）。
+  let out: number | "ignore" = "ignore";
+  try {
+    const logFile = path.join(path.dirname(CONFIG_PATH), "ui.log");
+    fs.mkdirSync(path.dirname(logFile), { recursive: true });
+    out = fs.openSync(logFile, "a");
+  } catch {
+    /* 打不开就还是扔掉 */
+  }
+  const child = spawn(process.execPath, [script, String(opts.port ?? 0)], { detached: true, stdio: ["ignore", out, out] });
+  child.unref();
+  if (typeof out === "number") fs.closeSync(out);
+  // 起来要几十毫秒。轮询等它写标记，比固定 sleep 靠谱（慢了会误判成失败）。
+  for (let i = 0; i < 50; i++) {
+    await new Promise((r) => setTimeout(r, 100));
+    const m = readUiMarker();
+    if (m && m.pid === child.pid && (await probeUi(m.port, 500))) {
+      return { url: `http://127.0.0.1:${m.port}/`, started: true, pid: m.pid };
+    }
+  }
+  throw new Error("面板进程没起来（手动跑一次：node scripts/ui-server.ts，看它报什么）");
+}
+
+/** 停掉常驻面板。端口被别的东西占了也该能用这个收拾干净。 */
+export async function stopUi(): Promise<boolean> {
+  const m = readUiMarker();
+  if (!m?.pid) return false;
+  try {
+    process.kill(m.pid, "SIGTERM");
+  } catch {
+    /* 已经不在了 */
+  }
+  fs.rmSync(UI_MARKER, { force: true });
+  return true;
+}
+
+/** 近义堆和全局过滤的 scope 口径：除了 global 库，其他都是「本库全部」。 */
+function scopeFilter(scope: string): "global" | null {
+  return scope === "global" ? "global" : null;
+}

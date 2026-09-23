@@ -1,8 +1,12 @@
 # 面板（ui/）
 
-`/memory ui` 打开的本机网页面板。Vite + Preact + TypeScript，**零运行时依赖**：
+`/memory ui` 打开的本机网页面板。Vite + Preact + TypeScript + `Cytoscape.js`/`fcose`
+（图谱渲染与布局，只在这里用，而且是动态 import 的独立 chunk），**零运行时依赖**：
 构建产物 `ui/dist/` 提交进仓库，由 `src/ui/server.ts` 当静态目录发出去 —— 使用者
 不需要 npm install 就能用面板。
+
+面板是**常驻进程**（`/memory ui` 第一次拉起来，端口和 pid 写在 `ROOT/ui.json`），不属于任何会话；
+默认看**所有项目**（合并图谱），可切单个项目 / 全局库，可隐藏不看的项目。
 
 视觉规范在 [DESIGN.md](./DESIGN.md)，改样式前先读它（色值、字号、间距、圆角都只在那里定义一次）。
 
@@ -12,11 +16,12 @@
 cd ui
 npm install
 npm run dev        # http://127.0.0.1:5173，Vite 直接代理不到后端
+node ../scripts/ui-server.ts 4319   # 另开一个终端：起真数据的常驻面板
 ```
 
-`npm run dev` 只热更新前端；要连着真数据看，用下面这条：随便起一个 pi 会话（`/memory ui`），
-把面板地址记下来，然后在 dev server 里调 API 时指向它 —— 面板的 `/api/*` 请求是相对路径，
-所以更省事的办法是直接 `npm run build`，刷新 `127.0.0.1:<port>`。
+`npm run dev` 只热更新前端；要连着真数据看，另开终端跑 `scripts/ui-server.ts`，然后让 Vite 的
+dev 页把 `/api/*` 代理到那个端口（`vite.config.ts` 里的 `server.proxy`）—— 面板的 `/api/*`
+是相对路径，所以更省事的办法是直接 `npm run build`，刷新 `127.0.0.1:4319`。
 
 ## 构建（改完必须跑）
 

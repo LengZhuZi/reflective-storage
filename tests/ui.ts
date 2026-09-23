@@ -19,21 +19,26 @@ const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "reflect-ui-"));
 process.env.REFLECTIVE_HOME = tmp;
 
 import * as fss from "node:fs";
-const { openDb, insertMemory, getMemory, countMemories, pendingReviews, enqueueReview } = await import("../src/storage/db.ts");
+const { openDb, insertMemory, getMemory, countMemories, pendingReviews, enqueueReview, refreshRegistry } = await import("../src/storage/db.ts");
 void fss;
 const { startUi } = await import("../src/ui/server.ts");
-const { queueTopicNaming } = await import("../src/pipeline/review.ts");
 
-const project = openDb(path.join(tmp, "proj.db"));
+// 面板自己按项目 id 开库（projectDbFile），所以测试库也得放在它找得到的位置。
+const project = openDb(path.join(tmp, "projects", "P.db"));
 const global = openDb(path.join(tmp, "global.db"));
+const other = openDb(path.join(tmp, "projects", "Q.db"));
 
 const attack = insertMemory(project, { content: '正常内容 <img src=x onerror="alert(1)"> 后面还有', type: "fact", scope: "project", scopeId: "P", topic: "安全" });
 insertMemory(project, { content: "认证走 OIDC", type: "fact", scope: "project", scopeId: "P" });
 insertMemory(global, { content: "用户喜欢简洁回答", type: "preference", scope: "global", scopeId: null });
 insertMemory(project, { content: "上一轮的临时状态", type: "event", scope: "session", scopeId: "s-old" });
 enqueueReview(project, { kind: "merge", memoryId: attack.id, otherId: attack.id, question: "要合并吗", options: ["保留两条（并存）", "用新的取代旧的"] });
+// 另一个项目：合并视图（scope=all）下要和上面那个库一起出现，主题相同的还要连上边。
+const foreign = insertMemory(other, { content: "另一个项目的安全约束", type: "fact", scope: "project", scopeId: "Q", topic: "安全" });
+refreshRegistry(global, project, "P", path.join(tmp, "P"));
+refreshRegistry(global, other, "Q", path.join(tmp, "Q"));
 
-const ui = await startUi({ projectDb: project, globalDb: global, projectId: "P" });
+const ui = await startUi({ defaultProject: "P" });
 const base = ui.url;
 const authFile = path.join(tmp, "ui-auth.json");
 const readAuthFile = () => { try { return JSON.parse(fs.readFileSync(authFile, "utf8")) as Record<string, unknown>; } catch { return null; } };
@@ -158,6 +163,19 @@ fs.chmodSync(path.join(tmp, "config.json"), 0o600);
 const masked = await (await get("/api/config")).json() as { raw: Record<string, any> };
 assert.equal(masked.raw.typesafe.apiKey, "", "key 抹成空串");
 assert.equal(masked.raw.typesafe.apiKeySet, 16, "只报长度");
+// 提炼后端的 key 也一样（多一个存 key 的字段就多一个泄露面）
+fs.writeFileSync(
+  path.join(tmp, "config.json"),
+  JSON.stringify({ typesafe: { apiKey: "sk-abcdefgh12345", model: "jev-latest" }, refine: { provider: "hunyuan", apiKey: "sk-refine-key-98765" } }),
+  { mode: 0o600 },
+);
+fs.chmodSync(path.join(tmp, "config.json"), 0o600);
+const masked2 = await (await get("/api/config")).json() as { raw: Record<string, any> };
+assert.equal(masked2.raw.refine.apiKey, "", "提炼的 key 也要抹掉");
+assert.equal(masked2.raw.refine.apiKeySet, "sk-refine-key-98765".length, "提炼的 key 也只报长度");
+assert.ok(!JSON.stringify(masked2).includes("sk-refine-key"), "整个响应里不许出现提炼 key");
+fs.writeFileSync(path.join(tmp, "config.json"), JSON.stringify({ typesafe: { apiKey: "sk-abcdefgh12345", model: "jev-latest" } }), { mode: 0o600 });
+fs.chmodSync(path.join(tmp, "config.json"), 0o600);
 const saved = await (await post("/api/config", { inject: { maxPerSession: 2 }, typesafe: { apiKey: "sk-new-key-123456" } })).json() as { raw: Record<string, any> };
 assert.equal(saved.raw.typesafe.apiKey, "", "保存的响应也不回 key");
 const onDisk = JSON.parse(fs.readFileSync(path.join(tmp, "config.json"), "utf8")) as Record<string, any>;
@@ -179,8 +197,9 @@ const resolved = await (await post(`/api/review/${pending[0].id}`, { resolution:
 assert.equal(resolved.ok, true);
 assert.equal(pendingReviews(project, 5).length, 0, "复核完就出队列");
 
-// 起个主题（文本框那条路）
-queueTopicNaming(project, insertMemory(project, { content: "灰度比例按 5% 起步", type: "procedure", scope: "project", scopeId: "P", importance: 0.9 }), []);
+// 起个主题（文本框那条路）。主题现在由模型直接落库，不再产生队列项，但**旧库里的历史主题条目**
+// 还得能解 —— 这里就模拟一条历史遗留的 topic 项。
+enqueueReview(project, { kind: "topic", memoryId: insertMemory(project, { content: "灰度比例按 5% 起步", type: "procedure", scope: "project", scopeId: "P", importance: 0.9 }).id, otherId: null, question: "要不要给这条记忆起个主题？", options: ["先不起主题"] });
 const topicItem = pendingReviews(project, 5)[0];
 await post(`/api/review/${String(topicItem.id)}`, { resolution: "发布流程" });
 const named = project.db.prepare(`SELECT topic FROM memories WHERE id = ?`).get(String(topicItem.memory_id)) as Record<string, unknown>;
@@ -212,6 +231,35 @@ assert.match(getM(project, twinA.id)!.metadata ?? "", /mergedFrom/, "旧原文�
 assert.match(getM(project, twinA.id)!.metadata ?? "", /不要用 log4j2 这个库/, "存的是 B 的原文");
 console.log("✓ 近义堆能列出来，一键合并保留了旧原文（可查可回滚）");
 
+// ------------------------------------------------------------ 跨项目合并视图
+// 常驻面板要看所有项目：scope=all 把每个项目库 + 全局库合起来（id 是 UUID，跨库唯一）。
+const health = await (await fetch(origin + "/api/health")).json() as { service: string; projects: number };
+assert.equal(health.service, "reflective-storage-ui", "探活必须能认出是自己（别的进程占着端口不算）");
+const allList = await (await get("/api/memories?scope=all")).json() as { items: Array<{ id: string; project?: string }> };
+assert.ok(allList.items.some((m) => m.scope === "global"), "合并视图要含全局库（所有项目共用的那部分）");
+assert.ok(allList.items.some((m) => m.id === attack.id), "要包含默认项目的记忆");
+assert.ok(allList.items.some((m) => m.id === foreign.id && m.project === "Q"), "也要包含另一个项目的记忆");
+const allGraph = await (await get("/api/graph?scope=all")).json() as { nodes: Array<{ id: string; project: string | null }>; links: Array<{ source: string; target: string; kind: string }> };
+assert.ok(allGraph.nodes.some((n) => n.project === "P") && allGraph.nodes.some((n) => n.project === "Q"), "图谱要同时含两个项目的节点");
+assert.ok(
+  allGraph.links.some((l) => (l.source === attack.id && l.target === foreign.id) || (l.source === foreign.id && l.target === attack.id)),
+  "同主题的两条跨项目也要连上边（不然「一个图谱看全部」就只是拼图）",
+);
+const allOv = await (await get("/api/overview?scope=all")).json() as { isAll: boolean; project: { count: number }; registry: Array<{ projectId: string }> };
+assert.equal(allOv.isAll, true);
+assert.ok(allOv.project.count >= 4, `合并概览的条数要是各库之和，实际 ${allOv.project.count}`);
+assert.deepEqual(allOv.registry.map((r) => r.projectId).sort(), ["P", "Q"], "项目选择器的数据源是注册表");
+// 刚建好的项目库还没登记进注册表（第一次在某个目录开 pi 之前就是这样）：
+// 选择器和合并视图要以磁盘上的库为准，不然「全部项目」会漏掉它。
+const fresh = openDb(path.join(tmp, "projects", "R.db"));
+insertMemory(fresh, { content: "一个还没登记过的新项目", type: "fact", scope: "project", scopeId: "R" });
+const afterFresh = await (await get("/api/overview?scope=all")).json() as { projects: Array<{ id: string; count: number }> };
+assert.ok(afterFresh.projects.some((p) => p.id === "R" && p.count === 1), "磁盘上存在、注册表里还没登记的项目也要算进去");
+fresh.close();// 合并视图下删除：id 自己会说话，不用再带 scope
+assert.equal((await del(`/api/memory/${foreign.id}?scope=all`)).status, 200, "合并视图下也能删（按 id 找家）");
+assert.equal(getMemory(other, foreign.id), null);
+console.log("✓ 跨项目合并视图：一次看全部 + 跨项目主题边 + 按 id 定位到库");
+
 // ------------------------------------------------------------ 删除（不可逆，要留痕）
 const before = countMemories(project);
 assert.equal((await del(`/api/memory/${attack.id}?scope=project`)).status, 200);
@@ -229,5 +277,6 @@ console.log("✓ 删除走对库、留痕、找不到就 404");
 ui.close();
 project.close();
 global.close();
+other.close();
 fs.rmSync(tmp, { recursive: true, force: true });
 console.log("\n全部通过");

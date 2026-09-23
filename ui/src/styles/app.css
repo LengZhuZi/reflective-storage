@@ -557,6 +557,7 @@ table.grid {
 }
 table.grid th {
   text-align: left;
+  white-space: nowrap;
   font-size: 11.5px;
   font-weight: 500;
   color: var(--fg-faint);
@@ -587,6 +588,11 @@ table.grid tbody tr:hover {
 table.grid tbody tr[aria-selected="true"] {
   background: var(--surface-2);
   box-shadow: inset 2px 0 0 var(--accent);
+}
+/* 时间列不许折行：列宽被压缩时「7 秒前」会折成两行，行高就破了 32px 的节奏 */
+table.grid td:last-child,
+table.grid td.num {
+  white-space: nowrap;
 }
 table.grid td.num {
   font-family: var(--mono);
@@ -700,39 +706,61 @@ table.grid td.num {
   position: relative;
   overflow: hidden;
 }
-.graph-canvas svg {
-  display: block;
-  width: 100%;
-  height: 100%;
-  touch-action: none;
+.graph-canvas-host {
+  position: absolute;
+  inset: 0;
+  /* canvas 在最底层：浮层（工具栏、悬停卡、图例、提示）都压在它上面，不然它们点不动 */
+  z-index: 0;
   cursor: grab;
+  touch-action: none;
 }
-.graph-canvas svg.panning {
+.graph-overlay,
+.graph-tip,
+.graph-legend,
+.graph-hint {
+  z-index: 2;
+}
+.graph-canvas-host:active {
   cursor: grabbing;
 }
-.graph-node {
-  cursor: pointer;
-  transition: opacity var(--t-hover);
+.graph-canvas-host:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: -3px;
 }
-.graph-node circle {
-  transition: r 160ms ease-out, stroke-width 160ms ease-out;
+/* canvas 里没有 DOM 节点，这份列表只给键盘和屏幕阅读器用 */
+.graph-a11y {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
 }
-.graph-edge {
-  transition: opacity var(--t-hover);
+/* 图例里的小圆点 */
+.lg-dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  border: 1.4px solid var(--line-strong);
+  background: var(--c-relation);
 }
-.graph-label {
-  font-family: var(--mono);
-  font-size: 10.5px;
-  fill: var(--fg-dim);
-  pointer-events: none;
-  paint-order: stroke;
-  stroke: var(--surface);
-  stroke-width: 3px;
-  stroke-linejoin: round;
+.lg-dot.global,
+.lg-dot.ring {
+  background: none;
+  border: 1.4px solid var(--info);
 }
-.graph-label.focus {
-  fill: var(--fg);
+.lg-dot.dashed {
+  border-style: dashed;
+  border-color: var(--warn);
+  background: none;
 }
+.lg-dot.group {
+  border-radius: 3px;
+  border-style: dashed;
+  border-color: var(--line);
+  background: color-mix(in oklab, var(--surface-2) 55%, transparent);
+}
+
 .graph-overlay {
   position: absolute;
   top: 10px;
@@ -772,40 +800,246 @@ table.grid td.num {
   font-size: 11.5px;
   color: var(--fg-faint);
 }
-.graph-list {
+/* 左栏是**项目结构树**（主题 → 路径 → 记忆），不是平铺列表：复核时要先看这条记忆
+   属于哪个主题、哪个文件，平铺列表看不出这一层。 */
+.graph-rail {
   border-right: 1px solid var(--line);
   overflow: auto;
   background: color-mix(in oklab, var(--surface) 92%, transparent);
 }
-.graph-list .row {
+.graph-rail-head {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  padding: 8px;
+  background: var(--surface);
+  border-bottom: 1px solid var(--line);
+}
+.graph-stats {
+  margin-top: 6px;
+  font-size: 11.5px;
+  color: var(--fg-dim);
+}
+.graph-stats .k {
+  font-family: var(--mono);
+  color: var(--fg);
+}
+.graph-stats .k.warn {
+  color: var(--warn);
+}
+.rail-tree {
+  padding: 4px 0 12px;
+}
+.rail-head {
   display: flex;
   align-items: center;
-  gap: 8px;
-  height: 30px;
+  gap: 6px;
+  width: 100%;
+  height: 28px;
   padding: 0 10px;
-  border-bottom: 1px solid var(--line);
-  cursor: pointer;
+  border: 0;
+  border-radius: 0;
+  background: none;
+  color: var(--fg);
+  font: inherit;
   font-size: 12.5px;
+  font-weight: 550;
+  text-align: left;
+  cursor: pointer;
 }
-.graph-list .row:hover {
+.rail-head:hover {
   background: var(--surface-2);
 }
-.graph-list .row[aria-selected="true"] {
+.rail-head.sub {
+  padding-left: 22px;
+  font-weight: 400;
+  color: var(--fg-dim);
+}
+.rail-head .caret {
+  display: inline-block;
+  width: 10px;
+  flex: none;
+  color: var(--fg-faint);
+  transform: rotate(0deg);
+  transition: transform var(--t-hover);
+}
+.rail-head .caret.open {
+  transform: rotate(90deg);
+}
+.rail-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.rail-name.mono {
+  font-family: var(--mono);
+  font-size: 11.5px;
+}
+.rail-count {
+  flex: none;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--fg-faint);
+}
+.graph-rail .row.leaf {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  height: 26px;
+  padding: 0 10px 0 40px;
+  cursor: pointer;
+  font-size: 12px;
+  color: var(--fg-dim);
+}
+.graph-rail .row.leaf:hover {
   background: var(--surface-2);
+  color: var(--fg);
+}
+.graph-rail .row.leaf[aria-selected="true"] {
+  background: var(--surface-2);
+  color: var(--fg);
   box-shadow: inset 2px 0 0 var(--accent);
 }
-.graph-list .row .dot {
-  width: 7px;
-  height: 7px;
+.graph-rail .row .dot {
+  width: 6px;
+  height: 6px;
   border-radius: 50%;
   flex: none;
   background: var(--fg-faint);
 }
-.graph-list .row .dot.active {
+.graph-rail .row .dot.active {
   background: var(--accent);
 }
-.graph-list .row .dot.cold {
+.graph-rail .row .dot.cold {
   background: var(--warn);
+}
+/* 模型自己写的加一圈虚线圈：结构树里也要一眼看出来（§8.5 的来源权重） */
+.graph-rail .row .dot.agent {
+  box-shadow: 0 0 0 2px var(--surface), 0 0 0 3px var(--warn);
+}
+
+/* 模式切换（关系图 / 分层）：分段控件，两个选项不该抢主按钮的样式 */
+.seg {
+  display: inline-flex;
+  padding: 2px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--r-sm);
+  background: var(--surface-2);
+}
+.seg-item {
+  height: 22px;
+  padding: 0 10px;
+  border: 0;
+  border-radius: 4px;
+  background: none;
+  color: var(--fg-dim);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+.seg-item.on {
+  background: var(--surface);
+  color: var(--fg);
+  box-shadow: var(--e1);
+}
+
+/* 节点编码：填色 = 作用域（项目/全局/会话），描边 = 状态，半径 = 重要度，
+   虚线外环 = 模型所记且未经确认。四个维度都在图例里说明。 */
+/* 悬停卡：图谱要能回答「这是哪条、谁说的、重不重要」 */
+.graph-tip {
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  max-width: 320px;
+  padding: 8px 10px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--r-sm);
+  background: color-mix(in oklab, var(--surface) 94%, transparent);
+  backdrop-filter: blur(6px);
+  box-shadow: var(--e1);
+  pointer-events: none;
+}
+.graph-tip-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.graph-tip-body {
+  margin-top: 6px;
+  font-size: 12.5px;
+  line-height: 18px;
+  color: var(--fg);
+}
+.graph-tip-meta {
+  margin-top: 5px;
+  font-size: 11px;
+  color: var(--fg-faint);
+}
+
+/* 分布：横条 + 等宽计数。不引图表库 —— 要看的就是几个计数，条只是为了比大小 */
+.dist-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 20px 28px;
+}
+.dist-title {
+  font-size: 11.5px;
+  color: var(--fg-dim);
+  margin-bottom: 8px;
+}
+.dist-row {
+  display: grid;
+  grid-template-columns: 76px 1fr 34px;
+  align-items: center;
+  gap: 8px;
+  height: 20px;
+  font-size: 12px;
+}
+.dist-label {
+  color: var(--fg);
+}
+.dist-bar {
+  display: block;
+  height: 6px;
+  border-radius: 3px;
+  background: var(--surface-2);
+  overflow: hidden;
+}
+.dist-bar i {
+  display: block;
+  height: 100%;
+  border-radius: 3px;
+  background: var(--accent);
+}
+.dist-bar i.warn {
+  background: var(--warn);
+}
+.dist-bar i.bad {
+  background: var(--bad);
+}
+.dist-n {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--fg-dim);
+  text-align: right;
+}
+.dist-note {
+  margin-top: 6px;
+  font-size: 11.5px;
+}
+.topic-dist {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 20px;
+  padding-top: 16px;
+  border-top: 1px solid var(--line);
+}
+.topic-dist .chip .mono {
+  margin-left: 4px;
+  color: var(--fg-faint);
 }
 
 /* ---------------------------------------------------------------- 复核 */
@@ -1063,4 +1297,25 @@ table.grid td.num {
     animation-iteration-count: 1 !important;
     transition-duration: 0.001ms !important;
   }
+}
+
+/* 项目过滤对话框里的一行：勾选框 + 项目 id + 目录 + 条数 */
+.filterrow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 4px;
+  font-size: 12.5px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+.filterrow:hover {
+  background: var(--surface-2);
+}
+.filterrow input {
+  flex: none;
+}
+.filterrow > span:nth-of-type(2) {
+  flex: 1;
+  min-width: 0;
 }

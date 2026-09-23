@@ -7,6 +7,42 @@ import { KIND_LABEL, SCOPE_LABEL, STATE_LABEL, TYPE_LABEL, ago, fixed, humanTrac
 
 /* ---------------------------------------------------------------- 概览 */
 
+/** 一根横条一个类别。数字用等宽、条用强调色 —— 不引图表库，因为要看的就是几个计数。 */
+function Dist({
+  title,
+  entries,
+  label,
+  tone,
+  note,
+}: {
+  title: string;
+  entries: Array<[string, number]>;
+  label: (k: string) => string;
+  tone?: (k: string) => string;
+  note?: string;
+}) {
+  const rows = entries.filter(([k]) => k && k !== "null").sort((a, b) => b[1] - a[1]);
+  const max = Math.max(1, ...rows.map(([, n]) => n));
+  return (
+    <div class="dist">
+      <div class="dist-title">{title}</div>
+      {rows.length === 0 ? <div class="dim" style={{ fontSize: "12px" }}>空</div> : null}
+      {rows.map(([k, n]) => (
+        <div class="dist-row" key={k}>
+          <span class="dist-label truncate" title={k}>
+            {label(k)}
+          </span>
+          <span class="dist-bar">
+            <i class={tone?.(k) ?? ""} style={{ width: `${Math.max(4, (n / max) * 100)}%` }} />
+          </span>
+          <span class="dist-n">{n}</span>
+        </div>
+      ))}
+      {note ? <div class="dist-note dim">{note}</div> : null}
+    </div>
+  );
+}
+
 export function OverviewView({ scope, version }: { scope: Scope; version: number }) {
   const { data, error, loading, reload } = useAsync(() => api.overview(scope), [scope, version]);
   if (loading && !data) return <Skeleton rows={6} />;
@@ -22,7 +58,7 @@ export function OverviewView({ scope, version }: { scope: Scope; version: number
       <div class="view-head">
         <h1>概览</h1>
         <span class="sub dim">
-          {scope === "global" ? "全局库" : "项目库"} {total} 条，其中 active {active} 条
+          {SCOPE_LABEL[scope] ?? scope} {total} 条，其中 active {active} 条
         </span>
         <span class="spacer" />
         <Button variant="ghost" icon="refresh" onClick={reload}>
@@ -32,12 +68,35 @@ export function OverviewView({ scope, version }: { scope: Scope; version: number
 
       <div class="metrics">
         <Metric k="注入命中率" v={o.hitRate == null ? "-" : pct(o.hitRate)} h={o.injectedTotal ? `注入 ${o.injectedTotal} 条，用过 ${o.citedTotal} 条` : "本会话还没注入过"} />
-        <Metric k="待确认" v={String(o.pending)} h="合并 / 冲突 / 起主题" />
+        <Metric k="待确认" v={String(o.pending)} h="合并 / 冲突 / 作用域" />
         <Metric k="近义堆" v={String(o.dupes)} h={`余弦 ≥ ${fixed(o.dupeCosine, 2)}`} />
         <Metric k="路径节点" v={String(o.project.paths)} h="来自 tool call 的文件名" />
         <Metric k="全局库" v={String(o.global.count)} h={o.global.file.split("/").slice(-1)[0]} />
         <Metric text k="判断引擎" v={o.engine.ready ? (o.engine.model ?? "已配置") : "不可用"} h={o.engine.ready ? `${o.engine.provider} · 阈值 ${fixed(o.engine.relevanceThreshold, 2)}` : o.engine.problems[0] ?? ""} />
       </div>
+
+      <Panel title="分布" actions={<span class="dim">按当前库统计</span>}>
+        <div class="dist-grid">
+          <Dist title="类型" entries={Object.entries(o.project.byType ?? {})} label={(k) => TYPE_LABEL[k] ?? k} />
+          <Dist title="状态" entries={Object.entries(byState)} label={(k) => STATE_LABEL[k] ?? k} tone={(k) => (k === "cold" ? "warn" : k === "superseded" ? "bad" : "")} />
+          <Dist title="作用域" entries={Object.entries(o.project.byScope ?? {})} label={(k) => SCOPE_LABEL[k] ?? k} />
+          <Dist
+            title="来源"
+            entries={[["user", o.project.byOrigin?.user ?? 0], ["agent", o.project.byOrigin?.agent ?? 0]]}
+            label={(k) => (k === "user" ? "用户原话" : "模型所记")}
+            tone={(k) => (k === "agent" ? "warn" : "")}
+            note={o.project.unconfirmed ? `${o.project.unconfirmed} 条未经用户确认（注入时带标记）` : "没有未确认的模型记忆"}
+          />
+        </div>
+        <div class="topic-dist">
+          {(o.project.topicCounts ?? []).map((t) => (
+            <span class="chip" key={t.topic}>
+              {t.topic} <span class="mono faint">{t.n}</span>
+            </span>
+          ))}
+          {(o.project.topicCounts ?? []).length === 0 ? <span class="dim">还没有主题</span> : null}
+        </div>
+      </Panel>
 
       <Panel title="召回健康度" actions={<span class="dim">最近 {o.recalls.length} 次</span>} flush>
         {o.recalls.length === 0 ? (
@@ -105,14 +164,14 @@ export function OverviewView({ scope, version }: { scope: Scope; version: number
             </thead>
             <tbody>
               {o.registry.map((p) => (
-                <tr key={p.project_id} style={{ cursor: "default" }}>
-                  <td>{p.project_id}</td>
+                <tr key={p.projectId} style={{ cursor: "default" }}>
+                  <td>{p.projectId}</td>
                   <td class="hide-sm mono truncate" title={p.dir}>
                     {p.dir}
                   </td>
-                  <td class="num">{p.memory_count}</td>
+                  <td class="num">{p.count}</td>
                   <td>
-                    <TimeCell at={p.updated_at} />
+                    <TimeCell at={p.updatedAt} />
                   </td>
                 </tr>
               ))}
@@ -155,17 +214,17 @@ export function OverviewView({ scope, version }: { scope: Scope; version: number
 
 /* ---------------------------------------------------------------- 记忆 */
 
-export function MemoriesView({ scope, version, query, onQuery, selected, onSelect }: { scope: Scope; version: number; query: string; onQuery: (v: string) => void; selected: string | null; onSelect: (id: string | null) => void }) {
+export function MemoriesView({ scope, version, query, onQuery, selected, onSelect, visible }: { scope: Scope; version: number; query: string; onQuery: (v: string) => void; selected: string | null; onSelect: (id: string | null) => void; visible: (project: string | null | undefined) => boolean }) {
   const [state, setState] = useState("");
   const [type, setType] = useState("");
   const [topic, setTopic] = useState("");
   const { data, error, loading, reload } = useAsync(() => api.memories(scope, { state, topic }), [scope, state, topic, version]);
 
   const items = useMemo(() => {
-    const all = data?.items ?? [];
+    const all = (data?.items ?? []).filter((m) => visible(m.project));
     const q = query.trim().toLowerCase();
     return all.filter((m) => (!type || m.type === type) && (!q || m.content.toLowerCase().includes(q) || m.id.startsWith(q) || (m.topic ?? "").toLowerCase().includes(q)));
-  }, [data, type, query]);
+  }, [data, type, query, visible]);
 
   useEffect(() => {
     // j / k 在列表里上下走，Enter 打开（键盘优先）
@@ -263,11 +322,14 @@ export function MemoriesView({ scope, version, query, onQuery, selected, onSelec
                   类型
                 </th>
                 <th>内容</th>
-                <th style={{ width: "120px" }} class="hide-sm">
+                <th style={{ width: "108px" }} class="hide-sm">
                   主题
                 </th>
-                <th style={{ width: "64px", textAlign: "right" }}>重要度</th>
-                <th style={{ width: "96px" }}>写入</th>
+                <th style={{ width: "86px" }} class="hide-sm">
+                  来源
+                </th>
+                <th style={{ width: "72px", textAlign: "right" }}>重要度</th>
+                <th style={{ width: "104px" }}>写入</th>
               </tr>
             </thead>
             <tbody>
@@ -280,10 +342,22 @@ export function MemoriesView({ scope, version, query, onQuery, selected, onSelec
                   <td class="hide-sm">
                     <TypeChip type={m.type} />
                   </td>
-                  <td class="cell-content truncate" title={m.content}>
-                    {m.content}
+                  <td class="cell-content truncate" title={m.summary ?? m.content}>
+                    {/* 默认显示提炼版：原文还在（详情里能看），这里只负责一眼看明白。 */}
+                    {m.summary ?? m.content}
+                    {m.summary ? <Chip title="这条是提炼过的，打开详情能看原文">提炼</Chip> : null}
                   </td>
                   <td class="hide-sm truncate dim">{m.topic ?? "-"}</td>
+                  {/* 来源与可信度（§8.5）：模型自己写的要一眼看出来，包括它值多少 trust */}
+                  <td class="hide-sm">
+                    {m.origin === "agent" ? (
+                      <Chip tone="warn" title={`模型所记，trust ${fixed(m.trust, 2)}${m.trust < 0.8 ? "（注入时带「未经用户确认」标记）" : ""}`}>
+                        模型 {fixed(m.trust, 1)}
+                      </Chip>
+                    ) : (
+                      <span class="dim">用户</span>
+                    )}
+                  </td>
                   <td class="num">{fixed(m.importance, 2)}</td>
                   <td>
                     <TimeCell at={m.createdAt} />
@@ -356,7 +430,7 @@ export function PendingView({ scope, version, onChanged, onOpenMemory }: { scope
         <Skeleton rows={4} />
       ) : !current ? (
         <Panel>
-          <EmptyState title="没有待确认的事" hint="判不准的（合并、冲突、起主题、要不要放宽到全局）会排在这里，不会替你拍。" />
+          <EmptyState title="没有待确认的事" hint="判不准的（合并、冲突、要不要放宽到全局）会排在这里，不会替你拍。主题由模型自己定。" />
         </Panel>
       ) : (
         <>
@@ -531,6 +605,7 @@ export function DupesView({ scope, version, onOpenMemory, onChanged }: { scope: 
 interface RawConfig {
   typesafe?: { apiKey?: string; apiKeySet?: number; baseUrl?: string; model?: string; timeoutMs?: number };
   judge?: { provider?: string; model?: string; relevanceThreshold?: number };
+  refine?: { provider?: string; apiKey?: string; apiKeySet?: number; baseUrl?: string; model?: string; timeoutMs?: number; maxSummaryChars?: number };
   proxy?: { http?: string };
   inject?: { maxPerSession?: number; minTurnsBetween?: number };
   recall?: { perSourceLimit?: number; weights?: Record<string, number> };
@@ -544,6 +619,7 @@ export function SettingsView({ user, onSaved }: { user: string; onSaved: () => v
   const cfgPath = data?.path ?? "";
   const [draft, setDraft] = useState<RawConfig | null>(null);
   const [apiKey, setApiKey] = useState("");
+  const [refineKey, setRefineKey] = useState("");
   const [busy, setBusy] = useState(false);
   const [dirty, setDirty] = useState(false);
 
@@ -568,9 +644,11 @@ export function SettingsView({ user, onSaved }: { user: string; onSaved: () => v
     try {
       const body: Record<string, unknown> = JSON.parse(JSON.stringify(draft));
       if (apiKey.trim()) (body.typesafe as Record<string, unknown>).apiKey = apiKey.trim();
+      if (refineKey.trim()) (body.refine as Record<string, unknown>).apiKey = refineKey.trim();
       await api.saveConfig(body);
       setApiKey("");
-      toast("已写入 config.json（权限 600）。判断引擎和端口要重启 pi 才生效");
+      setRefineKey("");
+      toast("已写入 config.json（权限 600）。判断引擎、提炼后端和端口要重启 pi 才生效");
       reload();
       onSaved();
     } catch (e) {
@@ -620,6 +698,31 @@ export function SettingsView({ user, onSaved }: { user: string; onSaved: () => v
             <input class="input" value={draft.proxy?.http ?? ""} onInput={(e) => patch((c) => void (c.proxy = { ...c.proxy, http: (e.currentTarget as HTMLInputElement).value }))} />
           </Field>
         </div>
+      </fieldset>
+
+      <fieldset class="fieldset">
+        <legend>提炼（可选：把长回复压成一条记忆，并提议主题名）</legend>
+        <p class="dim" style={{ margin: "0 0 8px", fontSize: "12px" }}>
+          不配就是关的，长回复原样存。判断仍然归判断引擎，这里只做生成。
+          原文一律保留（content 不动），列表和注入默认给提炼版，需要细节时在详情里看原文。
+        </p>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(200px,1fr))", gap: "10px" }}>
+          <Field label="provider" hint="openai 兼容的 /chat/completions。hunyuan / deepseek / openai / ollama 已登记，其他填自定义端点">
+            <input class="input mono" value={draft.refine?.provider ?? "off"} onInput={(e) => patch((c) => void (c.refine = { ...c.refine, provider: (e.currentTarget as HTMLInputElement).value }))} />
+          </Field>
+          <Field label="模型" hint="例如 hunyuan-lite / deepseek-chat / qwen2.5:7b">
+            <input class="input mono" value={draft.refine?.model ?? ""} onInput={(e) => patch((c) => void (c.refine = { ...c.refine, model: (e.currentTarget as HTMLInputElement).value }))} />
+          </Field>
+          <Field label="端点 baseUrl" hint="云端和本机（ollama / llama.cpp）是同一份代码">
+            <input class="input mono" value={draft.refine?.baseUrl ?? ""} onInput={(e) => patch((c) => void (c.refine = { ...c.refine, baseUrl: (e.currentTarget as HTMLInputElement).value }))} />
+          </Field>
+          <Field label="提炼后上限（字）">
+            <input class="input mono" type="number" value={draft.refine?.maxSummaryChars ?? 120} onInput={(e) => patch((c) => void (c.refine = { ...c.refine, maxSummaryChars: Number((e.currentTarget as HTMLInputElement).value) || undefined }))} />
+          </Field>
+        </div>
+        <Field label="API key" hint={draft.refine?.apiKeySet ? `已配置，长度 ${draft.refine.apiKeySet}；只写不读，留空就是不改` : "本机 ollama 不需要 key；环境变量 REFLECTIVE_REFINE_API_KEY 优先于这里"}>
+          <input class="input" type="password" value={refineKey} placeholder={draft.refine?.apiKeySet ? "留空 = 不改" : "sk-..."} onInput={(e) => setRefineKey((e.currentTarget as HTMLInputElement).value)} autocomplete="off" />
+        </Field>
       </fieldset>
 
       <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(260px,1fr))", gap: "14px" }}>
@@ -732,6 +835,7 @@ function AccountForm({ user }: { user: string }) {
 export function Inspector({ scope, id, version, onClose, onChanged }: { scope: Scope; id: string; version: number; onClose: () => void; onChanged: () => void }) {
   const { data, error, loading, reload } = useAsync(() => api.detail(scope, id), [scope, id, version]);
   const [confirmDelete, setConfirmDelete] = useState(false);
+  const [showRaw, setShowRaw] = useState(false);
 
   const copy = async (text: string) => {
     try {
@@ -775,8 +879,16 @@ export function Inspector({ scope, id, version, onClose, onChanged }: { scope: S
         <>
           <div class="inspector-body">
             <div>
-              <div class="content-large wrap">{m.content}</div>
-              {m.summary ? <div class="dim" style={{ marginTop: "6px" }}>{m.summary}</div> : null}
+              {/* 默认给提炼版；原文是真相，一键能看到，不藏也不丢。 */}
+              <div class="content-large wrap">{m.summary ?? m.content}</div>
+              {m.summary ? (
+                <div style={{ marginTop: "8px" }}>
+                  <Button variant="ghost" size="sm" onClick={() => setShowRaw((v) => !v)}>
+                    {showRaw ? "收起原文" : `看原文（${m.content.length} 字）`}
+                  </Button>
+                  {showRaw ? <div class="content-large wrap dim" style={{ marginTop: "6px" }}>{m.content}</div> : null}
+                </div>
+              ) : null}
             </div>
 
             <dl class="meta-grid">

@@ -48,12 +48,14 @@ export const SCOPE_LABEL: Record<string, string> = {
   project: "项目",
   global: "全局",
   session: "会话",
+  all: "全部项目",
 };
 
 export const KIND_LABEL: Record<string, string> = {
   supersedes: "取代",
   contradicts: "冲突",
   extends: "延伸",
+  depends_on: "依赖",
   related: "相关",
   topic: "同主题",
   path: "同路径",

@@ -4,24 +4,33 @@
 :root {
   color-scheme: dark;
 
-  --bg: #08090a;
-  --surface: #0e1011;
-  --surface-2: #141719;
-  --line: #1d2124;
-  --line-strong: #2a2f34;
-  --fg: #e7eaec;
-  --fg-dim: #98a1a8;
-  --fg-faint: #7d858c;      /* 4.5:1 起（AA），时间戳/id/表头都用它 */
-  --accent: #3fbf8f;
-  --on-accent: #04221a;
-  --accent-dim: rgba(63, 191, 143, 0.14);
-  --warn: #d9a25b;
-  --bad: #e0685f;
-  --info: #7ba7d9;
-  --focus-ring: #3fbf8f;
+  --bg: #0a0c10;
+  --surface: #101319;
+  --surface-2: #161a21;
+  --line: #222833;
+  --line-strong: #2d3542;
+  --fg: #e7eaf0;
+  --fg-dim: #99a2b2;
+  --fg-faint: #7d8698;      /* 4.5:1 起（AA），时间戳/id/表头都用它 */
+  --accent: #5b8def;        /* 主色：靛蓝。不要再退回绿色 */
+  --on-accent: #06121f;
+  --accent-dim: rgba(91, 141, 239, 0.14);
+  --warn: #d99a3c;
+  --bad: #e5645c;
+  --info: #35c0dd;
+  --focus-ring: #5b8def;
 
-  --edge: #5b656d;          /* 图谱边：按图形对象 3:1 定的（发丝线也要看得见） */
-  --edge-dim: #454e56;      /* 相似/延伸这类更弱的关系 */
+  --edge: #566072;          /* 图谱边：按图形对象 3:1 定的（发丝线也要看得见） */
+  --edge-dim: #414a5a;      /* 相似/延伸这类更弱的关系 */
+
+  /* 图谱节点填充：按**记忆类型**上色（抄 cognee 的做法 —— 填充表示类别，其余维度走描边/外环）。
+     节点是实心色块，所以这六个值要互相分得开、也要跟状态色分得开。 */
+  --c-fact: #4c8df6;
+  --c-procedure: #2fa8c9;
+  --c-preference: #b45bd4;
+  --c-event: #e0a339;
+  --c-emotion: #e5645c;
+  --c-relation: #8b93a8;
 
   --r-sm: 6px;
   --r-md: 10px;
@@ -43,23 +52,29 @@
 
 :root[data-theme="light"] {
   color-scheme: light;
-  --bg: #f5f6f5;   /* 比 surface 略深一点：浅色下三栏的边界靠它分开 */
+  --bg: #f5f6f8;   /* 比 surface 略深一点：浅色下三栏的边界靠它分开 */
   --surface: #ffffff;
-  --surface-2: #f4f5f6;
-  --line: #e6e7e9;
-  --line-strong: #d3d5d9;
-  --fg: #15181b;
-  --fg-dim: #5a626b;
-  --fg-faint: #6b727a;      /* 4.46:1 on surface-2，AA 线附近，别再用更浅的 */
-  --accent: #0f7a5a;
+  --surface-2: #f3f4f7;
+  --line: #e5e7ec;
+  --line-strong: #d2d6de;
+  --fg: #14171d;
+  --fg-dim: #565e6d;
+  --fg-faint: #6a7280;      /* 4.46:1 on surface-2，AA 线附近，别再用更浅的 */
+  --accent: #2f6fd0;
   --on-accent: #ffffff;
-  --accent-dim: rgba(15, 122, 90, 0.1);
+  --accent-dim: rgba(47, 111, 208, 0.1);
   --warn: #8a5a10;
   --bad: #b3261e;
-  --info: #2a5c99;
-  --focus-ring: #0f7a5a;
-  --edge: #868c93;
-  --edge-dim: #a5abb1;
+  --info: #14708a;
+  --focus-ring: #2f6fd0;
+  --edge: #8a919c;
+  --edge-dim: #a8aeb8;
+  --c-fact: #2f6fd0;
+  --c-procedure: #17829c;
+  --c-preference: #8b34a8;
+  --c-event: #a1720c;
+  --c-emotion: #c2453c;
+  --c-relation: #5f6878;
   --e1: 0 1px 2px rgba(16, 24, 32, 0.06), 0 6px 18px rgba(16, 24, 32, 0.08);
   --e2: 0 12px 40px rgba(16, 24, 32, 0.18);
 }

@@ -36,7 +36,7 @@ addTrace(project, { memoryId: rule.id, stage: "write", gate: "J1+J2+J3", action:
 enqueueReview(project, { kind: "merge", memoryId: attack.id, otherId: rule.id, question: "这两条要合并吗？", options: ["保留两条", "合并"] });
 insertMemory(global, { content: "回答默认用中文。", type: "preference", scope: "global", importance: 0.7 });
 
-const ui = await startUi({ projectDb: project, globalDb: global, projectId: "projA" });
+const ui = await startUi({ defaultProject: "projA" });
 const origin = new URL(ui.url).origin;
 
 const setup = await fetch(`${origin}/api/setup`, { method: "POST", redirect: "manual", body: new URLSearchParams({ username: "me", password: "s3cret-pass" }) });
@@ -64,28 +64,50 @@ for (const theme of ["dark", "light"]) {
     await page.reload();
     await page.waitForSelector(".shell", { timeout: 15000 });
     await page.waitForTimeout(900);   // 等数据 + 动效落地
+    // 图谱库是动态加载的（cytoscape 单独一个 chunk），实例建好之前拿不到 probe
+    if (id === "graph") await page.waitForFunction(() => Boolean(window.__rsGraphProbe), { timeout: 20000 });
     if (shotsDir) {
       const file = path.join(shotsDir, `${theme}-${id}.png`);
       await page.screenshot({ path: file, fullPage: false });
       shots.push([theme, file, theme]);
     }
     if (id === "graph") {
-      const nodes = await page.locator(".graph-node").count();
-      assert.ok(nodes >= 3, `图谱要画得出节点，实际 ${nodes}`);
-      // 点节点要能设焦点，并且焦点节点落在画布中心附近（拖动坐标、指针捕获都会破坏这条）
-      // 用坐标点击：SVG <g> 的可点击区域是圆和标签的并集，playwright 的稳定性判定
-      // 对这种会重排的图不友好（而且用户本来就是点坐标）。
-      const dot = await page.locator(".graph-node").first().locator("circle").first().boundingBox();
-      await page.mouse.click(dot.x + dot.width / 2, dot.y + dot.height / 2);
-      await page.waitForTimeout(600);
+      // canvas 画出来的节点 DOM 里没有，所以两端对账：可达列表里有几个，cy 里就有几个。
+      const a11y = await page.locator(".graph-node-a11y").count();
+      assert.ok(a11y >= 3, `图谱要画得出节点（可达列表），实际 ${a11y}`);
+      const drawn = await page.evaluate(() => (window).__rsGraphProbe?.nodeCount() ?? 0);
+      assert.equal(drawn, a11y, "canvas 上的节点数要和可达列表一致");
+      // 点节点要能设焦点，而且焦点节点落在画布中心附近（焦点居中这条是手感的核心）
+      const first = page.locator(".graph-node-a11y").first();
+      const id = await first.getAttribute("data-id");
+      // 这份列表是故意隐藏的（给键盘和读屏看），指针点不到它 —— 直接派发 click 事件，
+      // 走的是同一条处理路径（就当成键盘用户按了 Enter）。
+      await first.dispatchEvent("click");
+      await page.waitForTimeout(500);
       assert.equal(await page.locator(".graph-overlay").getByText(/^焦点/).count(), 1, "点节点要出现焦点标记");
-      const canvas = await page.locator(".graph-canvas").boundingBox();
-      const node = await page.locator(".graph-node").first().locator("circle").first().boundingBox();
-      const off = Math.hypot(node.x + node.width / 2 - (canvas.x + canvas.width / 2), node.y + node.height / 2 - (canvas.y + canvas.height / 2));
+      const probe = await page.evaluate((nid) => {
+        const p = (window).__rsGraphProbe;
+        return p ? { pos: p.renderedCenter(nid), canvas: p.canvas() } : null;
+      }, id);
+      assert.ok(probe?.pos, "要能从 cy 问到节点位置");
+      const off = Math.hypot(probe.pos.x - probe.canvas.w / 2, probe.pos.y - probe.canvas.h / 2);
       assert.ok(off < 40, `焦点节点要居中，实际偏了 ${Math.round(off)}px`);
-      await page.keyboard.press("Escape");
+      // 键子选：方向键换节点，Enter 开详情
+      await page.locator(".graph-canvas-host").focus();   // 键盘事件要落在这个容器上（canvas 挡住指针）
+      await page.keyboard.press("ArrowRight");
       await page.waitForTimeout(300);
+      const moved = await page.locator(".graph-node-a11y[aria-current=true]").count();
+      assert.equal(moved, 1, "方向键要能选中下一个节点");
+      await page.keyboard.press("Escape");
+      await page.waitForTimeout(400);
       assert.equal(await page.locator(".graph-overlay").getByText(/^焦点/).count(), 0, "Esc 要回到全库概览");
+      // 分层画法：切过去后 cy 里还应该有节点（直接跑一次分层布局）
+      await page.locator(".seg-item", { hasText: "分层" }).click();
+      await page.waitForTimeout(800);
+      const treeNodes = await page.evaluate(() => (window).__rsGraphProbe?.nodeCount() ?? 0);
+      assert.equal(treeNodes, a11y, "分层画法也要把节点都画出来");
+      await page.locator(".seg-item", { hasText: "关系图" }).click();
+      await page.waitForTimeout(500);
     }
     if (id === "memories") {
       const rows = await page.locator("table.grid tbody tr").count();
@@ -104,6 +126,29 @@ for (const theme of ["dark", "light"]) {
     }
   }
 }
+
+// 合并视图 = 默认视图：选库的下拉要列出项目，项目过滤能隐藏其中的一个
+await page.goto(`${origin}/#/graph`);
+await page.waitForSelector(".shell");
+await page.waitForTimeout(600);
+await page.waitForFunction(() => Boolean(document.querySelector(".graph-node-a11y")) || Boolean(window.__rsGraphProbe), { timeout: 20000 });
+const scopeSelect = page.locator(".topbar select");
+assert.equal(await scopeSelect.inputValue(), "all", "默认应该看全部项目");
+assert.ok((await page.locator(".view-head").getByText("全部项目").count()) >= 1, "视图头要写明当前看的是全部项目");
+const before = await page.locator(".graph-node-a11y").count();
+await page.getByRole("button", { name: "项目过滤" }).click();
+await page.waitForSelector(".dialog", { timeout: 5000 });
+assert.equal(await page.locator(".dialog .filterrow").count(), 2, "过滤列表里要有全局库 + 每个项目（磁盘上的库也算）");
+await page.locator(".dialog .filterrow input").first().click();   // 取消勾选第一个项目
+await page.waitForTimeout(400);
+assert.ok((await page.locator(".graph-node-a11y").count()) < before, "隐藏一个项目后节点要变少");
+await page.locator(".dialog").getByRole("button", { name: "知道了" }).click();
+await page.reload();
+await page.waitForSelector(".shell");
+await page.waitForTimeout(600);
+assert.ok((await page.locator(".graph-node-a11y").count()) < before, "隐藏的选择要记住（localStorage）");
+await page.evaluate(() => localStorage.removeItem("rs-hidden-projects"));
+console.log("✓ 一个页面看所有项目：默认合并视图 + 项目过滤能隐藏");
 
 // 键盘切视图：g 然后数字
 await page.goto(`${origin}/#/overview`);
@@ -132,7 +177,35 @@ if (shotsDir) {
   await page.screenshot({ path: path.join(shotsDir, "dark-inspector.png") });
 }
 
+// 图谱的两种画法：分层图要有主题/路径分组框，折叠要真的收起来，左栏要是同一棵树。
+// 这几条是「图谱只是个点云」和「图谱能看出项目结构」的分界，坏了就等于退回上一版。
+await page.goto(`${origin}/#/graph`);
+await page.waitForSelector(".graph-canvas");
+await page.waitForFunction(() => Boolean(window.__rsGraphProbe), { timeout: 20000 });
+assert.ok((await page.locator(".rail-tree .rail-head").count()) >= 2, "左栏要是主题 → 路径的结构树，不是平铺列表");
+const probe = () => page.evaluate(() => {
+  const p = window.__rsGraphProbe;
+  return p ? { nodes: p.nodeCount(), visible: p.visibleCount(), groups: p.groupCount() } : null;
+});
+// 关系图：主题是**复合节点**（不是画的圈），拖动它整团跟着走
+assert.ok((await probe()).groups >= 1, "关系图要有主题复合节点（不然节点就是一堆没归属的点）");
+await page.getByRole("button", { name: "分层", exact: true }).click();
+await page.waitForTimeout(600);
+const tree = await probe();
+assert.ok(tree.groups >= 3, `分层图要有「库 → 主题 → 路径」的复合节点，实际 ${tree.groups}`);
+// 折叠：左栏和画布共用同一份状态，折叠后子节点真的藏起来
+const beforeCollapse = tree.visible;
+await page.locator(".rail-tree .rail-head").nth(1).click();
+await page.waitForTimeout(500);
+assert.ok((await probe()).visible < beforeCollapse, "折叠要真的把子树藏起来（左栏和画布同一份状态）");
+await page.locator(".rail-tree .rail-head").nth(1).click();
+await page.waitForTimeout(400);
+assert.equal((await probe()).visible, beforeCollapse, "展开要能回到原样");
+if (shotsDir) await page.screenshot({ path: path.join(shotsDir, "dark-tree.png") });
+await page.getByRole("button", { name: "关系图", exact: true }).click();
+await page.waitForTimeout(300);
+
 assert.deepEqual(errors, [], `控制台不该有报错：${errors.join(" | ")}`);
 await browser.close();
 ui.close();
-console.log(`✓ 浏览器自检：6 个视图两种主题都渲染、键盘可用、记忆原文没变成 DOM${shotsDir ? `（截图 ${shots.length + 1} 张 → ${shotsDir}）` : ""}`);
+console.log(`✓ 浏览器自检：6 个视图两种主题都渲染、图谱两种画法 + 折叠、键盘可用、记忆原文没变成 DOM${shotsDir ? `（截图 ${shots.length + 1} 张 → ${shotsDir}）` : ""}`);

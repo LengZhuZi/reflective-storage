@@ -1,12 +1,16 @@
 /** 外壳：命令栏 + 左栏 + 主区 + 检视栏，路由走 hash，键盘优先。 */
 import { useCallback, useEffect, useMemo, useRef, useState } from "preact/hooks";
-import { api, type MemoryNode, type Scope } from "./api";
+import { api, type MemoryNode, type ProjectRow, type Scope } from "./api";
 import { Button, Chip, Dialog, Icon, KeyHint, ToastHost, toast } from "./components";
 import { Graph } from "./graph";
 import { DupesView, Inspector, MemoriesView, OverviewView, PendingView, SettingsView } from "./views";
 import { SCOPE_LABEL, TYPE_LABEL, shortId } from "./format";
 
 type ViewId = "overview" | "graph" | "memories" | "pending" | "dupes" | "settings";
+
+/** 隐藏列表的 localStorage 键，以及全局库在隐藏列表里的占位 id（它没有项目 id）。 */
+const HIDDEN_KEY = "rs-hidden-projects";
+const GLOBAL_KEY = "__global__";
 
 const VIEWS: Array<{ id: ViewId; label: string; icon: string; key: string }> = [
   { id: "overview", label: "概览", icon: "overview", key: "1" },
@@ -38,18 +42,37 @@ function useTheme() {
 export function App({ user }: { user: string }) {
   const { theme, toggle } = useTheme();
   const [view, setView] = useState<ViewId>(fromHash);
-  const [scope, setScope] = useState<Scope>("project");
+  // 默认看全部：一个页面看到所有项目的图谱，这也是「跨项目」唯一看得见的地方。
+  const [scope, setScope] = useState<Scope>("all");
   const [query, setQuery] = useState("");
   const [selected, setSelected] = useState<string | null>(null);
   const [graphFocus, setGraphFocus] = useState<string | null>(null);
   const [version, setVersion] = useState(0);
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [helpOpen, setHelpOpen] = useState(false);
+  const [filterOpen, setFilterOpen] = useState(false);
   const [railCollapsed, setRailCollapsed] = useState(false);
-  const [summary, setSummary] = useState<{ count: number; pending: number; dupes: number; engine: string; engineBad: boolean; dbFile: string; topics: string[] } | null>(null);
+  /** 隐藏掉的项目（只影响图谱和列表的显示，不动数据）。全局库用 GLOBAL_KEY。 */
+  const [hidden, setHidden] = useState<string[]>(() => {
+    try {
+      return JSON.parse(localStorage.getItem(HIDDEN_KEY) ?? "[]") as string[];
+    } catch {
+      return [];
+    }
+  });
+  const [summary, setSummary] = useState<{ count: number; pending: number; dupes: number; engine: string; engineBad: boolean; dbFile: string; topics: string[]; projects: ProjectRow[] } | null>(null);
   const pendingG = useRef<string | null>(null);
 
   const bump = useCallback(() => setVersion((v) => v + 1), []);
+  const toggleHidden = useCallback((id: string) => {
+    setHidden((h) => {
+      const next = h.includes(id) ? h.filter((x) => x !== id) : [...h, id];
+      localStorage.setItem(HIDDEN_KEY, JSON.stringify(next));
+      return next;
+    });
+  }, []);
+  /** 项目/全局是否显示。null/undefined 的 project = 全局库。 */
+  const visible = useCallback((project: string | null | undefined) => !hidden.includes(project ?? GLOBAL_KEY), [hidden]);
 
   useEffect(() => {
     const onHash = () => setView(fromHash());
@@ -74,6 +97,7 @@ export function App({ user }: { user: string }) {
           engineBad: !o.engine.ready || o.engine.problems.length > 0,
           dbFile: o.project.file,
           topics: o.topics,
+          projects: o.projects ?? [],
         }),
       )
       .catch(() => setSummary(null));
@@ -129,10 +153,20 @@ export function App({ user }: { user: string }) {
           <Icon name="stack" size={16} />
           <span>反思存储</span>
         </span>
-        <select class="select" value={scope} onChange={(e) => { setScope((e.currentTarget as HTMLSelectElement).value as Scope); setSelected(null); setGraphFocus(null); }} aria-label="库">
-          <option value="project">项目库</option>
+        <select class="select" value={scope} onChange={(e) => { setScope((e.currentTarget as HTMLSelectElement).value as Scope); setSelected(null); setGraphFocus(null); }} aria-label="看哪个库">
+          <option value="all">全部项目</option>
           <option value="global">全局库</option>
+          {(summary?.projects ?? []).map((p) => (
+            <option key={p.id} value={p.id}>
+              {p.id}（{p.count}）
+            </option>
+          ))}
         </select>
+        {scope === "all" ? (
+          <Button variant="ghost" size="sm" icon="stack" title="隐藏不看的项目（只影响图谱和列表的显示）" onClick={() => setFilterOpen(true)}>
+            {hidden.length ? `已隐藏 ${hidden.length}` : "项目过滤"}
+          </Button>
+        ) : null}
         <span class="dbpath truncate" title={summary?.dbFile ?? ""}>
           {summary?.dbFile ?? ""}
         </span>
@@ -211,9 +245,9 @@ export function App({ user }: { user: string }) {
       <main class="main">
         {view === "overview" ? <OverviewView scope={scope} version={version} /> : null}
         {view === "graph" ? (
-          <GraphSection scope={scope} version={version} selected={selected} onSelect={setSelected} focus={graphFocus} onFocus={setGraphFocus} onOpen={openMemory} />
+          <GraphSection scope={scope} version={version} selected={selected} onSelect={setSelected} focus={graphFocus} onFocus={setGraphFocus} onOpen={openMemory} visible={visible} />
         ) : null}
-        {view === "memories" ? <MemoriesView scope={scope} version={version} query={query} onQuery={setQuery} selected={selected} onSelect={setSelected} /> : null}
+        {view === "memories" ? <MemoriesView scope={scope} version={version} query={query} onQuery={setQuery} selected={selected} onSelect={setSelected} visible={visible} /> : null}
         {view === "pending" ? <PendingView scope={scope} version={version} onChanged={bump} onOpenMemory={openMemory} /> : null}
         {view === "dupes" ? <DupesView scope={scope} version={version} onOpenMemory={openMemory} onChanged={bump} /> : null}
         {view === "settings" ? <SettingsView user={user} onSaved={bump} /> : null}
@@ -236,6 +270,33 @@ export function App({ user }: { user: string }) {
             setPaletteOpen(false);
           }}
         />
+      ) : null}
+
+      {filterOpen ? (
+        <Dialog
+          title="项目过滤"
+          onClose={() => setFilterOpen(false)}
+          actions={<Button onClick={() => setFilterOpen(false)}>知道了</Button>}
+        >
+          <p class="dim" style={{ margin: "0 0 10px", fontSize: "12px" }}>
+            取消勾选 = 从合并图谱和列表里藏起来（数据不动，改回来就又能看见）。
+          </p>
+          <label class="filterrow">
+            <input type="checkbox" checked={!hidden.includes(GLOBAL_KEY)} onChange={() => toggleHidden(GLOBAL_KEY)} />
+            <span>全局库</span>
+          </label>
+          {(summary?.projects ?? []).map((p) => (
+            <label key={p.id} class="filterrow">
+              <input type="checkbox" checked={!hidden.includes(p.id)} onChange={() => toggleHidden(p.id)} />
+              <span class="mono">{p.id}</span>
+              <span class="dim truncate" title={p.dir}>
+                {p.dir}
+              </span>
+              <span class="dim">{p.count}</span>
+            </label>
+          ))}
+          {(summary?.projects ?? []).length === 0 ? <p class="dim">还没有别的项目登记进来。</p> : null}
+        </Dialog>
       ) : null}
 
       {helpOpen ? (
@@ -282,7 +343,7 @@ export function App({ user }: { user: string }) {
   );
 }
 
-function GraphSection(props: { scope: Scope; version: number; selected: string | null; onSelect: (id: string | null) => void; focus: string | null; onFocus: (id: string | null) => void; onOpen: (id: string) => void }) {
+function GraphSection(props: { scope: Scope; version: number; selected: string | null; onSelect: (id: string | null) => void; focus: string | null; onFocus: (id: string | null) => void; onOpen: (id: string) => void; visible: (project: string | null | undefined) => boolean }) {
   const [data, setData] = useState<Awaited<ReturnType<typeof api.graph>> | null>(null);
   const [error, setError] = useState<Error | null>(null);
   useEffect(() => {
@@ -296,11 +357,23 @@ function GraphSection(props: { scope: Scope; version: number; selected: string |
     };
   }, [props.scope, props.version]);
 
+  // 隐藏的项目在客户端过滤：合并图谱里把它们藏起来，比让用户重新选库快。
+  const shown = useMemo(() => {
+    if (!data) return null;
+    const nodes = data.nodes.filter((n) => props.visible(n.project));
+    const keep = new Set(nodes.map((n) => n.id));
+    return { nodes, links: data.links.filter((l) => keep.has(l.source) && keep.has(l.target)) };
+  }, [data, props.visible]);
+
   return (
     <div class="view">
       <div class="view-head">
         <h1>图谱</h1>
-        <span class="sub dim">{data ? `${data.nodes.length} 个节点 · ${data.links.length} 条关系` : "加载中"}</span>
+        <span class="sub dim">
+          {shown ? `${shown.nodes.length} 个节点 · ${shown.links.length} 条关系` : "加载中"}
+          {data && shown && shown.nodes.length !== data.nodes.length ? `（隐藏了 ${data.nodes.length - shown.nodes.length} 个）` : ""}
+        </span>
+        <span class="sub dim">{SCOPE_LABEL[props.scope] ?? props.scope}</span>
       </div>
       {error ? (
         <div class="panel">
@@ -309,8 +382,8 @@ function GraphSection(props: { scope: Scope; version: number; selected: string |
             <p class="mono">{error.message}</p>
           </div>
         </div>
-      ) : data ? (
-        <Graph data={data} selected={props.selected} onSelect={props.onSelect} focus={props.focus} onFocus={props.onFocus} onOpen={props.onOpen} />
+      ) : shown ? (
+        <Graph data={shown} selected={props.selected} onSelect={props.onSelect} focus={props.focus} onFocus={props.onFocus} onOpen={props.onOpen} />
       ) : (
         <div class="graph">
           <div class="skeleton" style={{ height: "100%", margin: "12px" }} />

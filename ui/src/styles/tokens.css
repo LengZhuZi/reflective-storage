@@ -1,0 +1,67 @@
+/* 视觉系统的唯一色值来源。组件里不许出现裸色值。
+   规范见 ui/DESIGN.md。暗色是主模式，浅色是同一套 token 的对照。 */
+
+:root {
+  color-scheme: dark;
+
+  --bg: #08090a;
+  --surface: #0e1011;
+  --surface-2: #141719;
+  --line: #1d2124;
+  --line-strong: #2a2f34;
+  --fg: #e7eaec;
+  --fg-dim: #98a1a8;
+  --fg-faint: #7d858c;      /* 4.5:1 起（AA），时间戳/id/表头都用它 */
+  --accent: #3fbf8f;
+  --on-accent: #04221a;
+  --accent-dim: rgba(63, 191, 143, 0.14);
+  --warn: #d9a25b;
+  --bad: #e0685f;
+  --info: #7ba7d9;
+  --focus-ring: #3fbf8f;
+
+  --edge: #5b656d;          /* 图谱边：按图形对象 3:1 定的（发丝线也要看得见） */
+  --edge-dim: #454e56;      /* 相似/延伸这类更弱的关系 */
+
+  --r-sm: 6px;
+  --r-md: 10px;
+  --r-lg: 14px;
+
+  --e1: 0 1px 2px rgba(0, 0, 0, 0.4), 0 6px 18px rgba(0, 0, 0, 0.28);
+  --e2: 0 12px 40px rgba(0, 0, 0, 0.55);
+
+  --font: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", "Segoe UI", system-ui, sans-serif;
+  --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, "JetBrains Mono", Consolas, monospace;
+
+  --rail: 224px;
+  --inspector: 380px;
+  --bar: 44px;
+
+  --t-hover: 140ms ease-out;
+  --t-view: 180ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+:root[data-theme="light"] {
+  color-scheme: light;
+  --bg: #f5f6f5;   /* 比 surface 略深一点：浅色下三栏的边界靠它分开 */
+  --surface: #ffffff;
+  --surface-2: #f4f5f6;
+  --line: #e6e7e9;
+  --line-strong: #d3d5d9;
+  --fg: #15181b;
+  --fg-dim: #5a626b;
+  --fg-faint: #6b727a;      /* 4.46:1 on surface-2，AA 线附近，别再用更浅的 */
+  --accent: #0f7a5a;
+  --on-accent: #ffffff;
+  --accent-dim: rgba(15, 122, 90, 0.1);
+  --warn: #8a5a10;
+  --bad: #b3261e;
+  --info: #2a5c99;
+  --focus-ring: #0f7a5a;
+  --edge: #868c93;
+  --edge-dim: #a5abb1;
+  --e1: 0 1px 2px rgba(16, 24, 32, 0.06), 0 6px 18px rgba(16, 24, 32, 0.08);
+  --e2: 0 12px 40px rgba(16, 24, 32, 0.18);
+}
+/* 主题切换：main.tsx 启动时按 localStorage → prefers-color-scheme 写 data-theme，
+   所以这里只需要两套值，不需要在 CSS 里再写一遍系统偏好媒体查询。 */

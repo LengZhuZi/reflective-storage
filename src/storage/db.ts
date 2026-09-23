@@ -259,7 +259,7 @@ export function insertMemory(o: OpenedDb, m: InsertMemory): MemoryNode {
     summary: m.summary ?? null,
     type: m.type,
     scope: m.scope,
-    scopeId: m.scopeId,
+    scopeId: m.scopeId ?? null,
     topic: m.topic ?? null,
     importance: m.importance ?? 0.5,
     decayScore: 1,

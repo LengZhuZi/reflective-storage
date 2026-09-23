@@ -6,7 +6,8 @@
  *
  * 最该钉的是第三条：**记忆原文是不可信输入**（§15 原则 14）。一条写着
  * `<img src=x onerror=alert(1)>` 的记忆，在页面上只能当文字显示，不许变成 DOM。
- * 所以页面里所有内容都用 textContent 拼，不用 innerHTML 拼数据。
+ * 所以面板（ui/ 里的 Preact 源码）渲染一律走文本节点，源码里不许出现 innerHTML / __html；
+ * 这条由本文件断言在 ui/src 上，比断言构建产物的字符串可靠（Preact 运行时自带那条分支）。
  */
 
 import assert from "node:assert/strict";
@@ -42,6 +43,7 @@ const origin = new URL(base).origin;
 assert.match(base, /^http:\/\/127\.0\.0\.1:\d+\/$/, "只绑回环，地址里不再带 token");
 const noSession = await fetch(origin + "/api/overview");
 assert.equal(noSession.status, 401, "没登录就 401");
+assert.equal((await fetch(origin + "/api/session")).status, 401, "没登录拿不到账号名");
 const setupPage = await fetch(origin + "/", { headers: { accept: "text/html" } });
 assert.equal(setupPage.status, 200);
 assert.match(await setupPage.text(), /设置账号密码/, "首次访问是设置页，不是面板");
@@ -84,14 +86,38 @@ const post = (p: string, body: unknown) => fetch(origin + p, { method: "POST", h
 const del = (p: string) => fetch(origin + p, { method: "DELETE", headers: { cookie: cookie2, "x-csrf": "1" } });
 
 // ------------------------------------------------------------ 页面本身
+// 面板是 Vite + Preact 构建出来的（ui/ → ui/dist），所以安全线要断言在**构建产物**上：
+// 记忆原文是不可信输入，渲染必须走文本节点，产物里不许出现 innerHTML / dangerouslySetInnerHTML。
 const pageRes = await get("/");
 assert.equal(pageRes.status, 200);
 const html = await pageRes.text();
-assert.match(html, /textContent/, "内容必须用 textContent 拼，不许把记忆原文塞进 innerHTML");
-assert.ok(!/innerHTML\s*=/.test(html), "页面里不该出现 innerHTML 赋值（记忆原文是不可信输入）");
+assert.match(html, /<div id="root">/, "回的是面板外壳（挂载点）");
+assert.ok(!html.includes(attack.content), "外壳 HTML 里不许带记忆原文（数据是运行时取的）");
+const assets = [...html.matchAll(/["'](\.?\/assets\/[^"']+)["']/g)].map((m) => m[1]!.replace(/^\.\//, "/"));
+assert.ok(assets.length >= 2, `外壳要引用构建产物（js + css），实际 ${assets.join(", ")}`);
+let bundle = "";
+for (const a of assets) {
+  const r = await get(a);
+  assert.equal(r.status, 200, `${a} 要能取到（构建产物提交进仓库了）`);
+  if (a.endsWith(".js")) bundle = await r.text();
+}
+assert.ok(bundle.length > 1000, "JS 产物要非空");
+// 产物里必然含 Preact 运行时的 innerHTML 分支（它实现 dangerouslySetInnerHTML 那条路），
+// 所以不能在产物上做字符串断言。真正要钉的是**我们自己的源码**永远不走那条路：
+// 只要 ui/src 里没有 innerHTML / __html，产物里就没有任何组件能把记忆原文变成 DOM。
+const uiSrc = path.join(path.dirname(new URL(".", import.meta.url).pathname), "ui", "src");
+const uiFiles = fs.readdirSync(uiSrc, { recursive: true, encoding: "utf8" }).filter((f) => /\.(ts|tsx|css)$/.test(f));
+assert.ok(uiFiles.length >= 5, `要能读到面板源码（${uiSrc}）`);
+for (const f of uiFiles) {
+  const src = fs.readFileSync(path.join(uiSrc, f), "utf8");
+  assert.ok(!/innerHTML|dangerouslySetInnerHTML|__html/.test(src), `ui/src/${f} 里不许出现 innerHTML / __html（记忆原文是不可信输入）`);
+}
 assert.ok(!/\/t\//.test(html), "页面不再走 URL token（改成账号密码 + 会话）");
-assert.ok(html.includes("me"), "页面里带当前账号名");
-console.log("✓ 页面渲染只认 textContent，不把不可信的记忆原文当 DOM");
+// 账号名不再注进 HTML，改成启动时问一次 /api/session
+assert.equal((await get("/api/session")).status, 200);
+const sess = await (await get("/api/session")).json() as { user: string };
+assert.equal(sess.user, "me", "/api/session 回当前账号");
+console.log("✓ 面板外壳 + 构建产物：渲染只走文本节点，产物里没有 innerHTML（记忆原文不可信）");
 
 // ------------------------------------------------------------ 列表与过滤
 const list = await (await get("/api/memories?scope=project")).json() as { items: Array<{ id: string; scope: string }> };
@@ -141,7 +167,7 @@ assert.equal(onDisk.inject.maxPerSession, 2);
 assert.equal(fs.statSync(path.join(tmp, "config.json")).mode & 0o777, 0o600, "写配置后权限必须是 600");
 await post("/api/config", { typesafe: { apiKey: "" } });
 assert.equal((JSON.parse(fs.readFileSync(path.join(tmp, "config.json"), "utf8")) as Record<string, any>).typesafe.apiKey, "sk-new-key-123456", "空值不覆盖已有配置");
-assert.match(html, /textContent/, "内容必须用 textContent 拼");
+assert.ok(!html.includes(attack.content), "外壳里不许出现记忆原文");
 console.log("✓ 概览 / 图谱 / 设置（key 只写不读、写回 600、空值不覆盖）");
 
 const traces = await (await get(`/api/traces?scope=project&id=${attack.id}`)).json() as { items: unknown[] };

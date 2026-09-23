@@ -155,6 +155,10 @@ node tests/ui.ts          # 本地页面
 
 自检不联网（判断引擎用假 fetch），断言风格，不用框架。
 
+面板（`ui/`）是 Vite + Preact，构建产物 `ui/dist` 提交进仓库 —— 用面板的人不需要装依赖。
+改前端：`cd ui && npm install && npm run build`（规范见 [ui/DESIGN.md](./ui/DESIGN.md)，
+真浏览器自检见 `ui/test/e2e.mjs`，它需要 playwright，所以不进 `npm test`）。
+
 真 pi 验收（临时记忆库，不动本地数据）：
 
 ```bash

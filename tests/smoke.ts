@@ -21,6 +21,10 @@ const { createJevAdapter, MAX_CANDIDATES } = await import("../src/jev/adapter.ts
 
 const o = openDb(path.join(tmp, "test.db"));
 assert.equal(o.vecEnabled, true, "sqlite-vec 应该能加载；加载不了说明 sqlite-vec 没装");
+// 两个 pi 实例（两个终端）会各持一个连接：没有 busy_timeout 的话撞上对方写库就直接报错
+const second = openDb(path.join(tmp, "test.db"));
+assert.equal(Number((o.db.prepare(`PRAGMA busy_timeout`).get() as { timeout: number }).timeout), 3000, "要设 busy_timeout，别让并发写直接失败");
+second.close();
 console.log("✓ 打开数据库 + sqlite-vec");
 
 // ---------------------------------------------------------------- 写入

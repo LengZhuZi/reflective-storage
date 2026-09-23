@@ -159,6 +159,9 @@ export function openDb(file: string): OpenedDb {
   const db = new DatabaseSync(file, { allowExtension: true });
   db.exec("PRAGMA journal_mode = WAL");
   db.exec("PRAGMA foreign_keys = ON");
+  // 两个 pi 实例同时开（比如两个终端）会各自持一个连接。没有 busy_timeout 的话，
+  // 撞上对方正在写就直接 SQLITE_BUSY 报错；等一会儿基本都能过去。
+  db.exec("PRAGMA busy_timeout = 3000");
   db.exec(SCHEMA);
 
   // 向量层可缺：缺了系统照样跑，只是召回少了语义那一路（原则 2：向量层可重建）。

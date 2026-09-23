@@ -1,10 +1,18 @@
-# PolyForm Noncommercial License 1.0.0
+# 许可说明（License） / Licensing notice
 
-Copyright (c) 2026 LQ (lq666666lucky@163.com) — the Licensor.
+本项目采用 PolyForm Noncommercial License 1.0.0 授权。这是**源码公开（source-available）**
+许可，并非 OSI 认可的开源许可。
 
-Noncommercial use only. Personal use, hobby projects, study, research and
-non-profits are fine. **Commercial use requires a separate license from the
-Licensor** — open an issue to ask.
+- **允许**：个人学习、研究、教育及非营利组织等非商业目的的免费使用、修改和分发。
+- **禁止**：任何形式的商业使用，包括但不限于在公司内部使用、集成到商业产品、提供付费服务
+  或 SaaS，均需获得单独的书面商业授权。
+- **商业授权**：GitHub Issue 咨询（勿附敏感信息），或邮件 lq666666lucky@163.com；细节私下协商。
+
+Licensor / 版权方：LQ <lq666666lucky@163.com>, 2026.
+Licensed under the PolyForm Noncommercial License 1.0.0 — free for personal, educational,
+research and non-profit use; **any commercial use requires a separate written license**.
+
+---
 
 PolyForm Noncommercial License 1.0.0
 https://polyformproject.org/licenses/noncommercial/1.0.0

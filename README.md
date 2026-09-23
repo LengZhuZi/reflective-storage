@@ -181,8 +181,15 @@ Phase 1 完成，Phase 2 大部分完成（J9–J13 生命周期、J11 合并、
 未做：J16 阈值学习、J17 多租户、Postgres/pgvector 与 Qdrant 迁移、跨设备同步。
 设计文档见 [DESIGN.md](./DESIGN.md)。
 
-## 许可
+## 许可说明（License）
 
-[PolyForm Noncommercial 1.0.0](./LICENSE)：**个人使用、学习、研究、非营利都可以**，
-**商业使用需要单独授权**（开 issue 说明用途）。这不是 OSI 认可的开源许可，属于源码公开
-（source-available）。
+本项目采用 **PolyForm Noncommercial License 1.0.0** 授权。这是一个**源码公开（source-available）**
+许可，并非 OSI 认可的开源许可。
+
+**允许**：个人学习、研究、教育及非营利组织等非商业目的的免费使用、修改和分发。
+
+**禁止**：任何形式的商业使用，包括但不限于在公司内部使用、集成到商业产品、提供付费服务
+或 SaaS 等，均需获得单独的书面商业授权。
+
+**商业授权**：如需商业使用，请通过 GitHub Issue 发起咨询（请勿在 Issue 中包含敏感信息），
+或发送邮件至 lq666666lucky@163.com。授权细节将通过私下渠道协商。

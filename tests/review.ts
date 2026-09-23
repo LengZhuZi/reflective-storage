@@ -87,6 +87,27 @@ assert.equal(get2(o, important.id)!.topic, "发布流程");
 const inTopic = o.db.prepare(`SELECT id FROM memories WHERE topic = ?`).all("发布流程") as Array<{ id: string }>;
 assert.deepEqual(inTopic.map((r) => r.id), [important.id]);
 
+// ------------------------------------------------------------ J14b：不确定就问用户（不放宽不静默）
+const { queueScopeWidening, widenScopeToGlobal, SCOPE_KEEP, SCOPE_WIDEN } = await import("../src/pipeline/review.ts");
+const narrowed = insertMemory(o, { content: "我一般喜欢用 vim 编辑", type: "preference", scope: "project", scopeId: "P", importance: 0.7 });
+assert.equal(queueScopeWidening(o, narrowed, "global").length, 1, "引擎说 global 却被收窄成 project → 要问用户");
+assert.equal(queueScopeWidening(o, insertMemory(o, { content: "项目级的就不问了", type: "fact", scope: "project", scopeId: "P" }), "project").length, 0, "引擎本来就说 project，没什么可问");
+assert.equal(queueScopeWidening(o, insertMemory(o, { content: "本来就已经是全局的", type: "preference", scope: "global", scopeId: null }), "global").length, 0);
+
+const gdb = openDb(path.join(tmp, "global-review.db"));
+const widenItem = pendingItems(o, 20).find((it) => String(it.kind) === "scope")!;
+assert.ok([SCOPE_KEEP, SCOPE_WIDEN].every((x) => JSON.parse(String(widenItem.options)).includes(x)));
+const widened = widenScopeToGlobal(o, gdb, narrowed.id);
+assert.match(widened, /全局库/);
+assert.equal(getMemory(o, narrowed.id)!.state, "superseded", "原项目级那条标成已取代（不乱删）");
+const moved = gdb.db.prepare(`SELECT scope, content FROM memories`).all() as Array<Record<string, unknown>>;
+assert.equal(moved.length, 1);
+assert.equal(moved[0].scope, "global");
+assert.equal(moved[0].content, "我一般喜欢用 vim 编辑", "内容原样搬过去");
+assert.equal(widenScopeToGlobal(o, gdb, "不存在的 id"), "那条记忆已经不在了", "目标没了也不能炸");
+gdb.close();
+console.log("✓ J14b：作用域不确定就问用户；放宽是跨库搬迁（复制 + 标已取代），不是原地改字段");
+
 // ------------------------------------------------------------ 处置
 const items = pendingItems(o, 20);
 const kinds = items.map((it) => String(it.kind));

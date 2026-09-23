@@ -23,7 +23,7 @@ import {
   type InsertMemory, type OpenedDb,
 } from "../storage/db.ts";
 import { recallCandidates } from "./recall.ts";
-import { queueAfterWrite, queueTopicNaming, type ReviewItem } from "./review.ts";
+import { queueAfterWrite, queueScopeWidening, queueTopicNaming, type ReviewItem } from "./review.ts";
 
 /** 低于这个概率就不写。实测 §4.1：明确要求记住的给出 0.86–0.89，无关内容 0.2。 */
 export const KEEP_THRESHOLD = 0.5;
@@ -234,6 +234,8 @@ export async function writeFlow(
   const review = [
     ...queueAfterWrite(target, memory, candidates, j.relation),
     ...queueTopicNaming(target, memory, topics),
+    // J14b：引擎说 global 但我们收窄了 → 问用户要不要放宽（本地版不做 LLM 复核，就问用户）
+    ...queueScopeWidening(target, memory, j.scope.choice),
   ];
 
   addTrace(target, {

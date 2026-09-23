@@ -28,7 +28,9 @@ import { splitForWrite, writeFlow } from "./src/pipeline/write.ts";
 import { recallFlow, worthRecalling } from "./src/pipeline/recall.ts";
 import { resurrectFor, runLifecycle } from "./src/pipeline/lifecycle.ts";
 import { closeFeedbackLoop } from "./src/pipeline/feedback.ts";
-import { RESOLUTION_LABELS, applyResolution, labelToResolution, pendingItems } from "./src/pipeline/review.ts";
+import {
+  RESOLUTION_LABELS, SCOPE_WIDEN, applyResolution, labelToResolution, pendingItems, widenScopeToGlobal,
+} from "./src/pipeline/review.ts";
 import { DEFAULT_MAX_TOKENS, InjectionState, MEMORY_OPEN } from "./src/pipeline/inject.ts";
 
 /** 本会话的运行时状态。每次 session_start 重建，session_shutdown 拆掉。 */
@@ -230,6 +232,16 @@ function warnProxy(r: Runtime, ctx: ExtensionContext): void {
 async function askReview(o: OpenedDb, ctx: ExtensionContext, reviewId: string): Promise<string | null> {
   const item = pendingItems(o, 50).find((it) => String(it.id) === reviewId);
   if (!item) return null;
+
+  // J14b 的放宽也走选择框，但它要跨库操作，所以单独处理（applyResolution 只碰一个库）。
+  if (String(item.kind) === "scope") {
+    const options = JSON.parse(String(item.options)) as string[];
+    const picked = await ctx.ui.select(`记忆待确认：${String(item.question)}`, options);
+    const widen = picked === SCOPE_WIDEN;
+    resolveReview(o, String(item.id), widen ? "scope:widen" : "scope:keep");
+    if (!widen) return "保持项目级";
+    return widenScopeToGlobal(o, rt!.globalDb, String(item.memory_id));
+  }
 
   // J4 的起名用文本框（要让用户输入新词），其余两个用 1/2/3 选择框。
   if (String(item.kind) === "topic") {

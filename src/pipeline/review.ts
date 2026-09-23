@@ -17,11 +17,13 @@
  */
 
 import type { MemoryNode } from "../core/types.ts";
-import type { OpenedDb } from "../storage/db.ts";
-import { addRelation, enqueueReview, pendingReviews, resolveReview, setState, type ReviewRow } from "../storage/db.ts";
+import {
+  addRelation, addTrace, enqueueReview, getMemory, insertMemory, pendingReviews, resolveReview,
+  setState, type ReviewRow,
+} from "../storage/db.ts";
 import { longestSharedRun } from "./feedback.ts";
 
-export type ReviewKind = "merge" | "conflict" | "topic";
+export type ReviewKind = "merge" | "conflict" | "topic" | "scope";
 
 /** 用户可选的处置。保留两条是最安全的默认。 */
 export const RESOLUTIONS = ["keep_both", "keep_new", "keep_old"] as const;
@@ -36,6 +38,41 @@ export const RESOLUTION_LABELS: Record<Resolution, string> = {
 export function labelToResolution(label: string): Resolution {
   const hit = (Object.entries(RESOLUTION_LABELS) as Array<[Resolution, string]>).find(([, l]) => l === label);
   return hit ? hit[0] : "keep_both";
+}
+
+/** 作用域放宽时给用户的两个选项（J14b：不确定就问用户，本地版不走 LLM 复核）。 */
+export const SCOPE_KEEP = "保持项目级（更窄）";
+export const SCOPE_WIDEN = "放宽到全局（以后哪个项目都能用）";
+
+/**
+ * J14b 的 0.5–0.8 那一档：引擎说 global 但不够确信，我们已经按更窄（project）存了。
+ *
+ * 收窄是安全方向，但代价是「本该跟着用户走的偏好被锁进一个项目」——
+ * 问一句就能纠正，所以问。**不静默收窄**：用户看不见的判断等于没做（§6.2）。
+ */
+export function queueScopeWidening(o: OpenedDb, memory: MemoryNode, engineChoice: string): ReviewItem[] {
+  if (memory.scope !== "project" || engineChoice !== "global") return [];
+  const options = [SCOPE_KEEP, SCOPE_WIDEN];
+  const question = `引擎觉得这条该是全局的（不够确信），我先按项目级存了：\n${clip(memory.content, 80)}\n要放宽到全局吗？`;
+  const id = enqueueReview(o, { kind: "scope", memoryId: memory.id, otherId: null, question, options });
+  return id ? [{ id, kind: "scope", memoryId: memory.id, otherId: null, question, options }] : [];
+}
+
+/**
+ * 放宽到全局：**跨库**，所以是「在全局库重写一条 + 把原来那条标成已取代」，
+ * 不是原地改 scope —— 原地改成 global 只会让它在本项目可见、别的项目看不见。
+ */
+export function widenScopeToGlobal(projectDb: OpenedDb, globalDb: OpenedDb, memoryId: string): string {
+  const m = getMemory(projectDb, memoryId);
+  if (!m) return "那条记忆已经不在了";
+  const moved = insertMemory(globalDb, {
+    content: m.content, type: m.type, scope: "global", scopeId: null,
+    importance: m.importance, summary: m.summary, topic: m.topic, source: m.source,
+  });
+  setState(projectDb, m.id, "superseded");
+  addTrace(globalDb, { memoryId: moved.id, stage: "governance", gate: "J14b", action: "widen", reason: "用户确认放宽到全局" });
+  addTrace(projectDb, { memoryId: m.id, stage: "governance", gate: "J14b", action: "superseded", reason: `已复制到全局库（${moved.id}）` });
+  return `已放宽到全局库（新 id ${moved.id.slice(0, 8)}）`;
 }
 
 /** 看同一件事的判据：连续 6 个以上二字组（≈7 字以上原样片段）。只用来提议。 */

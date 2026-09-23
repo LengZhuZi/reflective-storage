@@ -24,6 +24,7 @@ import {
   type InsertMemory, type OpenedDb,
 } from "../storage/db.ts";
 import { recallCandidates } from "./recall.ts";
+import { attachPaths } from "./tree.ts";
 import { SAME_THING_RUN } from "./review.ts";
 import { mergeMemories, queueAfterWrite, queueMerge, queueScopeWidening, queueTopicNaming, type ReviewItem } from "./review.ts";
 
@@ -80,6 +81,8 @@ export function normalizeForDedup(s: string): string {
 export interface TurnInput {
   /** 本轮用户说过的话，按时间顺序。 */
   userTexts: string[];
+  /** 本轮碰过的文件（来自 pi 的 tool call）。给记忆挂树路径用（tree.ts）。 */
+  paths?: string[];
   /** 供 JEV 判断用的对话上下文（可以包含助手的话，但同样要洗凭据）。 */
   context: string;
 }
@@ -224,6 +227,9 @@ export async function writeFlow(
     source: session.sessionId,
   };
   const memory = insertMemory(target, insert);
+
+  // 树路径来自**本轮碰过的文件**（pi 的 tool call 自带），不是让引擎或用户起名。
+  attachPaths(target, memory.id, input.paths ?? [], session.cwd);
 
   // 向量是加分项：编码失败不能让写入失败（原则 2：向量层可重建）。
   let vec: number[] | null = null;

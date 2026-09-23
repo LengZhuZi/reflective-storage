@@ -24,9 +24,10 @@ import type { JudgeMeta } from "../jev/types.ts";
 import { DEFAULT_RELEVANCE_THRESHOLD } from "../jev/types.ts";
 import { embed } from "../embed/encoder.ts";
 import {
-  addTrace, distinctTopics, listInScope, markAccessed, memoriesByTopic, recordRecall, searchByKeyword,
-  searchByVector, type OpenedDb,
+  addTrace, allTreePaths, distinctTopics, listInScope, markAccessed, memoriesByTopic, recordRecall,
+  searchByKeyword, searchByVector, type OpenedDb,
 } from "../storage/db.ts";
+import { pathCandidates } from "./tree.ts";
 import { bigramCoverage, bigrams } from "../jev/rule.ts";
 import { buildInjectionBlock, fitBudget } from "./inject.ts";
 
@@ -45,7 +46,7 @@ const PER_SOURCE_LIMIT = 50;
  * 看到它。所以先给每一路保底名额，再用 preScore 补满：宁可牺牲一点排序纯度，也不让某一路
  * 整体消失。
  */
-const QUOTA: ReadonlyArray<[Source, number]> = [["vector", 8], ["topic", 5], ["keyword", 3]];
+const QUOTA: ReadonlyArray<[Source, number]> = [["vector", 8], ["topic", 5], ["path", 3], ["keyword", 3]];
 
 /**
  * 短于这个长度就不值得花一次召回（"继续"、"好"）。
@@ -56,7 +57,7 @@ const QUOTA: ReadonlyArray<[Source, number]> = [["vector", 8], ["topic", 5], ["k
  */
 const MIN_PROMPT = 6;
 
-export type Source = "vector" | "keyword" | "scope" | "topic";
+export type Source = "vector" | "keyword" | "scope" | "topic" | "path";
 
 /** 候选池的一项：同一个 id 被多路召回时合并到一条。 */
 interface Candidate {
@@ -195,6 +196,15 @@ async function gather(query: string, deps: CandidateDeps): Promise<Map<string, C
     // 主题那一路只是加分项：查不到就少一路候选，不影响其他路
   }
 
+  // 路径那一路（第六路）：提问里出现文件路径（`login.ts`、`src/backend/auth`）时，
+  // 把该子树下的记忆捞进来。只认「像路径的东西」，中文自然语言不会误触发，所以不需要引擎判。
+  try {
+    for (const m of pathCandidates(deps.projectDb, query, allTreePaths(deps.projectDb), per)) remember(pool, m, "path");
+    for (const m of pathCandidates(deps.globalDb, query, allTreePaths(deps.globalDb), per)) remember(pool, m, "path");
+  } catch {
+    // 路径这一路只是加分项：查不到就少一路候选
+  }
+
   // 作用域内全部 + 近期：listInScope 就是 ORDER BY created_at DESC，
   // 所以「树遍历」和「时间过滤」是同一趟查询，不重复扫库（§10.1 的两路）。
   // session 作用域单独取一次，因为它的 scope_id 是会话而不是项目。
@@ -234,7 +244,7 @@ function preScore(c: Candidate, now: number, query: string): number {
   return 0.3 * c.vectorSim
     + 0.25 * lexical                            // 字面对得上：一堆近似记忆里唯一能分开它们的本地信号
     + 0.1 * (c.sources.has("keyword") ? 1 : 0)
-    + 0.15 * (c.sources.has("topic") ? 1 : 0)   // 主题是人起的名，命中一次比关键词更值钱
+    + 0.15 * (c.sources.has("topic") || c.sources.has("path") ? 1 : 0)   // 主题/路径命中：确定性的分组
     + 0.15 * c.memory.importance
     + 0.05 * recency(c.memory, now);
 }

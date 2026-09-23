@@ -21,8 +21,8 @@ import { createJudgeAdapter, type JevAdapter } from "./src/jev/adapter.ts";
 import { loadConfig, proxyHint, type InjectConfig, type RecallWeights } from "./src/config.ts";
 import {
   addTrace, countMemories, countPendingReviews, distinctTopics, getMemory, hardDelete, listInScope,
-  openGlobalDb, openProjectDb, projectIdFor, recentRecalls, resolveReview, setTopic, tracesFor,
-  type OpenedDb,
+  listRegistry, openGlobalDb, openProjectDb, projectIdFor, recentRecalls, refreshRegistry, resolveReview,
+  setTopic, tracesFor, type OpenedDb,
 } from "./src/storage/db.ts";
 import { splitForWrite, writeFlow } from "./src/pipeline/write.ts";
 import { recallFlow, worthRecalling } from "./src/pipeline/recall.ts";
@@ -45,6 +45,8 @@ interface Runtime {
   pending: Promise<unknown>;
   /** 本会话已经消化过的用户原话，防同一句被评估两次。 */
   digested: Set<string>;
+  /** 本会话碰过的文件（来自 tool call）—— 给记忆挂树路径用。 */
+  touched: Set<string>;
   /** 本会话的注入策略（config.inject）。 */
   inject: InjectConfig;
   /** §10.2 的混合排序权重。 */
@@ -320,6 +322,7 @@ export default function reflectiveStorage(pi: ExtensionAPI): void {
       state: new InjectionState(),
       pending: Promise.resolve(),
       digested: new Set<string>(),
+      touched: new Set<string>(),
       configProblems: [...loaded.problems, ...judge.problems],
       cleanup: loaded.lifecycle,
     };
@@ -328,6 +331,14 @@ export default function reflectiveStorage(pi: ExtensionAPI): void {
     const pending = countPendingReviews(projectDb);
     if (pending > 0 && ctx.hasUI) {
       ctx.ui.notify(`reflective-storage：有 ${pending} 条记忆等你确认（合并 / 冲突），/memory review`, "info");
+    }
+
+    // 项目注册表（跨项目的入口层）：内容是**派生**出来的（主题 / 条数 / 最近几条标题），
+    // 刷新它不花一次判断调用。存在 global.db —— 所有项目的会话都看得到它。
+    try {
+      refreshRegistry(globalDb, projectDb, rt.session.projectId, ctx.cwd);
+    } catch (e) {
+      rt.error = errText(e);
     }
 
     // 懒生命周期（§9.3）：没有定时任务，就挂在 session_start 上跑一次，且有上限。
@@ -452,8 +463,10 @@ export default function reflectiveStorage(pi: ExtensionAPI): void {
         // 同一条，类型和作用域只能选一个 —— 用户偏好被锁进单个项目就再也跟不走了。
         const pieces = splitForWrite(texts);
         let firstReviewId: string | null = null;
+        const touched = [...r.touched];
+        r.touched.clear();
         for (const piece of pieces) {
-          const res = await writeFlow(r.projectDb, r.globalDb, r.adapter, r.session, { userTexts: [piece], context });
+          const res = await writeFlow(r.projectDb, r.globalDb, r.adapter, r.session, { userTexts: [piece], context, paths: touched });
           r.lastWrite = { action: res.action, reason: res.reason, at: Date.now() };
           if (res.status === "unavailable") warnProxy(r, ctx);
           firstReviewId ??= res.review?.[0]?.id ?? null;
@@ -463,6 +476,22 @@ export default function reflectiveStorage(pi: ExtensionAPI): void {
         if (firstReviewId && ctx.hasUI) await askReview(r.projectDb, ctx, firstReviewId);
       })
       .catch((e) => { r.error = errText(e); });
+  });
+
+  // 碰过的文件 = 树路径的来源（pi 的 tool call 自带路径，零生成、零追问）
+  pi.on("tool_call", async (event) => {
+    const r = rt;
+    if (!r) return;
+    const input = (event as { input?: Record<string, unknown> }).input ?? {};
+    for (const key of ["path", "file_path", "filePath", "file", "notebook_path"]) {
+      const v = input[key];
+      if (typeof v === "string" && v) r.touched.add(v);
+    }
+    for (const key of ["paths", "files"]) {
+      const v = input[key];
+      if (Array.isArray(v)) for (const x of v) if (typeof x === "string" && x) r.touched.add(x);
+    }
+    return;
   });
 
   // J16 主动召回（§4）：用户没问、但库里有一条他现在就该知道的。
@@ -640,7 +669,7 @@ export default function reflectiveStorage(pi: ExtensionAPI): void {
   });
 
   pi.registerCommand("memory", {
-    description: "长期记忆 /memory：状态、search <词>、why <id>、review（待确认）、topic <名>、topics、ui（网页面板）、forget <id>",
+    description: "长期记忆 /memory：状态、search <词>、why <id>、review（待确认）、topic <名>、topics、projects（项目注册表）、ui（网页面板）、forget <id>",
     handler: async (args: string, ctx: ExtensionContext) => {
       const r = rt;
       if (!r) {
@@ -713,6 +742,17 @@ export default function reflectiveStorage(pi: ExtensionAPI): void {
         } catch (e) {
           ctx.ui.notify(`页面起不来：${errText(e)}`, "error");
         }
+        return;
+      }
+
+      if (sub === "projects") {
+        const rows = listRegistry(r.globalDb);
+        ctx.ui.notify(
+          rows.length
+            ? `项目注册表（${rows.length}）：\n${rows.map((x) => `${x.projectId}：${x.count} 条${x.topics.length ? `，主题 ${x.topics.slice(0, 5).join("/")}` : ""}`).join("\n")}`
+            : "注册表还是空的（会话开始时自动刷新）",
+          "info",
+        );
         return;
       }
 

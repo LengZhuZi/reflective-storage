@@ -71,6 +71,30 @@ CREATE TABLE IF NOT EXISTS reflection_traces (
 );
 CREATE INDEX IF NOT EXISTS idx_traces_created ON reflection_traces(created_at DESC);
 
+-- 记忆树链接（DESIGN §7.1）。目前只用 path 这一棵树：pi 的 tool call 自带文件路径，
+-- 直接拿它当树的路径，零生成、零追问、跟代码结构天然一致。
+CREATE TABLE IF NOT EXISTS memory_tree_links (
+  memory_id       TEXT NOT NULL,
+  tree_name       TEXT NOT NULL,
+  parent_id       TEXT,
+  path            TEXT,
+  position        INTEGER,
+  PRIMARY KEY (memory_id, tree_name, parent_id)
+);
+CREATE INDEX IF NOT EXISTS idx_tree_path ON memory_tree_links(tree_name, path);
+
+-- 项目注册表（跨项目的入口层）。放 global.db —— 所有项目的会话都能看到它。
+-- 内容是**派生**出来的（主题清单 / 条数 / 最近几条标题），不需要引擎生成，
+-- 所以刷新它不花一次判断调用。
+CREATE TABLE IF NOT EXISTS project_registry (
+  project_id      TEXT PRIMARY KEY,
+  dir             TEXT,
+  topics          TEXT,
+  memory_count    INTEGER,
+  recent          TEXT,
+  updated_at      INTEGER
+);
+
 -- 待确认队列（§6 的「<0.5 交用户确认」+ §9.3 的合并）。
 -- 引擎不确定的事不替用户拍，也不装没看见：排队，等用户过一遍。
 CREATE TABLE IF NOT EXISTS review_queue (
@@ -554,6 +578,76 @@ export function staleSessionMemories(o: OpenedDb, days: number, now: number): st
     )
     .all(cutoff) as Row[];
   return rows.map((r) => String(r.id));
+}
+
+// ---------------------------------------------------------------- 记忆树 / 项目注册表
+
+/** 给一条记忆挂上树路径（同一棵树、同一个路径不重复挂）。 */
+export function linkPath(o: OpenedDb, memoryId: string, path: string, treeName = "path"): void {
+  o.db
+    .prepare(`INSERT OR IGNORE INTO memory_tree_links (memory_id, tree_name, parent_id, path, position) VALUES (?,?,?,?,?)`)
+    .run(memoryId, treeName, path, path, 0);
+}
+
+/** 某个路径前缀下的记忆（子树查询：物化路径 + LIKE，不用递归）。 */
+export function memoriesUnderPath(o: OpenedDb, prefix: string, limit = 30): MemoryNode[] {
+  const rows = o.db
+    .prepare(
+      `SELECT m.* FROM memory_tree_links l JOIN memories m ON m.id = l.memory_id
+        WHERE l.tree_name = 'path' AND l.path LIKE ? AND m.state IN ('active','cold')
+        ORDER BY COALESCE(m.last_accessed, m.created_at) DESC, m.rowid DESC LIMIT ?`,
+    )
+    .all(`${prefix}%`, limit) as Row[];
+  return rows.map(toNode);
+}
+
+/** 库里现有的所有树路径（路径那一路召回的匹配对象）。 */
+export function allTreePaths(o: OpenedDb, limit = 200): string[] {
+  const rows = o.db
+    .prepare(`SELECT DISTINCT path FROM memory_tree_links WHERE tree_name = 'path' ORDER BY length(path) ASC LIMIT ?`)
+    .all(limit) as Row[];
+  return rows.map((r) => String(r.path));
+}
+
+export function pathsFor(o: OpenedDb, memoryId: string): string[] {
+  const rows = o.db
+    .prepare(`SELECT path FROM memory_tree_links WHERE memory_id = ? AND tree_name = 'path'`)
+    .all(memoryId) as Row[];
+  return rows.map((r) => String(r.path));
+}
+
+/**
+ * 刷新一个项目的注册表行（派生：条数 / 主题 / 最近几条标题）。
+ * `registryDb` 是放注册表的那个库（global.db），`projectDb` 是被描述的项目库 ——
+ * 两个库不一样：注册表全项目共用，而条数和主题必须从**那个项目自己的库**里数。
+ */
+export function refreshRegistry(registryDb: OpenedDb, projectDb: OpenedDb, projectId: string, dir: string): void {
+  const count = countMemories(projectDb);
+  const topics = distinctTopics(projectDb, 20);
+  const recent = (projectDb.db
+    .prepare(`SELECT content FROM memories WHERE state IN ('active','cold') ORDER BY created_at DESC, rowid DESC LIMIT 3`)
+    .all() as Row[]).map((r) => String(r.content).slice(0, 60));
+  registryDb.db
+    .prepare(
+      `INSERT INTO project_registry (project_id, dir, topics, memory_count, recent, updated_at)
+       VALUES (?,?,?,?,?,?)
+       ON CONFLICT(project_id) DO UPDATE SET dir=excluded.dir, topics=excluded.topics,
+         memory_count=excluded.memory_count, recent=excluded.recent, updated_at=excluded.updated_at`,
+    )
+    .run(projectId, dir, JSON.stringify(topics), count, JSON.stringify(recent), Date.now());
+}
+
+export function listRegistry(o: OpenedDb): Array<{ projectId: string; dir: string; topics: string[]; count: number; recent: string[] }> {
+  const rows = o.db
+    .prepare(`SELECT project_id, dir, topics, memory_count, recent FROM project_registry ORDER BY project_id`)
+    .all() as Row[];
+  return rows.map((r) => ({
+    projectId: String(r.project_id),
+    dir: String(r.dir ?? ""),
+    topics: JSON.parse(String(r.topics ?? "[]")) as string[],
+    count: Number(r.memory_count ?? 0),
+    recent: JSON.parse(String(r.recent ?? "[]")) as string[],
+  }));
 }
 
 /** 读回某条记忆的向量（合并判重时算余弦用）。向量层没开或没存过就返回 null。 */

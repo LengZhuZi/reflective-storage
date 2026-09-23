@@ -40,6 +40,7 @@ src/pipeline/inject.ts  注入块组装与「每会话只注入一次」的状�
 src/pipeline/lifecycle.ts 生命周期：J10 衰减 / J9 巩固 / J12 归档 / J13 复活（纯后台）
 src/pipeline/feedback.ts  J15 事后核对：注入的记忆有没有真被用上（纯本地字符串比对）
 src/pipeline/review.ts    待确认队列：低置信冲突 + 合并提议，问用户来拍（pi 的 1/2/3 选择）
+src/pipeline/tree.ts      记忆树（path 树，路径来自 tool call）+ 项目注册表的读写
 src/ui/server.ts          本地网页面板（/memory ui）：列记忆、看轨迹、复核、删除
 ```
 
@@ -77,6 +78,7 @@ node tests/lifecycle.ts   # J10 衰减公式、J9 巩固、J12 归档（高 impo
 node tests/feedback.ts    # J15 事后核对：确凿用上的判定、换了说法的盲区、空回复不覆盖
 node tests/review.ts      # 待确认队列：只提议不动数据、三种处置、被取代的不再召回
 node tests/ui.ts          # 本地页面：token 403、转义不 innerHTML、过滤、复核、删除
+node tests/tree.ts        # 记忆树：路径规整/挂载/子树查询/第六路召回 + 项目注册表
 node tests/write.ts       # 写入流程：预筛、脱敏、作用域分流、fail-open
 node tests/recall.ts      # 召回流程：门禁、阈值、fail-degraded、fail-closed、预算
 node tests/inject.ts      # 注入块：声明、转义、预算截断、状态机
@@ -190,7 +192,7 @@ localhost）。页面上能按状态/主题过滤、展开「为什么记住」�
 | 引擎在已有主题里挑不出主题、而这条又够重要 | 要不要起个主题 | 输入名字 / 留空跳过 |
 | 引擎给的冲突/取代关系**置信度 < 0.5** | 怎么处理 | 同上 |
 
-只改状态、记关系，**不硬删**。一轮最多问一条；`/memory review` 可以把攒下的一次过；`/memory topics` 看主题、`/memory topic <名>` 看某个主题下的记忆；
+只改状态、记关系，**不硬删**。一轮最多问一条；`/memory review` 可以把攒下的一次过；`/memory topics` 看主题、`/memory topic <名>` 看某个主题下的记忆、`/memory projects` 看项目注册表；
 `print` 模式不弹窗，只排队。
 
 ## 状态

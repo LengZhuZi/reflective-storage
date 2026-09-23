@@ -201,6 +201,27 @@ assert.ok(
 );
 console.log("✓ agent_end 只取用户自己的话，重复的那句不会被评估两次；上下文带上前几轮");
 
+// ------------------------------------------------------------ 树路径来自 tool call
+// pi 的 tool call 自带文件路径 —— 记忆的树路径就是这么来的（零生成、零追问）。
+// 先跑一次带路径的 tool_call，再让 agent_end 写一条，看它挂没挂上。
+await call("tool_call", { toolName: "edit", input: { path: "src/auth/login.ts" } });
+await call("agent_end", {
+  messages: [{ role: "user", content: "登录校验必须走 OIDC，别自己解析 token" }],
+});
+for (let i = 0; i < 100; i++) {
+  if ((seed.db.prepare(`SELECT count(*) c FROM memory_tree_links`).get() as { c: number }).c > 0) break;
+  await new Promise((r) => setTimeout(r, 30));
+}
+{
+  const check = openDb(dbFile);
+  const { pathsFor } = await import("../src/storage/db.ts");
+  const rows = check.db.prepare(`SELECT memory_id FROM memory_tree_links`).all() as Array<{ memory_id: string }>;
+  assert.ok(rows.length >= 1, "碰过的文件要变成记忆的树路径");
+  assert.deepEqual(pathsFor(check, rows[0].memory_id), ["/src/auth/login"], "路径相对化 + 去扩展名");
+  check.close();
+}
+console.log("✓ 树路径来自 tool call（相对化 + 去扩展名）");
+
 // 落库后排队的合并提议（看着是同一件事）会在 agent_end 之后问用户一次 ——
 // pi 的 1/2/3 选择框，不弹第二个（一轮最多问一条，剩下的 /memory review 过）。
 for (let i = 0; i < 100 && selects.length + inputs.length === 0; i++) await new Promise((r) => setTimeout(r, 50));
@@ -314,7 +335,7 @@ console.log("✓ J16 主动召回：agent_settled 后提醒一句（notify 不�
 await call("session_shutdown");
 globalThis.fetch = realFetch;
 const after = openDb(dbFile);
-assert.equal(countMemories(after), before + 1, "session_shutdown 必须把后台写入冲刷落地");
+assert.ok(countMemories(after) >= before + 1, "session_shutdown 必须把后台写入冲刷落地");
 const contents = (after.db.prepare(`SELECT content FROM memories`).all() as Array<{ content: string }>).map((r) => r.content);
 assert.ok(!contents.some((c) => c.includes("retrieved-memories")), "注入块不能被当成用户的话写回库");
 assert.ok(contents.some((c) => c.includes("Flyway")), "用户那句该被写进去");

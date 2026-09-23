@@ -18,7 +18,7 @@
 
 import type { MemoryNode, MemoryType } from "../core/types.ts";
 import type { OpenedDb } from "../storage/db.ts";
-import { addTrace, listByStates, updateLifecycle } from "../storage/db.ts";
+import { addTrace, hardDelete, listByStates, staleSessionMemories, updateLifecycle } from "../storage/db.ts";
 import { bigrams } from "../jev/rule.ts";
 
 /** 每种记忆的衰减参数。λ = 每天的自然衰减率，半衰期 = ln2/λ。 */
@@ -43,6 +43,13 @@ export interface LifecycleOptions {
   now?: number;
   /** 一次最多处理多少条（§9.3：避免拖慢启动）。 */
   maxRows?: number;
+  /**
+   * 自动清理（§9 的收尾）：`scope='session'` 且超过 `purgeAfterDays` 天没被召回
+   * 命中过的记忆**直接销毁**。默认 false —— 删除不可逆，绝不默认开。
+   */
+  autoCleanup?: boolean;
+  /** 多少天没命中就销毁，默认 90。 */
+  purgeAfterDays?: number;
 }
 
 export interface LifecycleSummary {
@@ -50,6 +57,8 @@ export interface LifecycleSummary {
   promoted: number;
   decayed: number;
   archived: number;
+  /** 被自动清理销毁的 session 记忆条数（autoCleanup 关着时恒为 0）。 */
+  purged: number;
   errors: string[];
 }
 
@@ -70,7 +79,25 @@ const daysSince = (m: MemoryNode, now: number) => (now - (m.lastAccessed ?? m.cr
 export function runLifecycle(o: OpenedDb, opts: LifecycleOptions = {}): LifecycleSummary {
   const now = opts.now ?? Date.now();
   const maxRows = opts.maxRows ?? 200;
-  const summary: LifecycleSummary = { scanned: 0, promoted: 0, decayed: 0, archived: 0, errors: [] };
+  const summary: LifecycleSummary = { scanned: 0, promoted: 0, decayed: 0, archived: 0, purged: 0, errors: [] };
+
+  // 自动清理：只碰 session 作用域，而且默认关（删除不可逆）。
+  if (opts.autoCleanup) {
+    const days = opts.purgeAfterDays ?? 90;
+    try {
+      for (const id of staleSessionMemories(o, days, now)) {
+        // 先留痕再删：删完这一行就查不到了，理由得留在 traces 里。
+        addTrace(o, {
+          stage: "lifecycle", gate: "J12", action: "delete", memoryId: id,
+          reason: `session 记忆 ${days} 天没被命中，自动清理`, status: "ok",
+        });
+        hardDelete(o, id);
+        summary.purged++;
+      }
+    } catch (e) {
+      summary.errors.push(`自动清理失败：${(e as Error).message}`);
+    }
+  }
 
   let rows: MemoryNode[];
   try {

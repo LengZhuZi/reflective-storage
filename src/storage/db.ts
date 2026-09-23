@@ -512,6 +512,25 @@ export function listByStates(o: OpenedDb, states: readonly MemoryState[], limit 
   return rows.map(toNode);
 }
 
+/**
+ * 找出「很久没被召回命中过」的 session 记忆的 id。
+ *
+ * 只看 `scope='session'`：global / project 记忆走归档那条软路，不在这里销毁。
+ * 「没命中过」的判据是 `last_accessed`（召回注入时才会更新），从没命中过就用 `created_at`。
+ */
+export function staleSessionMemories(o: OpenedDb, days: number, now: number): string[] {
+  const cutoff = now - days * 86400000;
+  const rows = o.db
+    .prepare(
+      `SELECT id FROM memories
+        WHERE scope = 'session' AND state != 'deleted'
+          AND COALESCE(last_accessed, created_at) < ?
+        ORDER BY COALESCE(last_accessed, created_at) ASC`,
+    )
+    .all(cutoff) as Row[];
+  return rows.map((r) => String(r.id));
+}
+
 /** 生命周期只改这三个字段，单独开一个写入口，免得 SQL 散在各个 pipeline 里。 */
 export function updateLifecycle(
   o: OpenedDb,

@@ -122,6 +122,7 @@ notes.length = 0;
 await runCommand("");
 assert.match(notes.at(-1)!, /注入：.*2 次/, "/memory 要能看出本会话注入过几次、上限是多少");
 assert.match(notes.at(-1)!, /注入策略：每会话最多 3 次/, "策略本身也要看得见");
+assert.match(notes.at(-1)!, /自动清理：关/, "自动清理开没开必须看得见（默认关，删除不可逆）");
 await call("session_compact");
 const afterCompact = await call("before_agent_start", { prompt: PROMPT }) as { message: unknown } | undefined;
 assert.ok(afterCompact?.message, "压缩把注入块带走了，所以压缩后要允许重新注入");

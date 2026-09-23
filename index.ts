@@ -51,6 +51,8 @@ interface Runtime {
   /** 代理没生效时的提示文本（配了代理但启动时没开 NODE_USE_ENV_PROXY）。只在真失败时提示一次。 */
   proxyHint: string | null;
   proxyWarned?: boolean;
+  /** 生命周期里的自动清理设置（/memory 要能看见它开没开、多少天）。 */
+  cleanup: { autoCleanup: boolean; sessionTtlDays: number };
   /** query 存着给 J5 用：下次它要判断「这个提问还是上次那件事吗」。 */
   lastRecall?: { status: JudgeMeta["status"] | "skipped"; candidates: number; injected: number; detail?: string; query?: string; at: number };
   lastWrite?: { action: string; reason?: string; at: number };
@@ -179,6 +181,7 @@ function statusText(r: Runtime): string {
     `本会话注入：${r.state.doneThisSession ? `${r.state.injectedIds.size} 条 / ${r.state.injectionCount} 次` : "未注入"}`,
     `注入策略：每会话最多 ${r.inject.maxPerSession} 次，间隔 ≥${r.inject.minTurnsBetween} 轮，换话题才再注入`,
     `判断引擎：${r.engine}`,
+    `自动清理：${r.cleanup.autoCleanup ? `开（session 记忆 ${r.cleanup.sessionTtlDays} 天没命中就销毁）` : "关（session 记忆只归档不销毁）"}`,
   ];
   const lr = r.lastRecall;
   if (lr) lines.push(`上次召回：${label(lr.status)}，候选 ${lr.candidates} → 注入 ${lr.injected}${lr.detail ? `（${lr.detail}）` : ""}`);
@@ -284,6 +287,7 @@ export default function reflectiveStorage(pi: ExtensionAPI): void {
       pending: Promise.resolve(),
       digested: new Set<string>(),
       configProblems: [...loaded.problems, ...judge.problems],
+      cleanup: loaded.lifecycle,
     };
 
     // 有待确认的事项就在启动时说一声（不弹窗：一次弹五个对话框比不问更糟）。
@@ -297,8 +301,14 @@ export default function reflectiveStorage(pi: ExtensionAPI): void {
     const lifecycle = rt;
     void Promise.resolve()
       .then(() => {
-        const s = runLifecycle(lifecycle.projectDb);
-        runLifecycle(lifecycle.globalDb);
+        const s = runLifecycle(lifecycle.projectDb, {
+          autoCleanup: lifecycle.cleanup.autoCleanup,
+          purgeAfterDays: lifecycle.cleanup.sessionTtlDays,
+        });
+        runLifecycle(lifecycle.globalDb, {
+          autoCleanup: lifecycle.cleanup.autoCleanup,
+          purgeAfterDays: lifecycle.cleanup.sessionTtlDays,
+        });
         if (s.errors.length) lifecycle.error = `生命周期：${s.errors[0]}`;
       })
       .catch((e) => { lifecycle.error = `生命周期：${errText(e)}`; });

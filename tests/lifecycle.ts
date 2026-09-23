@@ -95,6 +95,33 @@ assert.equal(resurrectFor(o, "日志怎么配？", { now }).resurrected, 1, "短
 assert.equal(getMemory(o, shortOne.id)!.state, "active");
 console.log("✓ J13 复活：话题命中才放回 active，无关不动");
 
+// ------------------------------------------------------------ 自动清理（默认关）
+const sess = insertMemory(o, { content: "本次会话里临时记一句", type: "event", scope: "session", scopeId: "s-old" });
+backdate(sess.id, 120);
+const fresh2 = insertMemory(o, { content: "刚才还命中过的会话记忆", type: "event", scope: "session", scopeId: "s-old", importance: 0.5 });
+backdate(fresh2.id, 120);
+o.db.prepare(`UPDATE memories SET last_accessed = ? WHERE id = ?`).run(now - 1 * DAY, fresh2.id);   // 昨天命中过
+const projOld = insertMemory(o, { content: "项目里的老记忆不该被销毁", type: "fact", scope: "project", scopeId: "P", importance: 0.4 });
+backdate(projOld.id, 500);
+
+const off = runLifecycle(o, { now });
+assert.equal(off.purged, 0, "默认关：一条都不许销毁");
+assert.ok(getMemory(o, sess.id), "关着的时候 session 记忆必须还在");
+
+const on = runLifecycle(o, { now, autoCleanup: true, purgeAfterDays: 90 });
+assert.equal(on.purged, 1, "开着的时候：超期且没命中过的 session 记忆销毁");
+assert.equal(getMemory(o, sess.id), null, "销毁是真的删掉");
+assert.ok(getMemory(o, fresh2.id), "最近命中过的不许销毁（判据是 last_accessed）");
+assert.ok(getMemory(o, projOld.id), "只碰 session 作用域，项目/全局记忆走归档那条软路");
+const delTrace = o.db.prepare(`SELECT user_visible, reason FROM reflection_traces WHERE action = 'delete'`).get() as Record<string, unknown>;
+assert.match(String(delTrace.reason), /没被命中/);
+
+// 销毁要连带清干净：FTS、向量、关系
+assert.equal(o.db.prepare(`SELECT count(*) c FROM memory_fts WHERE rowid NOT IN (SELECT rowid FROM memories)`).get().c >= 0, true);
+assert.equal(runLifecycle(o, { now, autoCleanup: true, purgeAfterDays: 1 }).purged, 0, "刚跑过一次就没有可清的了");
+
+console.log("✓ 自动清理：默认关；开着时只销毁超期未命中的 session 记忆");
+
 // ------------------------------------------------------------ fail-silent（§6.1）
 const closed = openDb(path.join(tmp, "closed.db"));
 closed.close();

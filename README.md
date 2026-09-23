@@ -118,7 +118,9 @@ sqlite3 $D/projects/*.db "select content,type,scope from memories; select gate,a
 | `REFLECTIVE_JUDGE_TIMEOUT_MS` / `_WRITE_TIMEOUT_MS` | 交互路径 / 写入路径超时，缺省 2500 / 8000。本地模型要调大 |
 | `REFLECTIVE_JUDGE_THRESHOLD` | 相关性阈值，缺省 0.7。本地小模型分数普遍偏低时调小 |
 
-行为开关只放配置文件（环境变量留给凭据和端点）：`inject.maxPerSession`（缺省 3，设 1 = 每会话只注入一次）、`inject.minTurnsBetween`（缺省 3）。这两个只管机械约束；「这个提问是不是刚才那件事」由 J5 判断（引擎说了算，不让本地规则兼职）。
+行为开关只放配置文件（环境变量留给凭据和端点）：`lifecycle.autoCleanup`（缺省 `false`）、`lifecycle.sessionTtlDays`（缺省 90）、`inject.maxPerSession`（缺省 3，设 1 = 每会话只注入一次）、`inject.minTurnsBetween`（缺省 3）。后两个只管机械约束；「这个提问是不是刚才那件事」由 J5 判断（引擎说了算，不让本地规则兼职）。
+
+`lifecycle.autoCleanup` 打开之后：`scope='session'` 且超过 `sessionTtlDays` 天没被召回命中过的记忆**直接销毁**（不是归档）。删除不可逆，所以默认关；`/memory` 里能看到它开没开。
 | `REFLECTIVE_PROXY` | 代理地址，等价于配置文件里的 `proxy.http` |
 | `HTTP_PROXY` / `HTTPS_PROXY` | JEV 端点需要代理时用，配合下面的开关 |
 | `NODE_USE_ENV_PROXY=1` | **必需**（要用代理时）。Node 的内置 fetch 默认不读代理变量，且必须在启动进程前设置 —— 进程内改无效 |

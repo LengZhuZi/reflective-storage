@@ -55,8 +55,21 @@ export interface LoadedConfig {
   config: JevConfig;
   judge: JudgeConfig;
   inject: InjectConfig;
+  lifecycle: LifecycleConfig;
   /** 读取时发现的问题。降级时必须把这些说出去，不能静默（§6.2）。 */
   problems: string[];
+}
+
+/**
+ * 生命周期开关（§9）。
+ *
+ * **删除是不可逆的，所以自动清理默认关**。打开之后：`scope='session'` 且超过
+ * `sessionTtlDays` 天没被召回命中过的记忆直接销毁（不是归档）。
+ * 只碰 session 作用域 —— global / project 记忆的清理仍走归档那条软路。
+ */
+export interface LifecycleConfig {
+  autoCleanup: boolean;
+  sessionTtlDays: number;
 }
 
 /** 注入策略（§8.3）。只管机械约束（次数上限、隔多少轮）；「是不是同一话题」归 J5。 */
@@ -107,7 +120,20 @@ export function loadConfig(): LoadedConfig {
   const timeout = typesafe.timeoutMs;
   if (typeof timeout === "number" && timeout > 0) config.timeoutMs = timeout;
 
-  return { config, judge: resolveJudge(judge, config), inject: resolveInject(file?.inject), problems };
+  return {
+    config,
+    judge: resolveJudge(judge, config),
+    inject: resolveInject(file?.inject),
+    lifecycle: resolveLifecycle(file?.lifecycle),
+    problems,
+  };
+}
+
+/** 生命周期开关。同样只从配置文件读。 */
+function resolveLifecycle(raw: unknown): LifecycleConfig {
+  const file = (raw ?? {}) as Record<string, unknown>;
+  const days = typeof file.sessionTtlDays === "number" && file.sessionTtlDays >= 1 ? Math.floor(file.sessionTtlDays) : 90;
+  return { autoCleanup: file.autoCleanup === true, sessionTtlDays: days };
 }
 
 /** 注入策略。只从配置文件读 —— 行为开关放文件里，环境变量留给凭据和端点。 */

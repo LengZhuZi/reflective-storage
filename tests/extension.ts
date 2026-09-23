@@ -350,17 +350,13 @@ after.close();
 seed.close();
 console.log("✓ session_shutdown 冲刷待写队列，注入块没被写回库；J16 提醒留痕");
 
-// ------------------------------------------------------------ 没配 key：默认 rules 档
-// 这一档存在的理由：对别的用户来说，「没配 key 就什么都不发生」等于没装这个扩展。
+// ------------------------------------------------------------ 没配 key：不启动（硬要求）
 delete process.env.TYPESAFE_API_KEY;
 await call("session_start");
 notes.length = 0;
 await runCommand("");
-assert.match(notes.at(-1)!, /判断引擎：rules/, "没 key 时默认档是纯规则，不是「装了没反应」");
-assert.match(notes.at(-1)!, /按 rules/, "走到 rules 的原因要说清");
-assert.match(notes.at(-1)!, /配置：.*配置文件不存在/, "配置来源的问题要能在 /memory 直接看到（600 权限也是这么被发现的）");
-await call("session_shutdown");
-console.log("✓ 没配 key：默认走 rules 档，/memory 说清为什么");
+assert.match(notes.at(-1)!, /记忆库未打开/, "没有判断模型时 /memory 要说不出来话（扩展没启动）");
+console.log("✓ 没有判断模型：不启动（不做规则档降级）");
 
 // ------------------------------------------------------------ 引擎真失败：fail-closed
 // 引擎连不上 + 配了代理但没开 NODE_USE_ENV_PROXY → 提示一次（网络正常时不许误报，见下）

@@ -334,6 +334,18 @@ export default function reflectiveStorage(pi: ExtensionAPI): void {
       ctx.ui.notify(`reflective-storage 判断引擎配置：\n${judge.problems.join("\n")}`, "warning");
     }
 
+    // 判断模型是硬要求（跟跑 Java 要 JDK 一样）：没有就**不启动**，把原因说清楚，
+    // 所有 hook 直接返回 —— 不做「退化成规则引擎」那种降级档位。
+    if (!judge.ready) {
+      const why = judge.problems.join("；") || "没有可用的判断模型";
+      projectDb.close();
+      globalDb.close();
+      rt = null;
+      if (ctx.hasUI) ctx.ui.notify(`reflective-storage 未启动：${why}\n（判断模型是硬要求，配好后重启 pi）`, "error");
+      else console.error(`[reflective-storage] 未启动：${why}`);
+      return;
+    }
+
     rt = {
       projectDb,
       globalDb,

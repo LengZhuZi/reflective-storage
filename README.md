@@ -2,14 +2,14 @@
 
 pi 的本地长期记忆扩展。
 
-写入时判断值不值得记，召回时判断该不该用，不用了会自己衰减、归档、遗忘。全部数据在
-本机 SQLite 文件里，不联网也能跑。
+写入时判断值不值得记，召回时判断该不该用，不用了会自己衰减、归档、遗忘。记忆存在本机
+SQLite 文件里，判断走一个判断模型（必须有，见下）。
 
 ## 特性
 
 - 自动写入：不用喊「记住」。说完一轮，值钱的那句自己进库
 - 自动召回：会话首轮和新话题开始时，把相关的旧记忆追加在上下文尾部
-- 判断可换：JEV / 任意 OpenAI 兼容端点 / 纯规则（零配置、离线）
+- 判断模型可换：同类判断模型（按类型化问题打分）实现一个 `ask` 就能接
 - 作用域隔离：一个项目一个库，SQL 层硬过滤，跨项目引用要显式点名
 - 生命周期：巩固、衰减、归档、复活；session 记忆可配自动清理
 - 人工兜底：拿不准的（合并、冲突、起主题）排队问你，不替你拍
@@ -63,7 +63,7 @@ bash scripts/fetch-model.sh       # 本地 embedding 模型 24MB，拉一次
 ```json
 {
   "typesafe":  { "apiKey": "...", "baseUrl": "https://api.typesafe.ai", "model": "jev-latest" },
-  "judge":     { "provider": "openai", "baseUrl": "http://localhost:11434/v1", "model": "qwen3:8b" },
+  "judge":     { "provider": "jev", "model": "jev-latest" },
   "proxy":     { "http": "http://127.0.0.1:7897" },
   "inject":    { "maxPerSession": 5, "minTurnsBetween": 1 },
   "recall":    { "weights": { "relevance": 0.55, "vector": 0.15, "topic": 0.1, "importance": 0.15, "recency": 0.05 },
@@ -78,7 +78,7 @@ bash scripts/fetch-model.sh       # 本地 embedding 模型 24MB，拉一次
 | --- | --- |
 | `TYPESAFE_API_KEY` | JEV key |
 | `TYPESAFE_BASE_URL` / `TYPESAFE_MODEL` | JEV 端点与模型，缺省 `https://api.typesafe.ai` / `jev-latest` |
-| `REFLECTIVE_JUDGE_PROVIDER` | `rules` / `jev` / `openai`。缺省：有 key 走 jev，没 key 走 rules |
+| `REFLECTIVE_JUDGE_PROVIDER` | 只有 `jev` |
 | `REFLECTIVE_JUDGE_API_KEY` / `_BASE_URL` / `_MODEL` | 判断引擎自己的凭据和端点 |
 | `REFLECTIVE_JUDGE_TIMEOUT_MS` / `_WRITE_TIMEOUT_MS` | 交互 / 写入超时，缺省 2500 / 8000 |
 | `REFLECTIVE_JUDGE_THRESHOLD` | 相关性阈值，缺省 0.7（本地小模型分数偏低时调小） |
@@ -86,15 +86,13 @@ bash scripts/fetch-model.sh       # 本地 embedding 模型 24MB，拉一次
 | `HTTP_PROXY` / `HTTPS_PROXY` + `NODE_USE_ENV_PROXY=1` | 需要代理时用。**开关必须在启动 pi 之前设好**，进程内改无效 |
 | `REFLECTIVE_HOME` | 记忆库位置，缺省 `~/.pi/agent/reflective-storage` |
 
-## 判断引擎
+## 判断模型（硬要求）
 
-| provider | 依赖 | 说明 |
-| --- | --- | --- |
-| `rules` | 无 | 默认档。离线、零成本。不做语义判断：J3 一律新建、不自动合并、不主动提醒 |
-| `jev` | TypeSafe key | 本项目的标定基准 |
-| `openai` | 任意 `/chat/completions` | DeepSeek / Ollama / LM Studio / vLLM。本地小模型分数尺度不同，`REFLECTIVE_JUDGE_THRESHOLD` 要调 |
+必须有一个判断模型，没有就不启动（跟跑 Java 要 JDK 一样），报错会写清缺什么。目前接的是
+JEV：按类型化问题打分、只输出数字和枚举，不生成文本。
 
-换引擎只换一个 client：`JevAdapter` 只依赖 `client.ask(state, questions, opts)`。
+`src/jev/adapter.ts` 的 `JudgeClient` 只有一个方法 `ask(state, questions, opts)`，同类的判断
+模型实现它就能接。LLM 对话端点不算（那是生成，不是判断）。
 
 ## 工作原理
 

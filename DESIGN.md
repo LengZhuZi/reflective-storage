@@ -293,9 +293,12 @@ export interface JevAdapter {
 - **全部返回结构化结果 + 置信度**，便于降级和兜底（见 §6）。`ChoiceResult.probabilities` 要真的填，置信度分级要用它。
 - **只让引擎输出数字和枚举标签，不让它生成记忆原文**（§15 原则 1）。
 
-### 5.2 判断引擎可替换（不是绑死 JEV）
+### 5.2 判断模型是硬要求
 
-流程只通过**一个方法**使用判断引擎：
+没有判断模型这个扩展不启动 —— 跟跑 Java 要 JDK 一样，不设「退化成规则引擎」那种档位。
+缺什么、去哪儿配，启动时报错写清楚。
+
+只接**判断模型**（按类型化问题打分、输出数字和枚举，不生成文本）。接缝只有一个方法：
 
 ```typescript
 export interface JudgeClient {
@@ -303,21 +306,15 @@ export interface JudgeClient {
 }
 ```
 
-失败姿态、留痕、落库格式都在 `pipeline/` 里，全部只依赖它。所以「换引擎」= 换一个 client，`pipeline/` 一行不改。
+同类模型实现它就能换（`createJudgeAdapter` 里换一个 client）。LLM 对话端点不算：
+那是生成，不是判断，混进来会把「判断与生成分离」这条地基拆掉（§15 原则 1）。
 
-| 档位 | 实现 | 依赖 | 特点 |
-| --- | --- | --- | --- |
-| `rules` | `src/jev/rule-adapter.ts` | 无 | **默认档**（没配 key 时）。零配置、零联网、零成本。判断粗：J3 不做语义冲突检测（一律新建）、类型/作用域是关键词规则。`relevanceThreshold` = 0.5 |
-| `jev` | `src/jev/http.ts` + `adapter.ts` | TypeSafe API key | 本设计的标定基准（§4.1），质量最好，`relevanceThreshold` = 0.7 |
-| `openai` | `src/jev/llm.ts` | OpenAI 兼容 `/chat/completions` | DeepSeek / Ollama / LM Studio / vLLM / DashScope 兼容模式等；本地小模型分数普遍偏低，阈值要调 |
+规则函数（`src/jev/rule.ts`）仍然存在，但只在**失败姿态**里用：引擎不可用时写入退回
+关键词判断、召回退回味二字组打分（§6.1），不是可选的运行档位。
 
-**为什么必须有 `rules` 档**：没有模型时如果每个 gate 都按「不可用」处理，注入会 fail-closed，表现就是「装了什么都没发生」—— 对只想装个长期记忆的用户来说等于没这个扩展。所以规则引擎是正式档位，不是主/备关系：它的 `meta.status` 是 `ok`，`fallbackUsed` 是 `rule`，不假装自己降级。
+**按引擎给阈值**：`JevAdapter.relevanceThreshold`（JEV 缺省 0.7）。分数尺度是引擎自己的事。
 
-**按引擎给阈值**：`JevAdapter.relevanceThreshold` 由引擎自己给。§10.1 的 `>0.7` 是在 JEV 的分数尺度上标定的，搬到规则引擎或本地小模型上会把候选全卡光（实测：规则分 0.6 的命中在 0.7 下被丢，在规则档的 0.5 下正常注入）。
-
-**超时可配**：交互路径缺省 2500ms、写入路径 8000ms（§5.3）。本地模型慢一个量级，所以这两个值能从配置调大。
-
-**`openai` 档不继承 `typesafe.*` 的 key**：别人可能同时配了两家，把 JEV 的 key 发到另一个端点上是不能接受的。
+**超时可配**：交互 2500ms、写入 8000ms，都能从配置调。
 
 ### 5.3 HTTP 细节（已实测）
 

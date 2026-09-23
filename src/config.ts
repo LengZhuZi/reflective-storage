@@ -33,11 +33,16 @@ export interface JevConfig {
   proxy?: string;
 }
 
-/** 判断引擎档位。三个都是正式档位，不是「主 / 备」。详见 src/jev/adapter.ts。 */
-export type JudgeProvider = "jev" | "openai" | "rules";
+/**
+ * 判断模型。**硬要求** —— 没有它这个扩展不启动（跟跑 Java 要 JDK 一样）。
+ * 只接受「按类型化问题打分、不生成文本」的判断模型（JEV 就是这种）。
+ */
+export type JudgeProvider = "jev";
 
 export interface JudgeConfig {
   provider: JudgeProvider;
+  /** 判断模型可用吗。不可用 = 扩展不启动。 */
+  ready: boolean;
   apiKey?: string;
   baseUrl?: string;
   model?: string;
@@ -232,7 +237,7 @@ function resolveInject(raw: unknown): InjectConfig {
  * > `typesafe.*` 配置 > 默认值。两套环境变量名都认，是为了让只想换模型、不想重写
  * 配置文件的人只改一个变量。
  *
- * provider 缺省时：有 key 就走 jev，没 key 就走 rules —— 即「装了就能用」，
+ * 判断模型是硬要求：没配就没有可用的判断模型，扩展拒绝启动（不退化）。
  * 不会出现「没配 key 于是什么都不发生」这种默认体验。
  */
 function resolveJudge(file: Record<string, unknown>, base: JevConfig): JudgeConfig {
@@ -240,25 +245,19 @@ function resolveJudge(file: Record<string, unknown>, base: JevConfig): JudgeConf
   const env = (key: string) => str(process.env[key]);
 
   const explicit = env("REFLECTIVE_JUDGE_PROVIDER") ?? str(file.provider);
-  let provider = explicit as JudgeProvider | undefined;
-  if (provider && !["jev", "openai", "rules"].includes(provider)) {
-    problems.push(`judge.provider 不认识（${provider}），只支持 jev / openai / rules，已按 rules 处理`);
-    provider = undefined;
-  }
-  // 缺省：有 key 走 jev，没 key 走 rules —— 「装了就能用」，不会默认什么都不发生。
-  if (!provider) provider = base.apiKey ? "jev" : "rules";
-  if (!explicit && provider === "rules") {
-    problems.push("judge.provider 未配置且没有 JEV key，按 rules（纯规则、不联网）运行");
+  const provider: JudgeProvider = "jev";
+  if (explicit && explicit !== "jev") {
+    problems.push(`judge.provider 只支持 jev（判断模型是硬要求，没有就退化成规则这类档位不存在）：收到 ${explicit}`);
   }
 
-  // 两档模型引擎各自认自己的字段。openai 一档**不**继承 typesafe.*：别人可能同时
-  // 配了 JEV 的 key，把那个 key 发到另一个端点上是不能接受的。
   const slot = (envJudge: string, fileJudge: unknown, inherited: string | undefined): string | undefined =>
-    env(envJudge) ?? str(fileJudge) ?? (provider === "jev" ? inherited : undefined);
-
+    env(envJudge) ?? str(fileJudge) ?? inherited;
   const apiKey = slot("REFLECTIVE_JUDGE_API_KEY", file.apiKey, base.apiKey);
   const baseUrl = slot("REFLECTIVE_JUDGE_BASE_URL", file.baseUrl, base.baseUrl);
   const model = slot("REFLECTIVE_JUDGE_MODEL", file.model, base.model);
+  if (!apiKey) {
+    problems.push(`没有判断模型的 key：环境变量 TYPESAFE_API_KEY / REFLECTIVE_JUDGE_API_KEY，或 ${CONFIG_PATH} 的 typesafe.apiKey`);
+  }
 
   const num = (envKey: string, fallback: number): number => {
     const n = Number(process.env[envKey]);
@@ -267,25 +266,17 @@ function resolveJudge(file: Record<string, unknown>, base: JevConfig): JudgeConf
   const fileNumber = (v: unknown, fallback: number): number => (typeof v === "number" && v >= 0 ? v : fallback);
   const threshold = env("REFLECTIVE_JUDGE_THRESHOLD");
 
-  if (provider === "openai") {
-    if (!baseUrl) problems.push("judge.provider=openai 但没有 baseUrl：要 OpenAI 兼容的根地址，例如 http://localhost:11434/v1");
-    if (!model) problems.push("judge.provider=openai 但没有 model：要显式指定模型名");
-  }
-  if (provider === "jev" && !apiKey) {
-    problems.push(`judge.provider=jev 但没有拿到 key：环境变量 TYPESAFE_API_KEY / REFLECTIVE_JUDGE_API_KEY，或 ${CONFIG_PATH} 的 typesafe.apiKey`);
-  }
-
   return {
     provider,
+    ready: Boolean(apiKey),
     apiKey,
     baseUrl,
     model,
     timeoutMs: num("REFLECTIVE_JUDGE_TIMEOUT_MS", fileNumber(file.timeoutMs, 2500)),
     writeTimeoutMs: num("REFLECTIVE_JUDGE_WRITE_TIMEOUT_MS", fileNumber(file.writeTimeoutMs, 8000)),
-    // 规则引擎的默认阈值是 0.5（它自己的分数尺度，见 §5.2），不是 JEV 的 0.7。
     relevanceThreshold: threshold !== undefined && Number.isFinite(Number(threshold))
       ? Number(threshold)
-      : fileNumber(file.relevanceThreshold, provider === "rules" ? 0.5 : 0.7),
+      : fileNumber(file.relevanceThreshold, 0.7),
     problems,
   };
 }

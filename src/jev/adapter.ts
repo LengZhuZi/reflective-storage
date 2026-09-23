@@ -15,8 +15,6 @@
 import { MEMORY_TYPES, type MemoryNode, type MemoryScope, type MemoryType, type Relation, type SessionInfo, type TokenBudget } from "../core/types.ts";
 import type { JudgeConfig } from "../config.ts";
 import { JevHttpClient, JevUnavailableError, type AskOptions, type Answer, type JevResponse, type Questions } from "./http.ts";
-import { LlmClient } from "./llm.ts";
-import { createRuleAdapter, RULE_RELEVANCE_THRESHOLD } from "./rule-adapter.ts";
 import { ruleRelation, ruleRelevance, ruleScope, ruleType, ruleWorthKeeping, sameTopic } from "./rule.ts";
 import type {
   CitationJudgment, InjectionJudgment, Judged, NoulResult, ProactiveJudgment, RecallJudgment, RouteJudgment,
@@ -24,8 +22,8 @@ import type {
 } from "./types.ts";
 
 /**
- * 判断引擎只需要这一个方法。JEV HTTP 和任何 OpenAI 兼容端点（见 llm.ts）都满足它，
- * 所以「换引擎」= 换一个 client，下面的流程、失败姿态、留痕一行都不用改。
+ * 判断引擎只需要这一个方法。同类判断模型（按类型化问题打分、不生成文本，比如 JEV）
+ * 实现它就能用；换引擎 = 换一个 client，流程与失败姿态不用改。
  */
 export interface JudgeClient {
   ask(state: string, questions: Questions, opts?: AskOptions): Promise<JevResponse>;
@@ -597,45 +595,25 @@ function degradation(gate: string, e: unknown, t0: number, detail: string) {
 }
 
 /**
- * 引擎选择。三个档位都是正式档位，不是「主 / 备」：
- *
- *   rules   零配置、零联网、零成本。默认档 —— 装了就有用，但判断粗。
- *   jev     TypeSafe AI 的 JEV，本设计的标定基准（§4.1）。
- *   openai  任何 OpenAI 兼容 /chat/completions：DeepSeek / Ollama / LM Studio / vLLM…
- *
- * 选哪个只影响判断质量，不影响流程、失败姿态和落库格式。
+ * 建判断引擎。**判断模型是硬要求**（跟跑 Java 要 JDK 一样）：没有可用端点就抛，
+ * 由调用方拒绝启动，而不是退化成别的什么。
  */
 export function createJudgeAdapter(config: JudgeConfig, deps: { fetchImpl?: typeof fetch } = {}): JevAdapter {
-  const timeouts: JudgeTimeouts = {
-    interactiveTimeoutMs: config.timeoutMs,
-    writeTimeoutMs: config.writeTimeoutMs,
-    relevanceThreshold: config.relevanceThreshold,
-  };
-  switch (config.provider) {
-    case "rules":
-      return createRuleAdapter(config.relevanceThreshold);
-    case "openai":
-      return createJevAdapter(
-        new LlmClient({
-          baseUrl: config.baseUrl ?? "",
-          apiKey: config.apiKey,
-          model: config.model ?? "",
-          timeoutMs: config.timeoutMs,
-          fetchImpl: deps.fetchImpl,
-        }),
-        timeouts,
-      );
-    case "jev":
-    default:
-      return createJevAdapter(
-        new JevHttpClient({
-          apiKey: config.apiKey,
-          baseUrl: config.baseUrl,
-          model: config.model,
-          timeoutMs: config.timeoutMs,
-          fetchImpl: deps.fetchImpl,
-        }),
-        timeouts,
-      );
+  if (!config.apiKey) {
+    throw new Error(`没有可用的判断模型：${config.problems.join("；") || "缺少 apiKey"}`);
   }
+  return createJevAdapter(
+    new JevHttpClient({
+      apiKey: config.apiKey,
+      baseUrl: config.baseUrl,
+      model: config.model,
+      timeoutMs: config.timeoutMs,
+      fetchImpl: deps.fetchImpl,
+    }),
+    {
+      interactiveTimeoutMs: config.timeoutMs,
+      writeTimeoutMs: config.writeTimeoutMs,
+      relevanceThreshold: config.relevanceThreshold,
+    },
+  );
 }
